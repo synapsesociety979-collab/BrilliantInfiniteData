@@ -69,40 +69,76 @@ def connect_account(user: UserAccount):
 
 import json
 import re
+from datetime import datetime
+from typing import List, Dict, Any
 
 
-def generate_market_predictions():
+def generate_market_predictions() -> Dict[str, Any]:
     """
     Generates market predictions for crypto and Forex using OpenAI
-    and returns real JSON (Python list/dict).
+    with enhanced analysis and structured output.
     """
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{
-                "role":
-                "system",
-                "content":
-                "Return ONLY pure JSON. No markdown, no ```json."
-            }, {
-                "role":
-                "user",
-                "content":
-                ("Generate trade signals for Forex pairs (EURUSD, USDJPY, GBPUSD) "
-                 "and crypto pairs (BTCUSDT, ETHUSDT). "
-                 "Each signal must include: symbol, signal (BUY/SELL/HOLD), "
-                 "confidence (0-100), stop_loss, take_profit. "
-                 "Return only JSON array.")
-            }],
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You are an expert financial analyst AI. Return ONLY valid JSON with no markdown formatting.
+Analyze market conditions and provide actionable trading signals with detailed reasoning."""
+                },
+                {
+                    "role": "user",
+                    "content": """Generate comprehensive trade signals for the following assets:
+
+Forex pairs: EURUSD, USDJPY, GBPUSD, AUDUSD, USDCAD
+Crypto pairs: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT
+
+For each signal, provide:
+{
+  "symbol": "PAIR_NAME",
+  "signal": "BUY/SELL/HOLD",
+  "confidence": 0-100,
+  "entry_price": "suggested entry price",
+  "stop_loss": "stop loss level",
+  "take_profit": "take profit level",
+  "risk_reward_ratio": "ratio as string",
+  "timeframe": "short-term/medium-term/long-term",
+  "analysis": "brief market analysis reason",
+  "market_sentiment": "bullish/bearish/neutral"
+}
+
+Return as a JSON array of objects."""
+                }
+            ],
+            temperature=0.7,
+            max_tokens=2000
         )
 
         content = response.choices[0].message.content.strip()
         content = re.sub(r"```json|```", "", content).strip()
         data = json.loads(content)
-        return data
+        
+        return {
+            "success": True,
+            "generated_at": datetime.utcnow().isoformat(),
+            "model": "gpt-4o-mini",
+            "signals": data,
+            "total_signals": len(data) if isinstance(data, list) else 0
+        }
 
+    except json.JSONDecodeError as e:
+        return {
+            "success": False,
+            "error": "Failed to parse AI response",
+            "details": str(e)
+        }
     except Exception as e:
-        return {"error": str(e)}
+        return {
+            "success": False,
+            "error": "Prediction generation failed",
+            "details": str(e)
+        }
 
 
 # ----------------------------
@@ -115,7 +151,21 @@ def get_predictions(username: str):
 
     ai_output = generate_market_predictions()
 
-    return {"username": username, "predictions": ai_output}
+    return {
+        "username": username,
+        "request_time": datetime.utcnow().isoformat(),
+        "predictions": ai_output
+    }
+
+
+# ----------------------------
+# Get Predictions (No Auth Required)
+# ----------------------------
+@app.get("/predictions")
+def get_predictions_public():
+    """Get AI predictions without requiring user authentication"""
+    ai_output = generate_market_predictions()
+    return ai_output
 
 
 # ----------------------------
