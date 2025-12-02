@@ -70,7 +70,7 @@ def connect_account(user: UserAccount):
 import json
 import re
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Dict, Any
 
 
 def generate_market_predictions() -> Dict[str, Any]:
@@ -199,7 +199,6 @@ def root():
 
 
 import uvicorn
-import os
 
 if __name__ == "__main__":
     uvicorn.run(
