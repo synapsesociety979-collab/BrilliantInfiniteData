@@ -221,17 +221,34 @@ def chat_with_ai(chat: ChatMessage):
         }
     
     try:
-        system_prompt = """You are an expert AI trading assistant specializing in Forex and cryptocurrency markets. 
-You help traders with:
-- Market analysis and insights
-- Trading strategies and techniques
-- Risk management advice
-- Explaining technical indicators
-- Answering questions about trading pairs (EURUSD, BTCUSDT, etc.)
-- Providing educational content about trading
+        system_prompt = """You are an expert AI trading analyst and advisor specializing in Forex and cryptocurrency markets.
 
-Be helpful, professional, and give actionable advice. Always remind users that trading involves risk.
-Keep responses concise but informative."""
+YOUR ROLE:
+You analyze market trends, technical indicators, and market sentiment to provide CLEAR BUY/SELL/HOLD recommendations.
+
+WHEN ASKED ABOUT ANY TRADING PAIR, YOU MUST:
+1. Analyze current market conditions and trends
+2. Consider technical indicators (RSI, MACD, Moving Averages, Support/Resistance)
+3. Evaluate market sentiment (bullish/bearish/neutral)
+4. Provide a CLEAR recommendation: BUY, SELL, or HOLD
+5. Give specific entry price, stop loss, and take profit levels
+6. Explain your reasoning briefly
+
+RESPONSE FORMAT FOR TRADING ADVICE:
+- Recommendation: [BUY/SELL/HOLD]
+- Confidence: [0-100%]
+- Entry Price: [price level]
+- Stop Loss: [price level]
+- Take Profit: [price level]
+- Risk/Reward Ratio: [ratio]
+- Analysis: [brief market analysis]
+
+MARKETS YOU COVER:
+- Forex: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF
+- Crypto: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT
+
+Be direct and actionable. Users want clear advice on whether to BUY or SELL.
+Always include a risk warning at the end."""
 
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -245,7 +262,7 @@ Keep responses concise but informative."""
             model="gpt-4o-mini",
             messages=messages,
             temperature=0.7,
-            max_tokens=1000
+            max_tokens=1500
         )
         
         ai_response = response.choices[0].message.content
@@ -256,6 +273,163 @@ Keep responses concise but informative."""
             "timestamp": datetime.utcnow().isoformat()
         }
         
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+# ----------------------------
+# Get Trading Advice for Specific Symbol
+# ----------------------------
+@app.get("/advice/{symbol}")
+def get_trading_advice(symbol: str):
+    """Get specific BUY/SELL advice for a trading pair"""
+    client = get_openai_client()
+    if not client:
+        return {
+            "success": False,
+            "error": "OpenAI API key not configured"
+        }
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You are an expert trading analyst. Analyze the given trading pair and provide a detailed trading recommendation.
+Return ONLY valid JSON with no markdown formatting."""
+                },
+                {
+                    "role": "user",
+                    "content": f"""Analyze {symbol.upper()} and provide a trading recommendation.
+
+Return JSON in this exact format:
+{{
+    "symbol": "{symbol.upper()}",
+    "recommendation": "BUY" or "SELL" or "HOLD",
+    "confidence": 0-100,
+    "entry_price": "suggested entry price",
+    "stop_loss": "stop loss level",
+    "take_profit": "take profit level", 
+    "risk_reward_ratio": "1:2 format",
+    "timeframe": "short-term/medium-term/long-term",
+    "market_sentiment": "bullish/bearish/neutral",
+    "trend": "uptrend/downtrend/sideways",
+    "key_levels": {{
+        "support": "support level",
+        "resistance": "resistance level"
+    }},
+    "technical_indicators": {{
+        "rsi": "overbought/oversold/neutral",
+        "macd": "bullish/bearish",
+        "moving_averages": "above/below"
+    }},
+    "analysis": "detailed analysis explaining the recommendation",
+    "risk_warning": "brief risk warning"
+}}"""
+                }
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        
+        content = response.choices[0].message.content.strip()
+        content = re.sub(r"```json|```", "", content).strip()
+        data = json.loads(content)
+        
+        return {
+            "success": True,
+            "generated_at": datetime.utcnow().isoformat(),
+            "advice": data
+        }
+        
+    except json.JSONDecodeError as e:
+        return {
+            "success": False,
+            "error": "Failed to parse AI response",
+            "details": str(e)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+# ----------------------------
+# Market Analysis Summary
+# ----------------------------
+@app.get("/market_analysis")
+def get_market_analysis():
+    """Get overall market analysis and trends"""
+    client = get_openai_client()
+    if not client:
+        return {
+            "success": False,
+            "error": "OpenAI API key not configured"
+        }
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert market analyst. Provide current market analysis. Return ONLY valid JSON."
+                },
+                {
+                    "role": "user",
+                    "content": """Provide a comprehensive market analysis covering:
+
+Return JSON in this format:
+{
+    "market_overview": "brief overall market summary",
+    "forex_analysis": {
+        "trend": "bullish/bearish/mixed",
+        "key_drivers": ["driver1", "driver2"],
+        "top_opportunities": [
+            {"pair": "EURUSD", "recommendation": "BUY/SELL", "reason": "brief reason"}
+        ]
+    },
+    "crypto_analysis": {
+        "trend": "bullish/bearish/mixed", 
+        "market_sentiment": "fear/greed/neutral",
+        "bitcoin_dominance": "high/low/stable",
+        "top_opportunities": [
+            {"pair": "BTCUSDT", "recommendation": "BUY/SELL", "reason": "brief reason"}
+        ]
+    },
+    "risk_factors": ["risk1", "risk2"],
+    "trading_tips": ["tip1", "tip2"],
+    "best_trades_today": [
+        {"symbol": "PAIR", "action": "BUY/SELL", "confidence": 85}
+    ]
+}"""
+                }
+            ],
+            temperature=0.7,
+            max_tokens=1500
+        )
+        
+        content = response.choices[0].message.content.strip()
+        content = re.sub(r"```json|```", "", content).strip()
+        data = json.loads(content)
+        
+        return {
+            "success": True,
+            "generated_at": datetime.utcnow().isoformat(),
+            "analysis": data
+        }
+        
+    except json.JSONDecodeError as e:
+        return {
+            "success": False,
+            "error": "Failed to parse AI response",
+            "details": str(e)
+        }
     except Exception as e:
         return {
             "success": False,
