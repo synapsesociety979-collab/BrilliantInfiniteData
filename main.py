@@ -191,6 +191,165 @@ def execute_trade(username: str, symbol: str, action: str):
 
 
 # ----------------------------
+# AI Chat Models
+# ----------------------------
+class ChatMessage(BaseModel):
+    message: str
+    conversation_history: Optional[list] = []
+
+class ChatResponse(BaseModel):
+    success: bool
+    response: Optional[str] = None
+    error: Optional[str] = None
+
+
+# In-memory chat history storage
+chat_history_db = {}
+
+
+# ----------------------------
+# AI Trading Assistant Chat
+# ----------------------------
+@app.post("/chat")
+def chat_with_ai(chat: ChatMessage):
+    """Chat with the AI trading assistant"""
+    client = get_openai_client()
+    if not client:
+        return {
+            "success": False,
+            "error": "OpenAI API key not configured"
+        }
+    
+    try:
+        system_prompt = """You are an expert AI trading assistant specializing in Forex and cryptocurrency markets. 
+You help traders with:
+- Market analysis and insights
+- Trading strategies and techniques
+- Risk management advice
+- Explaining technical indicators
+- Answering questions about trading pairs (EURUSD, BTCUSDT, etc.)
+- Providing educational content about trading
+
+Be helpful, professional, and give actionable advice. Always remind users that trading involves risk.
+Keep responses concise but informative."""
+
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        if chat.conversation_history:
+            for msg in chat.conversation_history[-10:]:
+                messages.append(msg)
+        
+        messages.append({"role": "user", "content": chat.message})
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1000
+        )
+        
+        ai_response = response.choices[0].message.content
+        
+        return {
+            "success": True,
+            "response": ai_response,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+# ----------------------------
+# AI Chat with User Context
+# ----------------------------
+@app.post("/chat/{username}")
+def chat_with_ai_user(username: str, chat: ChatMessage):
+    """Chat with AI trading assistant with user context and history"""
+    if username not in users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    client = get_openai_client()
+    if not client:
+        return {
+            "success": False,
+            "error": "OpenAI API key not configured"
+        }
+    
+    try:
+        if username not in chat_history_db:
+            chat_history_db[username] = []
+        
+        system_prompt = f"""You are an expert AI trading assistant for {username}. 
+You specialize in Forex and cryptocurrency markets and help with:
+- Personalized market analysis and insights
+- Trading strategies tailored to the user
+- Risk management advice
+- Explaining technical indicators
+- Answering questions about trading pairs
+- Providing educational content
+
+Be helpful, professional, and give actionable advice. Remember previous conversations.
+Always remind users that trading involves risk. Keep responses concise but informative."""
+
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        for msg in chat_history_db[username][-20:]:
+            messages.append(msg)
+        
+        messages.append({"role": "user", "content": chat.message})
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1000
+        )
+        
+        ai_response = response.choices[0].message.content
+        
+        chat_history_db[username].append({"role": "user", "content": chat.message})
+        chat_history_db[username].append({"role": "assistant", "content": ai_response})
+        
+        if len(chat_history_db[username]) > 50:
+            chat_history_db[username] = chat_history_db[username][-50:]
+        
+        return {
+            "success": True,
+            "username": username,
+            "response": ai_response,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+# ----------------------------
+# Clear Chat History
+# ----------------------------
+@app.delete("/chat/{username}/clear")
+def clear_chat_history(username: str):
+    """Clear chat history for a user"""
+    if username not in users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if username in chat_history_db:
+        chat_history_db[username] = []
+    
+    return {
+        "success": True,
+        "message": f"Chat history cleared for {username}"
+    }
+
+
+# ----------------------------
 # Root Endpoint
 # ----------------------------
 @app.get("/")
