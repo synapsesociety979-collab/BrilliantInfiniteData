@@ -6,13 +6,13 @@ import os
 from openai import OpenAI
 
 # ----------------------------
-# OpenAI API Setup
+# OpenAI API Setup (Lazy initialization)
 # ----------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise Exception("OPENAI_API_KEY not found in environment variables")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+def get_openai_client():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key)
 
 # ----------------------------
 # FastAPI App
@@ -78,6 +78,14 @@ def generate_market_predictions() -> Dict[str, Any]:
     Generates market predictions for crypto and Forex using OpenAI
     with enhanced analysis and structured output.
     """
+    client = get_openai_client()
+    if not client:
+        return {
+            "success": False,
+            "error": "OpenAI API key not configured",
+            "details": "Please set the OPENAI_API_KEY environment variable"
+        }
+    
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
