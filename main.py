@@ -75,8 +75,7 @@ from typing import Dict, Any
 
 def generate_market_predictions() -> Dict[str, Any]:
     """
-    Generates market predictions for crypto and Forex using OpenAI
-    with enhanced analysis and structured output.
+    Generates advanced market predictions using comprehensive technical and fundamental analysis.
     """
     client = get_openai_client()
     if not client:
@@ -92,47 +91,88 @@ def generate_market_predictions() -> Dict[str, Any]:
             messages=[
                 {
                     "role": "system",
-                    "content": """You are an expert financial analyst AI. Return ONLY valid JSON with no markdown formatting.
-Analyze market conditions and provide actionable trading signals with detailed reasoning."""
+                    "content": """You are an elite quantitative trading AI with expertise in:
+- Technical Analysis: RSI, MACD, Bollinger Bands, Fibonacci retracements, Moving Averages (EMA 20/50/200), Volume analysis
+- Chart Patterns: Head & Shoulders, Double Top/Bottom, Triangles, Wedges, Flags
+- Fundamental Analysis: Economic indicators, interest rates, inflation data, GDP, employment
+- Sentiment Analysis: Market fear/greed, institutional positioning, retail sentiment
+- Price Action: Support/Resistance levels, trend analysis, breakout patterns
+- Risk Management: Position sizing, risk/reward optimization
+
+You analyze ALL these factors to generate high-probability trading signals.
+Return ONLY valid JSON with no markdown formatting."""
                 },
                 {
                     "role": "user",
-                    "content": """Generate comprehensive trade signals for the following assets:
+                    "content": """Perform comprehensive multi-factor analysis for these assets:
 
-Forex pairs: EURUSD, USDJPY, GBPUSD, AUDUSD, USDCAD
-Crypto pairs: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT
+FOREX: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF
+CRYPTO: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT
 
-For each signal, provide:
+For EACH asset, analyze and return:
 {
-  "symbol": "PAIR_NAME",
-  "signal": "BUY/SELL/HOLD",
+  "symbol": "PAIR",
+  "signal": "STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL",
   "confidence": 0-100,
-  "entry_price": "suggested entry price",
-  "stop_loss": "stop loss level",
-  "take_profit": "take profit level",
-  "risk_reward_ratio": "ratio as string",
-  "timeframe": "short-term/medium-term/long-term",
-  "analysis": "brief market analysis reason",
-  "market_sentiment": "bullish/bearish/neutral"
+  "strength": "weak/moderate/strong/very_strong",
+  "entry_price": "optimal entry",
+  "stop_loss": "calculated SL",
+  "take_profit_1": "TP1 - conservative",
+  "take_profit_2": "TP2 - moderate", 
+  "take_profit_3": "TP3 - aggressive",
+  "risk_reward_ratio": "ratio",
+  "position_size_recommendation": "1-5% of capital",
+  "timeframe": "scalp/intraday/swing/position",
+  "trend": {
+    "short_term": "bullish/bearish/neutral",
+    "medium_term": "bullish/bearish/neutral",
+    "long_term": "bullish/bearish/neutral"
+  },
+  "technical_indicators": {
+    "rsi_14": "value and interpretation",
+    "macd": "bullish/bearish crossover status",
+    "ema_alignment": "bullish/bearish/mixed",
+    "bollinger_position": "upper/middle/lower band",
+    "volume_trend": "increasing/decreasing/stable"
+  },
+  "key_levels": {
+    "resistance_1": "nearest resistance",
+    "resistance_2": "major resistance",
+    "support_1": "nearest support",
+    "support_2": "major support",
+    "pivot_point": "daily pivot"
+  },
+  "pattern_detected": "pattern name or none",
+  "market_sentiment": "extreme_fear/fear/neutral/greed/extreme_greed",
+  "fundamental_factors": "key economic factors affecting this pair",
+  "trade_setup": "detailed trade setup explanation",
+  "risk_warning": "specific risks for this trade",
+  "optimal_entry_window": "best time to enter"
 }
 
-Return as a JSON array of objects."""
+Return as JSON array. Prioritize high-probability setups."""
                 }
             ],
-            temperature=0.7,
-            max_tokens=2000
+            temperature=0.6,
+            max_tokens=4000
         )
 
         content = response.choices[0].message.content.strip()
         content = re.sub(r"```json|```", "", content).strip()
         data = json.loads(content)
         
+        strong_signals = [s for s in data if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]] if isinstance(data, list) else []
+        
         return {
             "success": True,
             "generated_at": datetime.utcnow().isoformat(),
             "model": "gpt-4o-mini",
+            "analysis_type": "comprehensive_multi_factor",
             "signals": data,
-            "total_signals": len(data) if isinstance(data, list) else 0
+            "total_signals": len(data) if isinstance(data, list) else 0,
+            "strong_signals_count": len(strong_signals),
+            "top_picks": strong_signals[:3] if strong_signals else [],
+            "disclaimer": "Trading involves substantial risk. Past performance does not guarantee future results. Always use proper risk management."
         }
 
     except json.JSONDecodeError as e:
@@ -285,7 +325,7 @@ Always include a risk warning at the end."""
 # ----------------------------
 @app.get("/advice/{symbol}")
 def get_trading_advice(symbol: str):
-    """Get specific BUY/SELL advice for a trading pair"""
+    """Get comprehensive BUY/SELL advice for a trading pair with full analysis"""
     client = get_openai_client()
     if not client:
         return {
@@ -299,41 +339,99 @@ def get_trading_advice(symbol: str):
             messages=[
                 {
                     "role": "system",
-                    "content": """You are an expert trading analyst. Analyze the given trading pair and provide a detailed trading recommendation.
-Return ONLY valid JSON with no markdown formatting."""
+                    "content": """You are an elite trading strategist combining:
+- Quantitative analysis (statistical models, algorithms)
+- Technical analysis (all major indicators and chart patterns)
+- Fundamental analysis (economic data, news impact)
+- Sentiment analysis (market psychology, positioning)
+- Risk management (optimal position sizing, R:R optimization)
+
+Provide institutional-grade trading analysis. Return ONLY valid JSON."""
                 },
                 {
                     "role": "user",
-                    "content": f"""Analyze {symbol.upper()} and provide a trading recommendation.
+                    "content": f"""Perform DEEP ANALYSIS on {symbol.upper()}:
 
-Return JSON in this exact format:
+Return comprehensive JSON:
 {{
     "symbol": "{symbol.upper()}",
-    "recommendation": "BUY" or "SELL" or "HOLD",
-    "confidence": 0-100,
-    "entry_price": "suggested entry price",
-    "stop_loss": "stop loss level",
-    "take_profit": "take profit level", 
-    "risk_reward_ratio": "1:2 format",
-    "timeframe": "short-term/medium-term/long-term",
-    "market_sentiment": "bullish/bearish/neutral",
-    "trend": "uptrend/downtrend/sideways",
-    "key_levels": {{
-        "support": "support level",
-        "resistance": "resistance level"
+    "analysis_timestamp": "current time",
+    "recommendation": "STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL",
+    "confidence_score": 0-100,
+    "signal_strength": "weak/moderate/strong/very_strong",
+    
+    "trade_setup": {{
+        "entry_price": "optimal entry",
+        "entry_zone": {{"low": "zone low", "high": "zone high"}},
+        "stop_loss": "calculated SL with reason",
+        "take_profit_targets": [
+            {{"level": "TP1", "probability": "70%"}},
+            {{"level": "TP2", "probability": "50%"}},
+            {{"level": "TP3", "probability": "30%"}}
+        ],
+        "risk_reward_ratio": "calculated R:R",
+        "position_size": "recommended % of capital",
+        "max_risk": "maximum risk per trade"
     }},
-    "technical_indicators": {{
-        "rsi": "overbought/oversold/neutral",
-        "macd": "bullish/bearish",
-        "moving_averages": "above/below"
+    
+    "technical_analysis": {{
+        "trend_direction": "strong_uptrend/uptrend/sideways/downtrend/strong_downtrend",
+        "trend_strength": 0-100,
+        "rsi_14": {{"value": "number", "signal": "overbought/neutral/oversold"}},
+        "macd": {{"signal": "bullish/bearish", "histogram": "expanding/contracting"}},
+        "moving_averages": {{
+            "ema_20": "price position",
+            "ema_50": "price position", 
+            "ema_200": "price position",
+            "alignment": "bullish/bearish/mixed"
+        }},
+        "bollinger_bands": {{"position": "upper/middle/lower", "squeeze": true/false}},
+        "volume": {{"trend": "increasing/decreasing", "significance": "high/normal/low"}},
+        "atr": "current volatility level"
     }},
-    "analysis": "detailed analysis explaining the recommendation",
-    "risk_warning": "brief risk warning"
+    
+    "key_price_levels": {{
+        "current_price": "price",
+        "daily_pivot": "pivot",
+        "resistance_levels": ["R1", "R2", "R3"],
+        "support_levels": ["S1", "S2", "S3"],
+        "fibonacci_levels": {{"0.382": "level", "0.5": "level", "0.618": "level"}}
+    }},
+    
+    "chart_patterns": {{
+        "pattern_detected": "pattern name or none",
+        "pattern_reliability": "high/medium/low",
+        "pattern_target": "price target from pattern"
+    }},
+    
+    "market_context": {{
+        "overall_sentiment": "extreme_fear/fear/neutral/greed/extreme_greed",
+        "institutional_positioning": "bullish/bearish/neutral",
+        "retail_sentiment": "bullish/bearish/neutral",
+        "news_impact": "positive/negative/neutral",
+        "key_events": "upcoming events that may affect price"
+    }},
+    
+    "trade_management": {{
+        "entry_timing": "immediate/wait_for_pullback/wait_for_breakout",
+        "scaling_strategy": "all_in/scale_in/pyramid",
+        "exit_strategy": "trail_stop/fixed_targets/hybrid",
+        "time_horizon": "hours/days/weeks"
+    }},
+    
+    "risk_assessment": {{
+        "trade_risk_level": "low/medium/high/very_high",
+        "key_risks": ["risk1", "risk2"],
+        "invalidation_level": "price where trade thesis is invalid",
+        "warning": "specific risk warning for this trade"
+    }},
+    
+    "detailed_analysis": "comprehensive paragraph explaining the full analysis and rationale"
 }}"""
                 }
             ],
-            temperature=0.7,
-            max_tokens=1000
+            temperature=0.6,
+            max_tokens=2500
         )
         
         content = response.choices[0].message.content.strip()
@@ -343,6 +441,7 @@ Return JSON in this exact format:
         return {
             "success": True,
             "generated_at": datetime.utcnow().isoformat(),
+            "analysis_type": "deep_institutional_grade",
             "advice": data
         }
         
