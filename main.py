@@ -18,6 +18,10 @@ def get_openai_client():
 # FastAPI App
 # ----------------------------
 app = FastAPI(title="AI Multi-User Trading Bot Backend")
+#from backtest_api import router as backtest_router
+from backtest_api import router as backtest_router
+app.include_router(backtest_router, prefix="/api")   # optional prefix
+
 
 # ----------------------------
 # ADD THIS: CORS MIDDLEWARE

@@ -3,3 +3,10 @@ uvicorn
 python-dotenv
 openai>=1.0.0
 pydantic
+fastapi
+uvicorn[standard]
+pandas
+numpy
+python-dotenv
+openai   # for OpenAI HTTP client
+
