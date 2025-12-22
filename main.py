@@ -327,31 +327,50 @@ def chat_with_ai(chat: ChatMessage):
     try:
         predictions_data = generate_market_predictions()
         signals = predictions_data.get("signals", [])
-        top_picks = predictions_data.get("top_picks", [])
         
-        signals_summary = "Current Market Signals:\n"
-        if top_picks:
-            for signal in top_picks[:5]:
-                signals_summary += f"- {signal.get('symbol', 'N/A')}: {signal.get('signal', 'HOLD')} (Confidence: {signal.get('confidence', 0)}%)\n"
+        detailed_signals = "REAL MARKET SIGNALS FROM AI ANALYSIS:\n\n"
+        if signals and isinstance(signals, list):
+            for idx, signal in enumerate(signals[:14], 1):
+                symbol = signal.get('symbol', 'N/A')
+                trade_signal = signal.get('signal', 'HOLD')
+                confidence = signal.get('confidence', 0)
+                entry = signal.get('entry_price', 'N/A')
+                sl = signal.get('stop_loss', 'N/A')
+                tp1 = signal.get('take_profit_1', 'N/A')
+                tp2 = signal.get('take_profit_2', 'N/A')
+                tp3 = signal.get('take_profit_3', 'N/A')
+                rr = signal.get('risk_reward_ratio', 'N/A')
+                trend_short = signal.get('trend', {}).get('short_term', 'N/A') if isinstance(signal.get('trend'), dict) else 'N/A'
+                trend_long = signal.get('trend', {}).get('long_term', 'N/A') if isinstance(signal.get('trend'), dict) else 'N/A'
+                
+                detailed_signals += f"{idx}. {symbol}: {trade_signal} ({confidence}% confidence)\n"
+                detailed_signals += f"   Entry: {entry} | Stop Loss: {sl} | R:R: {rr}\n"
+                detailed_signals += f"   TP1: {tp1} | TP2: {tp2} | TP3: {tp3}\n"
+                detailed_signals += f"   Trend: {trend_short} (short) / {trend_long} (long)\n"
+                detailed_signals += f"   Analysis: {signal.get('rationale', 'See full report')}\n\n"
         
-        system_prompt = f"""You are an expert AI trading assistant with access to real market analysis data.
-        
-HERE ARE THE CURRENT MARKET SIGNALS FROM MY ANALYSIS:
-{signals_summary}
+        system_prompt = f"""You are an expert AI trading assistant. You have REAL market analysis data.
 
-You have access to detailed trading predictions. When users ask about specific symbols or the market:
-1. Reference the actual signals above
-2. Explain WHY each signal is bullish/bearish (technical reasons)
-3. Give position sizing recommendations (1-5% of capital)
-4. Explain risk management (stop-loss, take-profit levels)
-5. Use simple language - explain technical terms clearly
-6. If asked about a symbol not in signals, use general knowledge but mention the limited data
+{detailed_signals}
 
-IMPORTANT: Always explain your analysis in a way beginners can understand. Break down:
-- What technical indicator matters
-- Why it matters for this trade
-- What could go wrong (risk)
-- What's the profit target"""
+CRITICAL RULES:
+1. ALWAYS use the signals above - they are your real data
+2. If user asks about a symbol in this list, EXPLAIN that exact signal with entry/exit points
+3. If user asks about a symbol NOT in this list, say "I don't have current signals for that pair"
+4. Explain WHY each signal exists (what technical indicators)
+5. Give practical advice: position size (1-5% of capital), risk management, stop-loss placement
+6. Use beginner language - explain RSI, MACD, EMA like talking to someone new to trading
+7. NEVER give generic advice when you have specific signals to reference
+8. Always mention the confidence level from the signals
+
+When answering:
+- Start by identifying if the symbol has a signal in the list above
+- If yes: Reference the exact entry, stop loss, and take-profit levels
+- Explain which technical indicators support this (RSI, MACD, trend alignment)
+- Give risk management tips
+- If no: Say "I don't have a current signal for [symbol], but here's how to analyze it..."
+
+Be specific. Reference actual prices and levels from the signals."""
 
         messages = [{"role": "system", "content": system_prompt}]
         if chat.conversation_history:
@@ -359,9 +378,9 @@ IMPORTANT: Always explain your analysis in a way beginners can understand. Break
                 messages.append(msg)
         messages.append({"role": "user", "content": chat.message})
 
-        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.7, max_tokens=1500)
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.6, max_tokens=1500)
         ai_response = response.choices[0].message.content
-        return {"success": True, "response": ai_response, "timestamp": datetime.utcnow().isoformat(), "signals_provided": len(top_picks)}
+        return {"success": True, "response": ai_response, "timestamp": datetime.utcnow().isoformat(), "signals_analyzed": len(signals) if isinstance(signals, list) else 0}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -383,35 +402,45 @@ def chat_with_ai_user(username: str, chat: ChatMessage):
 
     predictions_data = generate_market_predictions()
     signals = predictions_data.get("signals", [])
-    top_picks = predictions_data.get("top_picks", [])
     
-    signals_summary = "Current Market Signals:\n"
-    if top_picks:
-        for signal in top_picks[:5]:
-            signals_summary += f"- {signal.get('symbol', 'N/A')}: {signal.get('signal', 'HOLD')} (Confidence: {signal.get('confidence', 0)}%)\n"
+    detailed_signals = f"REAL MARKET SIGNALS FOR {username}:\n\n"
+    if signals and isinstance(signals, list):
+        for idx, signal in enumerate(signals[:14], 1):
+            symbol = signal.get('symbol', 'N/A')
+            trade_signal = signal.get('signal', 'HOLD')
+            confidence = signal.get('confidence', 0)
+            entry = signal.get('entry_price', 'N/A')
+            sl = signal.get('stop_loss', 'N/A')
+            tp1 = signal.get('take_profit_1', 'N/A')
+            tp2 = signal.get('take_profit_2', 'N/A')
+            tp3 = signal.get('take_profit_3', 'N/A')
+            rr = signal.get('risk_reward_ratio', 'N/A')
+            trend_short = signal.get('trend', {}).get('short_term', 'N/A') if isinstance(signal.get('trend'), dict) else 'N/A'
+            trend_long = signal.get('trend', {}).get('long_term', 'N/A') if isinstance(signal.get('trend'), dict) else 'N/A'
+            
+            detailed_signals += f"{idx}. {symbol}: {trade_signal} ({confidence}% confidence)\n"
+            detailed_signals += f"   Entry: {entry} | Stop Loss: {sl} | R:R: {rr}\n"
+            detailed_signals += f"   TP1: {tp1} | TP2: {tp2} | TP3: {tp3}\n"
+            detailed_signals += f"   Trend: {trend_short} (short) / {trend_long} (long)\n"
+            detailed_signals += f"   Analysis: {signal.get('rationale', 'See full report')}\n\n"
 
-    system_prompt = f"""You are a friendly AI trading advisor for {username}. You have access to real market data.
+    system_prompt = f"""You are a friendly trading advisor for {username}. You have REAL, CURRENT market analysis.
 
-HERE ARE THE CURRENT MARKET SIGNALS FROM MY ANALYSIS:
-{signals_summary}
+{detailed_signals}
 
-Your job is to:
-1. Answer questions about trading the symbols above
-2. Explain WHY each signal exists (in simple terms)
-3. Give practical advice: entry price, stop-loss, take-profit
-4. Always mention position sizing (recommend 1-5% of capital per trade)
-5. Explain risk management clearly
-6. Use beginner-friendly language - define technical terms
-7. Never guarantee profits - always mention risks
+YOUR JOB:
+1. When {username} asks about a symbol - check if it's in this list
+2. If YES: Give the exact signal, entry price, stop loss, and take profit levels
+3. If NO: Say "I don't have current signals for [symbol]"
+4. Explain the technical reasons using simple language (what RSI means, what MACD shows, etc.)
+5. Always recommend position size: 1-5% of their capital per trade
+6. Give clear risk management: where to place stop loss, how much they could lose
+7. Never promise profits - always mention risks
+8. Reference the actual confidence levels from the signals
 
-When {username} asks about a specific symbol:
-- Give the signal (BUY/SELL/HOLD)
-- Explain the technical reasons
-- Give entry and exit points
-- Explain what technical indicators support this
-- Give a risk assessment
+Use bullet points and keep it clear and simple.
 
-Format responses clearly with bullet points and simple language."""
+MOST IMPORTANT: If {username} asks about a symbol in the list above, give the specific entry/exit prices from the signal. Don't give generic advice when you have real data."""
 
     messages = [{"role": "system", "content": system_prompt}]
     for msg in chat_history_db[username][-20:]:
@@ -419,13 +448,13 @@ Format responses clearly with bullet points and simple language."""
     messages.append({"role": "user", "content": chat.message})
 
     try:
-        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.7, max_tokens=1500)
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.6, max_tokens=1500)
         ai_response = response.choices[0].message.content
         chat_history_db[username].append({"role": "user", "content": chat.message})
         chat_history_db[username].append({"role": "assistant", "content": ai_response})
         if len(chat_history_db[username]) > 50:
             chat_history_db[username] = chat_history_db[username][-50:]
-        return {"success": True, "response": ai_response, "timestamp": datetime.utcnow().isoformat(), "signals_provided": len(top_picks)}
+        return {"success": True, "response": ai_response, "timestamp": datetime.utcnow().isoformat(), "signals_analyzed": len(signals) if isinstance(signals, list) else 0}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
