@@ -325,16 +325,43 @@ def chat_with_ai(chat: ChatMessage):
         return {"success": False, "error": "OpenAI API key not configured"}
 
     try:
-        system_prompt = "You are an expert AI trading assistant. Provide actionable BUY/SELL/HOLD advice based on market analysis."
+        predictions_data = generate_market_predictions()
+        signals = predictions_data.get("signals", [])
+        top_picks = predictions_data.get("top_picks", [])
+        
+        signals_summary = "Current Market Signals:\n"
+        if top_picks:
+            for signal in top_picks[:5]:
+                signals_summary += f"- {signal.get('symbol', 'N/A')}: {signal.get('signal', 'HOLD')} (Confidence: {signal.get('confidence', 0)}%)\n"
+        
+        system_prompt = f"""You are an expert AI trading assistant with access to real market analysis data.
+        
+HERE ARE THE CURRENT MARKET SIGNALS FROM MY ANALYSIS:
+{signals_summary}
+
+You have access to detailed trading predictions. When users ask about specific symbols or the market:
+1. Reference the actual signals above
+2. Explain WHY each signal is bullish/bearish (technical reasons)
+3. Give position sizing recommendations (1-5% of capital)
+4. Explain risk management (stop-loss, take-profit levels)
+5. Use simple language - explain technical terms clearly
+6. If asked about a symbol not in signals, use general knowledge but mention the limited data
+
+IMPORTANT: Always explain your analysis in a way beginners can understand. Break down:
+- What technical indicator matters
+- Why it matters for this trade
+- What could go wrong (risk)
+- What's the profit target"""
+
         messages = [{"role": "system", "content": system_prompt}]
         if chat.conversation_history:
             for msg in chat.conversation_history[-10:]:
                 messages.append(msg)
         messages.append({"role": "user", "content": chat.message})
 
-        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.7, max_tokens=1000)
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.7, max_tokens=1500)
         ai_response = response.choices[0].message.content
-        return {"success": True, "response": ai_response, "timestamp": datetime.utcnow().isoformat()}
+        return {"success": True, "response": ai_response, "timestamp": datetime.utcnow().isoformat(), "signals_provided": len(top_picks)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -354,20 +381,51 @@ def chat_with_ai_user(username: str, chat: ChatMessage):
     if username not in chat_history_db:
         chat_history_db[username] = []
 
-    system_prompt = f"You are an AI trading assistant for {username}. Provide actionable trading advice."
+    predictions_data = generate_market_predictions()
+    signals = predictions_data.get("signals", [])
+    top_picks = predictions_data.get("top_picks", [])
+    
+    signals_summary = "Current Market Signals:\n"
+    if top_picks:
+        for signal in top_picks[:5]:
+            signals_summary += f"- {signal.get('symbol', 'N/A')}: {signal.get('signal', 'HOLD')} (Confidence: {signal.get('confidence', 0)}%)\n"
+
+    system_prompt = f"""You are a friendly AI trading advisor for {username}. You have access to real market data.
+
+HERE ARE THE CURRENT MARKET SIGNALS FROM MY ANALYSIS:
+{signals_summary}
+
+Your job is to:
+1. Answer questions about trading the symbols above
+2. Explain WHY each signal exists (in simple terms)
+3. Give practical advice: entry price, stop-loss, take-profit
+4. Always mention position sizing (recommend 1-5% of capital per trade)
+5. Explain risk management clearly
+6. Use beginner-friendly language - define technical terms
+7. Never guarantee profits - always mention risks
+
+When {username} asks about a specific symbol:
+- Give the signal (BUY/SELL/HOLD)
+- Explain the technical reasons
+- Give entry and exit points
+- Explain what technical indicators support this
+- Give a risk assessment
+
+Format responses clearly with bullet points and simple language."""
+
     messages = [{"role": "system", "content": system_prompt}]
     for msg in chat_history_db[username][-20:]:
         messages.append(msg)
     messages.append({"role": "user", "content": chat.message})
 
     try:
-        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.7, max_tokens=1000)
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.7, max_tokens=1500)
         ai_response = response.choices[0].message.content
         chat_history_db[username].append({"role": "user", "content": chat.message})
         chat_history_db[username].append({"role": "assistant", "content": ai_response})
         if len(chat_history_db[username]) > 50:
             chat_history_db[username] = chat_history_db[username][-50:]
-        return {"success": True, "response": ai_response, "timestamp": datetime.utcnow().isoformat()}
+        return {"success": True, "response": ai_response, "timestamp": datetime.utcnow().isoformat(), "signals_provided": len(top_picks)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
