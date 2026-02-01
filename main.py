@@ -181,7 +181,10 @@ CRITICAL: Only include signals where 5+ factors align. Confidence = actual win p
             max_tokens=6000
         )
 
-        content = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
+        if content is None:
+            return {"success": False, "error": "AI returned empty content"}
+        content = content.strip()
         content = re.sub(r"```json|```", "", content).strip()
         data = json.loads(content)
         
@@ -295,7 +298,10 @@ Return JSON (no markdown):
             max_tokens=2500
         )
         
-        content = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
+        if content is None:
+            return {"success": False, "error": "AI returned empty content"}
+        content = content.strip()
         content = re.sub(r"```json|```", "", content).strip()
         data = json.loads(content)
         
