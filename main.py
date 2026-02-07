@@ -100,9 +100,32 @@ CRITICAL: Pure JSON ONLY. Only include signals where 5+ factors align. Confidenc
         if not content:
             return {"success": False, "error": "AI returned empty content"}
         
+        # Check if the response is an error message from ai_provider
+        if content.startswith("ERROR:"):
+            return {"success": False, "error": content}
+
         content = content.strip()
-        content = re.sub(r"```json|```", "", content).strip()
-        data = json.loads(content)
+        # More robust JSON extraction
+        json_match = re.search(r"\[\s*\{.*\}\s*\]", content, re.DOTALL)
+        if json_match:
+            content = json_match.group(0)
+        else:
+            content = re.sub(r"```json|```", "", content).strip()
+            
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            # If standard parsing fails, try to find anything that looks like a JSON array
+            try:
+                # Last resort: try to find anything between [ and ]
+                start = content.find("[")
+                end = content.rfind("]") + 1
+                if start != -1 and end != 0:
+                    data = json.loads(content[start:end])
+                else:
+                    raise ValueError("No JSON array found")
+            except Exception:
+                return {"success": False, "error": "Failed to parse AI response as JSON", "details": content[:200]}
         
         strong_signals = [s for s in data if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]] if isinstance(data, list) else []
         
@@ -237,9 +260,23 @@ Return JSON (no markdown):
         content = get_ai_response(prompt)
         if not content:
             return {"success": False, "error": "AI returned empty content"}
+        
+        if content.startswith("ERROR:"):
+            return {"success": False, "error": content}
+
         content = content.strip()
-        content = re.sub(r"```json|```", "", content).strip()
-        data = json.loads(content)
+        # Robust JSON object extraction
+        json_match = re.search(r"\{.*\}", content, re.DOTALL)
+        if json_match:
+            content = json_match.group(0)
+        else:
+            content = re.sub(r"```json|```", "", content).strip()
+            
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return {"success": False, "error": "Failed to parse AI response as JSON", "details": content[:200]}
+            
         return {"success": True, "generated_at": datetime.utcnow().isoformat(), "advice": data}
     except Exception as e:
         return {"success": False, "error": str(e)}
