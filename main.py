@@ -4,7 +4,11 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import os, json, re
 from datetime import datetime
-from openai import OpenAI
+from ai_provider import get_ai_response
+
+def analyze(prompt):
+    return get_ai_response(prompt)
+
 from fastapi.middleware.cors import CORSMiddleware
 from backtest_api import load_history_df, run_backtest_from_signals, signals_from_sma, router as backtest_router
 
@@ -48,12 +52,6 @@ def get_filtered_ai_signals(symbol: str, confidence_threshold: float = 70.0) -> 
 # ----------------------------
 # OpenAI Client
 # ----------------------------
-def get_openai_client():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
-
 
 # ----------------------------
 # FastAPI App
