@@ -6,7 +6,7 @@ import google.generativeai as genai
 api_key = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=api_key)
 
-# Using gemini-2.0-flash which is available according to the list
+# Using gemini-2.0-flash which was confirmed to exist in the list_models output
 model = genai.GenerativeModel("gemini-2.0-flash")
 
 def get_ai_response(prompt: str) -> str:
@@ -21,9 +21,9 @@ def get_ai_response(prompt: str) -> str:
         if "quota" in error_msg:
             return "ERROR: AI Quota exceeded. Please wait a minute or upgrade your Gemini API plan."
         
-        # Fallback to another known model if 2.0-flash fails
+        # Try a more common fallback if 2.0-flash fails
         try:
-            fallback_model = genai.GenerativeModel("gemini-flash-latest")
+            fallback_model = genai.GenerativeModel("gemini-1.5-flash")
             return fallback_model.generate_content(prompt).text
         except:
             return f"ERROR: AI generation failed. Details: {str(e)}"
