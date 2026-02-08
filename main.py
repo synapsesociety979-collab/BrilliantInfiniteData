@@ -143,6 +143,9 @@ class UserAccount(BaseModel):
     binance_api_key: Optional[str] = None
     binance_api_secret: Optional[str] = None
 
+class AnalyzeRequest(BaseModel):
+    prompt: str = "test prompt"
+
 users_db = {}
 chat_history_db = {}
 
@@ -150,16 +153,20 @@ chat_history_db = {}
 def health_check():
     return {"status": "healthy", "service": "AI Trading Bot Backend"}
 
+@app.post("/analyze")
+def analyze_market_endpoint(request: AnalyzeRequest):
+    try:
+        result = get_ai_response(request.prompt)
+        return {"analysis": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/predictions")
 def get_predictions_public():
     return generate_market_predictions()
 
 @app.get("/get_predictions")
 def get_predictions(username: str, symbol: str):
-    if username not in users_db:
-        # For demo purposes, we'll allow looking up predictions even if user isn't 'connected'
-        # but let's maintain the error if that's what's expected
-        pass
     predictions = get_filtered_ai_signals(symbol)
     return {
         "username": username,
