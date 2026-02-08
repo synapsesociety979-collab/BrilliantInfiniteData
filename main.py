@@ -2,12 +2,21 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-import os, json, re
+import os, json, re, time
 from datetime import datetime
 from ai_provider import get_ai_response
 
 from fastapi.middleware.cors import CORSMiddleware
 from backtest_api import load_history_df, run_backtest_from_signals, signals_from_sma, router as backtest_router
+
+# ----------------------------
+# Cache Configuration
+# ----------------------------
+PREDICTIONS_CACHE = {
+    "data": None,
+    "timestamp": 0
+}
+CACHE_DURATION_SECONDS = 300  # 5 minutes
 
 # ----------------------------
 # Trading symbols for AI and backtesting
@@ -52,7 +61,13 @@ def get_filtered_ai_signals(symbol: str, confidence_threshold: float = 70.0) -> 
 # AI Generation Functions
 # ----------------------------
 def generate_market_predictions() -> Dict[str, Any]:
-    """Generates world-class market predictions using advanced analysis via Gemini."""
+    """Generates world-class market predictions using advanced analysis via Gemini with caching."""
+    global PREDICTIONS_CACHE
+    
+    current_time = time.time()
+    if PREDICTIONS_CACHE["data"] and (current_time - PREDICTIONS_CACHE["timestamp"] < CACHE_DURATION_SECONDS):
+        return PREDICTIONS_CACHE["data"]
+
     prompt = """Analyze these pairs with MAXIMUM RIGOR for top-tier trading signals:
 
 FOREX: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF
@@ -108,7 +123,7 @@ CRITICAL: Pure JSON ONLY. Only include signals where 5+ factors align. Confidenc
         data = json.loads(content)
         strong_signals = [s for s in data if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]] if isinstance(data, list) else []
         
-        return {
+        result = {
             "success": True,
             "generated_at": datetime.utcnow().isoformat(),
             "model": "gemini-2.0-flash",
@@ -118,6 +133,10 @@ CRITICAL: Pure JSON ONLY. Only include signals where 5+ factors align. Confidenc
             "top_picks": strong_signals[:3] if strong_signals else [],
             "disclaimer": "Trading involves substantial risk."
         }
+        
+        PREDICTIONS_CACHE["data"] = result
+        PREDICTIONS_CACHE["timestamp"] = current_time
+        return result
     except Exception as e:
         return {"success": False, "error": f"Prediction failed: {str(e)}"}
 
