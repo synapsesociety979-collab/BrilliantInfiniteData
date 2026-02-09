@@ -16,7 +16,8 @@ PREDICTIONS_CACHE = {
     "data": None,
     "timestamp": 0
 }
-CACHE_DURATION_SECONDS = 300  # 5 minutes
+ADVICE_CACHE = {}
+CACHE_DURATION_SECONDS = 600  # 10 minutes for predictions
 
 # ----------------------------
 # Trading symbols for AI and backtesting
@@ -126,7 +127,7 @@ CRITICAL: Pure JSON ONLY. Only include signals where 5+ factors align. Confidenc
         result = {
             "success": True,
             "generated_at": datetime.utcnow().isoformat(),
-            "model": "gemini-2.0-flash",
+            "model": "gemini-1.5-flash",
             "signals": data,
             "total_signals": len(data) if isinstance(data, list) else 0,
             "strong_signals_count": len(strong_signals),
@@ -195,7 +196,17 @@ def get_predictions(username: str, symbol: str):
 
 @app.get("/advice/{symbol}")
 def get_trading_advice(symbol: str):
-    prompt = f"Perform deep analysis on {symbol.upper()} and return JSON with recommendation, confidence, trade_setup, technical_analysis, and risk_assessment."
+    """Get comprehensive institutional-grade trading advice with caching."""
+    symbol = symbol.upper()
+    current_time = time.time()
+    
+    # Cache check
+    if symbol in ADVICE_CACHE:
+        cache_data, timestamp = ADVICE_CACHE[symbol]
+        if current_time - timestamp < 3600:  # 1 hour cache for deep advice
+            return cache_data
+
+    prompt = f"Perform deep analysis on {symbol} and return JSON with recommendation, confidence, trade_setup, technical_analysis, and risk_assessment."
     try:
         content = get_ai_response(prompt)
         if content.startswith("ERROR:"):
@@ -205,7 +216,11 @@ def get_trading_advice(symbol: str):
         if json_match:
             content = json_match.group(0)
         data = json.loads(content)
-        return {"success": True, "generated_at": datetime.utcnow().isoformat(), "advice": data}
+        result = {"success": True, "generated_at": datetime.utcnow().isoformat(), "advice": data}
+        
+        # Update cache
+        ADVICE_CACHE[symbol] = (result, current_time)
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
