@@ -49,3 +49,7 @@ outputType = "webview"
 task = "shell.exec"
 args = "uvicorn main:app --host 0.0.0.0 --port 5000 --reload"
 waitForPort = 5000
+
+[userenv]
+
+[userenv.shared]

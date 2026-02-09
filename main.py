@@ -127,7 +127,7 @@ CRITICAL: Pure JSON ONLY. Only include signals where 5+ factors align. Confidenc
         result = {
             "success": True,
             "generated_at": datetime.utcnow().isoformat(),
-            "model": "gemini-1.5-flash",
+            "model": "llama-3.3-70b-versatile",
             "signals": data,
             "total_signals": len(data) if isinstance(data, list) else 0,
             "strong_signals_count": len(strong_signals),

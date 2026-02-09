@@ -12,3 +12,4 @@ openai   # for OpenAI HTTP client
 
 google-generativeai
 requests
+groq
