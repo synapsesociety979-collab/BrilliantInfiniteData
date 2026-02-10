@@ -2,12 +2,72 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-import os, json, re, time
+import os, json, re, time, requests
 from datetime import datetime
 from ai_provider import get_ai_response
 
 from fastapi.middleware.cors import CORSMiddleware
 from backtest_api import load_history_df, run_backtest_from_signals, signals_from_sma, router as backtest_router
+
+# ----------------------------
+# Alpha Vantage Integration
+# ----------------------------
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
+
+def fetch_alpha_vantage_forex(from_symbol: str, to_symbol: str = "USD") -> Dict:
+    """Fetch real-time Forex data from Alpha Vantage."""
+    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={from_symbol}&to_currency={to_symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        rate_data = data.get("Realtime Currency Exchange Rate", {})
+        if rate_data:
+            return {
+                "rate": rate_data.get("5. Exchange Rate"),
+                "bid": rate_data.get("8. Bid Price"),
+                "ask": rate_data.get("9. Ask Price"),
+                "last_refreshed": rate_data.get("6. Last Refreshed")
+            }
+    except Exception as e:
+        print(f"Alpha Vantage Forex Error: {e}")
+    return {}
+
+def fetch_alpha_vantage_crypto(symbol: str) -> Dict:
+    """Fetch real-time Crypto data from Alpha Vantage."""
+    # Convert BTCUSDT to BTC
+    base_symbol = symbol.replace("USDT", "")
+    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base_symbol}&to_currency=USD&apikey={ALPHA_VANTAGE_API_KEY}"
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        rate_data = data.get("Realtime Currency Exchange Rate", {})
+        if rate_data:
+            return {
+                "price": rate_data.get("5. Exchange Rate"),
+                "last_refreshed": rate_data.get("6. Last Refreshed")
+            }
+    except Exception as e:
+        print(f"Alpha Vantage Crypto Error: {e}")
+    return {}
+
+def get_market_context() -> str:
+    """Gathers real-time context for key symbols to feed the AI."""
+    context = []
+    # Sample a few key assets to stay within rate limits if needed
+    key_forex = ["EUR", "GBP", "JPY"]
+    key_crypto = ["BTC", "ETH"]
+    
+    for f in key_forex:
+        data = fetch_alpha_vantage_forex(f)
+        if data:
+            context.append(f"{f}/USD: Rate {data['rate']} (Last Update: {data['last_refreshed']})")
+            
+    for c in key_crypto:
+        data = fetch_alpha_vantage_crypto(c)
+        if data:
+            context.append(f"{c}/USD: Price {data['price']} (Last Update: {data['last_refreshed']})")
+            
+    return " | ".join(context) if context else "Live market data currently unavailable."
 
 # ----------------------------
 # Cache Configuration
@@ -69,7 +129,12 @@ def generate_market_predictions() -> Dict[str, Any]:
     if PREDICTIONS_CACHE["data"] and (current_time - PREDICTIONS_CACHE["timestamp"] < CACHE_DURATION_SECONDS):
         return PREDICTIONS_CACHE["data"]
 
-    prompt = """Analyze these pairs with MAXIMUM RIGOR and INSTITUTIONAL-GRADE CALCULATIONS for top-tier trading signals. 
+    live_data = get_market_context()
+
+    prompt = f"""INSTITUTIONAL MARKET ANALYSIS REPORT
+LIVE MARKET DATA CONTEXT: {live_data}
+
+Analyze these pairs with MAXIMUM RIGOR and INSTITUTIONAL-GRADE CALCULATIONS for top-tier trading signals. 
 
 FOREX: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF
 CRYPTO: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT
