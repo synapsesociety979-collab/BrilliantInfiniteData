@@ -69,10 +69,15 @@ def generate_market_predictions() -> Dict[str, Any]:
     if PREDICTIONS_CACHE["data"] and (current_time - PREDICTIONS_CACHE["timestamp"] < CACHE_DURATION_SECONDS):
         return PREDICTIONS_CACHE["data"]
 
-    prompt = """Analyze these pairs with MAXIMUM RIGOR for top-tier trading signals:
+    prompt = """Analyze these pairs with MAXIMUM RIGOR and INSTITUTIONAL-GRADE CALCULATIONS for top-tier trading signals. 
 
 FOREX: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF
 CRYPTO: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT
+
+For each signal, provide deep calculative reasoning including:
+1. Volatility-adjusted stop loss levels.
+2. Exact pip/percentage profit targets.
+3. Global currency context (consider how strength in USD affects NGN and other local currencies).
 
 Return JSON array with this structure ONLY:
 [{
@@ -101,7 +106,7 @@ Return JSON array with this structure ONLY:
     "support_1": "level", "support_2": "level"
   },
   "sentiment": "sentiment",
-  "rationale": "explanation"
+  "rationale": "Deep institutional analysis with calculative justification"
 }]
 
 CRITICAL: Pure JSON ONLY. Only include signals where 5+ factors align. Confidence = win probability."""
@@ -233,7 +238,20 @@ def chat_with_ai(chat: ChatMessage):
     try:
         preds_resp = generate_market_predictions()
         signals = preds_resp.get("signals", [])
-        system_prompt = f"You are an ELITE AI Trading Strategist. Signals: {json.dumps(signals[:5])}. Use this data to help the user."
+        
+        # Enhanced system prompt for better reasoning and currency handling
+        system_prompt = f"""You are an ELITE AI Trading Strategist and Financial Consultant. 
+Your reasoning must be highly calculative, professional, and institutional-grade.
+
+CORE CAPABILITIES:
+1. GLOBAL CURRENCY HANDLING: You are an expert in all global currencies, including Nigerian Naira (NGN), USD, EUR, etc.
+2. CALCULATIVE ADVICE: When users mention specific amounts (e.g., 'I have 500,000 Naira'), calculate position sizes, potential profits, and risks precisely.
+3. CONVERSION EXPERTISE: Always consider current market exchange rates (approximately 1 USD = 1,500 NGN or latest market rates) when giving advice.
+4. RISK MANAGEMENT: Never suggest more than 1-5% risk per trade.
+
+Current Market Signals: {json.dumps(signals[:5])}.
+
+Always provide specific, numbered advice with calculations if the user provides financial data."""
         
         full_prompt = f"{system_prompt}\nUser: {chat.message}\nAI:"
         ai_response = get_ai_response(full_prompt)
