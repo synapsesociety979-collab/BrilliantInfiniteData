@@ -145,34 +145,40 @@ For each signal, provide deep calculative reasoning including:
 3. Global currency context (consider how strength in USD affects NGN and other local currencies).
 
 Return JSON array with this structure ONLY:
-[{
-  "symbol": "PAIR",
-  "signal": "STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL",
-  "confidence": 0-100,
-  "confluence_factors": 5-15,
-  "entry_price": "optimal entry",
-  "stop_loss": "calculated SL",
-  "take_profit_1": "TP1",
-  "take_profit_2": "TP2",
-  "take_profit_3": "TP3",
-  "risk_reward_ratio": "1:X",
-  "position_size": "1-5%",
-  "timeframe": "scalp/intraday/swing/position",
-  "trend": {"short": "bullish/bearish/neutral", "medium": "bullish/bearish/neutral", "long": "bullish/bearish/neutral"},
-  "technical": {
-    "rsi": "value",
-    "macd": "bullish/bearish",
-    "ema_alignment": "bullish/bearish",
-    "volume": "trend",
-    "pattern": "pattern"
-  },
-  "key_levels": {
-    "resistance_1": "level", "resistance_2": "level",
-    "support_1": "level", "support_2": "level"
-  },
-  "sentiment": "sentiment",
-  "rationale": "Deep institutional analysis with calculative justification"
-}]
+[
+  {{
+    "symbol": "PAIR",
+    "signal": "STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL",
+    "confidence": 0-100,
+    "confluence_factors": 5-15,
+    "entry_price": "optimal entry",
+    "stop_loss": "calculated SL",
+    "take_profit_1": "TP1",
+    "take_profit_2": "TP2",
+    "take_profit_3": "TP3",
+    "risk_reward_ratio": "1:X",
+    "position_size": "1-5%",
+    "timeframe": "scalp/intraday/swing/position",
+    "trend": {{
+      "short": "bullish/bearish/neutral", 
+      "medium": "bullish/bearish/neutral", 
+      "long": "bullish/bearish/neutral"
+    }},
+    "technical": {{
+      "rsi": "value",
+      "macd": "bullish/bearish",
+      "ema_alignment": "bullish/bearish",
+      "volume": "trend",
+      "pattern": "pattern"
+    }},
+    "key_levels": {{
+      "resistance_1": "level", "resistance_2": "level",
+      "support_1": "level", "support_2": "level"
+    }},
+    "sentiment": "sentiment",
+    "rationale": "Deep institutional analysis with calculative justification"
+  }}
+]
 
 CRITICAL: Pure JSON ONLY. Only include signals where 5+ factors align. Confidence = win probability."""
     
