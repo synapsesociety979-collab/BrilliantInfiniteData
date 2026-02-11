@@ -241,6 +241,7 @@ class Trade(BaseModel):
     volume: float
     type: str  # BUY/SELL
     pnl: float = 0.0
+    is_demo: bool = True  # Distinguish between demo and real trades
 
 class AccountState(BaseModel):
     username: str
@@ -249,6 +250,91 @@ class AccountState(BaseModel):
     trades: List[Trade] = []
 
 accounts_db: Dict[str, AccountState] = {}
+
+class DemoAccount(BaseModel):
+    username: str
+    demo_balance: float = 10000.0  # Default $10k demo balance
+    currency: str = "USD"
+    active_demo_trades: List[Trade] = []
+    trade_history: List[Trade] = []
+
+demo_accounts_db: Dict[str, DemoAccount] = {}
+
+@app.post("/demo/open_account/{username}")
+def open_demo_account(username: str, initial_balance: float = 10000.0):
+    """Initialize a demo trading account for the user."""
+    demo_accounts_db[username] = DemoAccount(username=username, demo_balance=initial_balance)
+    return {"status": "success", "message": f"Demo account opened for {username} with ${initial_balance}"}
+
+@app.post("/demo/execute_trade/{username}")
+def execute_demo_trade(username: str, symbol: str, volume: float, trade_type: str):
+    """Execute a simulated trade in the demo account."""
+    if username not in demo_accounts_db:
+        open_demo_account(username)
+    
+    account = demo_accounts_db[username]
+    symbol = symbol.upper()
+    
+    # Get current price for entry
+    live_data = fetch_alpha_vantage_crypto(symbol) if "USDT" in symbol else fetch_alpha_vantage_forex(symbol[:3], symbol[3:] or "USD")
+    entry_price = float(live_data.get("price") or live_data.get("rate") or 0.0)
+    
+    if entry_price == 0.0:
+        raise HTTPException(status_code=400, detail="Could not fetch live price for entry")
+        
+    new_trade = Trade(
+        symbol=symbol,
+        entry_price=entry_price,
+        current_price=entry_price,
+        volume=volume,
+        type=trade_type.upper(),
+        is_demo=True
+    )
+    
+    account.active_demo_trades.append(new_trade)
+    return {"status": "success", "trade": new_trade}
+
+@app.get("/demo/ai_feedback/{username}")
+def get_demo_ai_feedback(username: str):
+    """AI analyzes demo performance and gives advice for the real account."""
+    if username not in demo_accounts_db:
+        return {"error": "No demo account found"}
+    
+    account = demo_accounts_db[username]
+    # Update prices for feedback
+    for trade in account.active_demo_trades:
+        live_data = fetch_alpha_vantage_crypto(trade.symbol) if "USDT" in trade.symbol else fetch_alpha_vantage_forex(trade.symbol[:3], trade.symbol[3:])
+        trade.current_price = float(live_data.get("price") or live_data.get("rate") or trade.current_price)
+        if trade.type == "BUY":
+            trade.pnl = (trade.current_price - trade.entry_price) * trade.volume
+        else:
+            trade.pnl = (trade.entry_price - trade.current_price) * trade.volume
+
+    trades_summary = [
+        f"{t.type} {t.volume} {t.symbol} at {t.entry_price}, current {t.current_price}, PnL: {t.pnl}"
+        for t in account.active_demo_trades
+    ]
+    
+    prompt = f"""You are an Elite Trading Risk Manager. 
+Analyze these DEMO TRADES for user {username}:
+{json.dumps(trades_summary)}
+
+User Balance: {account.demo_balance} USD
+
+TASK:
+1. Evaluate their current demo performance.
+2. Provide CRITICAL advice: Should they replicate these trades in their MAIN Forex account?
+3. Warn about potential market turns (e.g., BTC reversals).
+4. Suggest exact adjustments to stop losses or take profits for their REAL account.
+
+Be calculative and direct."""
+
+    feedback = get_ai_response(prompt)
+    return {
+        "username": username,
+        "demo_performance": account.active_demo_trades,
+        "ai_strategic_advice": feedback
+    }
 
 def update_account_pnl(username: str):
     """Update PnL for all trades in an account using live prices."""
