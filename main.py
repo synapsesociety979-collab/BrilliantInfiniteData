@@ -231,6 +231,77 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------------------
+# Account & Trade Monitoring
+# ----------------------------
+class Trade(BaseModel):
+    symbol: str
+    entry_price: float
+    current_price: float
+    volume: float
+    type: str  # BUY/SELL
+    pnl: float = 0.0
+
+class AccountState(BaseModel):
+    username: str
+    balance: float
+    currency: str = "NGN"
+    trades: List[Trade] = []
+
+accounts_db: Dict[str, AccountState] = {}
+
+def update_account_pnl(username: str):
+    """Update PnL for all trades in an account using live prices."""
+    if username not in accounts_db:
+        return
+    
+    account = accounts_db[username]
+    for trade in account.trades:
+        # Fetch live price
+        live_data = fetch_alpha_vantage_crypto(trade.symbol) if "USDT" in trade.symbol else fetch_alpha_vantage_forex(trade.symbol[:3], trade.symbol[3:])
+        current_price = float(live_data.get("price") or live_data.get("rate") or trade.current_price)
+        
+        trade.current_price = current_price
+        if trade.type == "BUY":
+            trade.pnl = (current_price - trade.entry_price) * trade.volume
+        else:
+            trade.pnl = (trade.entry_price - current_price) * trade.volume
+
+@app.get("/account/monitor/{username}")
+def monitor_account(username: str):
+    """Monitor account balance and trades with live currency conversion."""
+    if username not in accounts_db:
+        # Mocking an account for demo if not found
+        accounts_db[username] = AccountState(
+            username=username,
+            balance=1000000.0,
+            trades=[
+                Trade(symbol="BTCUSDT", entry_price=43000.0, current_price=43500.0, volume=0.01, type="BUY"),
+                Trade(symbol="EURUSD", entry_price=1.0850, current_price=1.0900, volume=10000, type="BUY")
+            ]
+        )
+    
+    update_account_pnl(username)
+    account = accounts_db[username]
+    
+    # Get live NGN rate
+    ngn_data = fetch_alpha_vantage_forex("USD", "NGN")
+    usd_to_ngn = float(ngn_data.get("rate") or 1500.0)
+    
+    total_pnl_usd = sum(t.pnl for t in account.trades)
+    total_pnl_ngn = total_pnl_usd * usd_to_ngn
+    
+    return {
+        "username": username,
+        "balance_ngn": account.balance,
+        "balance_usd": account.balance / usd_to_ngn,
+        "active_trades": account.trades,
+        "total_pnl_usd": total_pnl_usd,
+        "total_pnl_ngn": total_pnl_ngn,
+        "usd_to_ngn_rate": usd_to_ngn,
+        "status": "alert" if total_pnl_usd < -50 else "healthy"
+    }
+
 class UserAccount(BaseModel):
     username: str
     mt5_login: Optional[str] = None

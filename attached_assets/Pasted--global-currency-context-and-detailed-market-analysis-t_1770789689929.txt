@@ -1,0 +1,46 @@
+ global currency context and detailed market analysis to trading signals
+see the errors am facing can you fix it "success": false,
+"error": "Prediction generation failed",
+"details": "Expecting value: line 1 column 1 (char 0)"
+}
+
+{
+"success": true,
+"response": "ERROR: AI Model not found. Details: 404 models/gemini-1.5-flash is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+"timestamp": "2026-02-07T20:08:21.598595",
+"signals_analyzed": 0
+}
+
+You've reached your daily free quota limit. It will reset at 12:00 AM UTC.
+
+am facing this error too can you fix it
+
+You've reached your daily free quota limit. It will reset at 12:00 AM UTC.
+
+ok so please my predictions get prediction is supposed to get predictions form the forex market but instead it is showing backend active so i wnat you to fix in make all my exisials work like it was working when i was usingopen ai api ey like what the fuck is wrong
+
+data = request.get_json(silent=True) or {}
+symbol = data.get("symbol", "BTCUSDT")
+use this and also use this @app.route("/analyze", methods=["POST"])
+def analyze():
+try:
+data = request.get_json(silent=True) or {}
+prompt = data.get("prompt", "test prompt")
+
+    result = get_ai_response(prompt)
+    return {"analysis": result}
+except Exception as e:
+    return {"error": str(e)}, 500
+to check for the error cause my backend is showing me ai quota excedde but is is not supposed to be a problem so check if i am makeing the probelem in all my codes and make sure everthing is working well please make sure everthing is working well thanks
+
+ams till seeing the same error in alll my end points "ERROR: AI Quota exceeded. Please wait a minute or upgrade your Gemini API plan." fix it cause i dont understand i have a gemini plan working
+
+i wnat you to help me my backend it is not working it is showing me that i have used uop my genimi limits but i did not use up anything so i need your help to make it work cause am pretty sure i payed fully so maybe the problem is forn me or form the code and i dont knwo what to do to ensure i ahve it working well fully
+
+i am now using groq api key so i want you to change everthing in the code to match it and make it work for the ai to use it to generate all required messages output an dend points
+
+i want you to make the reasoning of the ai better and more caulative and custom make in such a way that the ai will get beter and will be able to answer questions based on nigerian naria currency or any other currency in the world especially the ai chat make it that way so that if you tell it a particular amount in naria it will be able to anser you and give u advice
+
+i wnat you to add an alpha vintage api key and i wnat you to edit the code to make all my end points including teh ai draw things and so anlysis form the vintage api key so that it will make the forex analisys more good
+
+i wnat you to make it more better in such a way that OK I noticed a problem about this course I want you to make the code better so like you know that if somebody put a trade If somebody puts a trade then the person is now trading then the port is not yet to monitor the threat to the force save what if the market just like turn like the market just turn understand and go to another place or like BTCUSE tone and go to another place so I need is it possible for you to make the boat in such a way that I can be able to connect accounts that both be able to see the accounts and see the traders happening and alert you with notifications even though you can even though you account can be connected inside the website 'cause that will cost you A bit of illegal actions and money stuff so I wanted to make it in such a way that the boat will be able to monitor your accounts because I'm using HFM market metaphor metal design met 3 that 5 and the rest of them Meta Trader 5 and the rest of them so I want you to be able to make the boat to connect to your account and monitor your account and how the money is going and let's say if you have some amount of money like you have never like 4000 naira something like that that they both be able to get with time data I don't mean the boat to be tamed that data rate scenarios 1500 when is 1003 something let's get with with that about all currency exchange so that I want to just make it better make it so good so that you need to do more so add more Python and make it better better better understand thanks
