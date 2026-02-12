@@ -3,7 +3,7 @@ modules = ["python-3.11"]
 
 [nix]
 channel = "stable-25_05"
-packages = ["glibcLocales", "libxcrypt"]
+packages = ["c-ares", "cacert", "cargo", "glibcLocales", "grpc", "libffi", "libiconv", "libuv", "libxcrypt", "openssl", "pkg-config", "rustc", "zlib"]
 
 [unitTest]
 language = "python3"
@@ -17,6 +17,7 @@ deploymentTarget = "cloudrun"
 
 [agent]
 expertMode = true
+integrations = ["python_database:1.0.0"]
 
 [[ports]]
 localPort = 3000
