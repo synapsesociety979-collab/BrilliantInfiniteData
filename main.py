@@ -23,9 +23,9 @@ def fetch_alpha_vantage_forex(from_symbol: str, to_symbol: str = "USD") -> Dict:
         rate_data = data.get("Realtime Currency Exchange Rate", {})
         if rate_data:
             return {
-                "rate": rate_data.get("5. Exchange Rate"),
-                "bid": rate_data.get("8. Bid Price"),
-                "ask": rate_data.get("9. Ask Price"),
+                "rate": float(rate_data.get("5. Exchange Rate") or 0),
+                "bid": float(rate_data.get("8. Bid Price") or 0),
+                "ask": float(rate_data.get("9. Ask Price") or 0),
                 "last_refreshed": rate_data.get("6. Last Refreshed")
             }
     except Exception as e:
@@ -43,12 +43,17 @@ def fetch_alpha_vantage_crypto(symbol: str) -> Dict:
         rate_data = data.get("Realtime Currency Exchange Rate", {})
         if rate_data:
             return {
-                "price": rate_data.get("5. Exchange Rate"),
+                "price": float(rate_data.get("5. Exchange Rate") or 0),
                 "last_refreshed": rate_data.get("6. Last Refreshed")
             }
     except Exception as e:
         print(f"Alpha Vantage Crypto Error: {e}")
     return {}
+
+def get_ngn_rate() -> float:
+    """Get the current USD/NGN exchange rate."""
+    data = fetch_alpha_vantage_forex("USD", "NGN")
+    return float(data.get("rate") or 1600.0)
 
 def get_market_context() -> str:
     """Gathers real-time context for key symbols to feed the AI."""
@@ -60,22 +65,19 @@ def get_market_context() -> str:
     for f in key_forex:
         data = fetch_alpha_vantage_forex(f)
         if data:
-            context.append(f"{f}/USD: Rate {data['rate']} (Last Update: {data['last_refreshed']})")
+            context.append(f"{f}/USD: Rate {data.get('rate')} (Last Update: {data.get('last_refreshed')})")
             
     for c in key_crypto:
         data = fetch_alpha_vantage_crypto(c)
         if data:
-            context.append(f"{c}/USD: Price {data['price']} (Last Update: {data['last_refreshed']})")
+            context.append(f"{c}/USD: Price {data.get('price')} (Last Update: {data.get('last_refreshed')})")
             
     return " | ".join(context) if context else "Live market data currently unavailable."
 
 # ----------------------------
 # Cache Configuration
 # ----------------------------
-PREDICTIONS_CACHE = {
-    "data": None,
-    "timestamp": 0
-}
+PREDICTIONS_CACHE = {}
 ADVICE_CACHE = {}
 CACHE_DURATION_SECONDS = 600  # 10 minutes for predictions
 
@@ -86,6 +88,91 @@ TRADING_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "EURUSD", "GBPUSD", "USDJPY",
     "AUDUSD", "USDCAD", "NZDUSD", "USDCHF", "SOLUSDT", "ADAUSDT", "DOGEUSDT"
 ]
+
+# ----------------------------
+# AI Generation Functions
+# ----------------------------
+def generate_market_predictions(investment_amount_ngn: float = 0.0) -> Dict[str, Any]:
+    """Generates high-accuracy market predictions with investment-specific advice."""
+    global PREDICTIONS_CACHE
+    
+    current_time = time.time()
+    # Cache key includes investment amount
+    cache_key = f"preds_{investment_amount_ngn}"
+    
+    if cache_key in PREDICTIONS_CACHE and (current_time - PREDICTIONS_CACHE[cache_key]["timestamp"] < CACHE_DURATION_SECONDS):
+        return PREDICTIONS_CACHE[cache_key]["data"]
+
+    live_data = get_market_context()
+    ngn_rate = get_ngn_rate()
+    investment_usd = investment_amount_ngn / ngn_rate if investment_amount_ngn > 0 else 0
+
+    prompt = f"""INSTITUTIONAL MARKET ANALYSIS - TARGET ACCURACY: 70%+
+LIVE MARKET CONTEXT: {live_data}
+INVESTMENT CONTEXT: {investment_amount_ngn} NGN (Approx. {investment_usd:.2f} USD)
+
+Analyze these pairs with 70%+ ACCURACY RIGOR. For each signal, you MUST include:
+1. Exact entry, stop-loss, and 3 take-profit targets.
+2. HOLD TIME: Specify exactly how many minutes or hours to hold the trade.
+3. RISK ADVICE: Based on {investment_amount_ngn} NGN, calculate the exact position size to use in Naira.
+4. BACK-OUT STRATEGY: Define a specific 'Exit Trigger' (e.g., 'If price stays below X for 15 mins, BACK OUT').
+
+FOREX: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF
+CRYPTO: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT
+
+Return JSON array:
+[
+  {{
+    "symbol": "PAIR",
+    "signal": "STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL",
+    "confidence": 70-100,
+    "hold_time": "X minutes/hours",
+    "position_size_ngn": "amount to use from your budget",
+    "entry_price": "price",
+    "stop_loss": "price",
+    "take_profit_1": "price",
+    "back_out_trigger": "Specific condition to exit early",
+    "rationale": "Calculative justification"
+  }}
+]
+CRITICAL: ONLY include signals with 70%+ confidence. Pure JSON only."""
+
+    try:
+        content = get_ai_response(prompt)
+        if not content:
+            return {"success": False, "error": "AI returned empty content"}
+        
+        if content.startswith("ERROR:"):
+            return {"success": False, "error": content}
+
+        content = content.strip()
+        # Extract JSON array
+        json_match = re.search(r"\[.*\]", content, re.DOTALL)
+        if json_match:
+            content = json_match.group(0)
+        else:
+            content = re.sub(r"```json|```", "", content).strip()
+            
+        data = json.loads(content)
+        
+        # Filter for 70%+ accuracy
+        data = [s for s in data if s.get("confidence", 0) >= 70]
+        
+        result = {
+            "success": True,
+            "generated_at": datetime.utcnow().isoformat(),
+            "investment_context_ngn": investment_amount_ngn,
+            "usd_ngn_rate": ngn_rate,
+            "model": "llama-3.3-70b-versatile",
+            "signals": data,
+            "total_signals": len(data) if isinstance(data, list) else 0,
+            "disclaimer": "Trading involves substantial risk. Target accuracy is based on technical confluence."
+        }
+        
+        PREDICTIONS_CACHE[cache_key] = {"data": result, "timestamp": current_time}
+        return result
+    except Exception as e:
+        return {"success": False, "error": f"Prediction failed: {str(e)}"}
 
 # ----------------------------
 # Helper: Dynamic AI Signal Filtering
@@ -119,105 +206,6 @@ def get_filtered_ai_signals(symbol: str, confidence_threshold: float = 70.0) -> 
     return filtered_preds if filtered_preds else [{"symbol": symbol, "signal": "HOLD", "confidence": 0}]
 
 # ----------------------------
-# AI Generation Functions
-# ----------------------------
-def generate_market_predictions() -> Dict[str, Any]:
-    """Generates world-class market predictions using advanced analysis via Gemini with caching."""
-    global PREDICTIONS_CACHE
-    
-    current_time = time.time()
-    if PREDICTIONS_CACHE["data"] and (current_time - PREDICTIONS_CACHE["timestamp"] < CACHE_DURATION_SECONDS):
-        return PREDICTIONS_CACHE["data"]
-
-    live_data = get_market_context()
-
-    prompt = f"""INSTITUTIONAL MARKET ANALYSIS REPORT
-LIVE MARKET DATA CONTEXT: {live_data}
-
-Analyze these pairs with MAXIMUM RIGOR and INSTITUTIONAL-GRADE CALCULATIONS for top-tier trading signals. 
-
-FOREX: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF
-CRYPTO: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT
-
-For each signal, provide deep calculative reasoning including:
-1. Volatility-adjusted stop loss levels.
-2. Exact pip/percentage profit targets.
-3. Global currency context (consider how strength in USD affects NGN and other local currencies).
-
-Return JSON array with this structure ONLY:
-[
-  {{
-    "symbol": "PAIR",
-    "signal": "STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL",
-    "confidence": 0-100,
-    "confluence_factors": 5-15,
-    "entry_price": "optimal entry",
-    "stop_loss": "calculated SL",
-    "take_profit_1": "TP1",
-    "take_profit_2": "TP2",
-    "take_profit_3": "TP3",
-    "risk_reward_ratio": "1:X",
-    "position_size": "1-5%",
-    "timeframe": "scalp/intraday/swing/position",
-    "trend": {{
-      "short": "bullish/bearish/neutral", 
-      "medium": "bullish/bearish/neutral", 
-      "long": "bullish/bearish/neutral"
-    }},
-    "technical": {{
-      "rsi": "value",
-      "macd": "bullish/bearish",
-      "ema_alignment": "bullish/bearish",
-      "volume": "trend",
-      "pattern": "pattern"
-    }},
-    "key_levels": {{
-      "resistance_1": "level", "resistance_2": "level",
-      "support_1": "level", "support_2": "level"
-    }},
-    "sentiment": "sentiment",
-    "rationale": "Deep institutional analysis with calculative justification"
-  }}
-]
-
-CRITICAL: Pure JSON ONLY. Only include signals where 5+ factors align. Confidence = win probability."""
-    
-    try:
-        content = get_ai_response(prompt)
-        if not content:
-            return {"success": False, "error": "AI returned empty content"}
-        
-        if content.startswith("ERROR:"):
-            return {"success": False, "error": content}
-
-        content = content.strip()
-        json_match = re.search(r"\[\s*\{.*\}\s*\]", content, re.DOTALL)
-        if json_match:
-            content = json_match.group(0)
-        else:
-            content = re.sub(r"```json|```", "", content).strip()
-            
-        data = json.loads(content)
-        strong_signals = [s for s in data if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]] if isinstance(data, list) else []
-        
-        result = {
-            "success": True,
-            "generated_at": datetime.utcnow().isoformat(),
-            "model": "llama-3.3-70b-versatile",
-            "signals": data,
-            "total_signals": len(data) if isinstance(data, list) else 0,
-            "strong_signals_count": len(strong_signals),
-            "top_picks": strong_signals[:3] if strong_signals else [],
-            "disclaimer": "Trading involves substantial risk."
-        }
-        
-        PREDICTIONS_CACHE["data"] = result
-        PREDICTIONS_CACHE["timestamp"] = current_time
-        return result
-    except Exception as e:
-        return {"success": False, "error": f"Prediction failed: {str(e)}"}
-
-# ----------------------------
 # FastAPI App
 # ----------------------------
 app = FastAPI(title="AI Multi-User Trading Bot Backend")
@@ -241,7 +229,7 @@ class Trade(BaseModel):
     volume: float
     type: str  # BUY/SELL
     pnl: float = 0.0
-    is_demo: bool = True  # Distinguish between demo and real trades
+    is_demo: bool = True
 
 class AccountState(BaseModel):
     username: str
@@ -253,7 +241,7 @@ accounts_db: Dict[str, AccountState] = {}
 
 class DemoAccount(BaseModel):
     username: str
-    demo_balance: float = 10000.0  # Default $10k demo balance
+    demo_balance: float = 10000.0
     currency: str = "USD"
     active_demo_trades: List[Trade] = []
     trade_history: List[Trade] = []
@@ -262,20 +250,17 @@ demo_accounts_db: Dict[str, DemoAccount] = {}
 
 @app.post("/demo/open_account/{username}")
 def open_demo_account(username: str, initial_balance: float = 10000.0):
-    """Initialize a demo trading account for the user."""
     demo_accounts_db[username] = DemoAccount(username=username, demo_balance=initial_balance)
     return {"status": "success", "message": f"Demo account opened for {username} with ${initial_balance}"}
 
 @app.post("/demo/execute_trade/{username}")
 def execute_demo_trade(username: str, symbol: str, volume: float, trade_type: str):
-    """Execute a simulated trade in the demo account."""
     if username not in demo_accounts_db:
         open_demo_account(username)
     
     account = demo_accounts_db[username]
     symbol = symbol.upper()
     
-    # Get current price for entry
     live_data = fetch_alpha_vantage_crypto(symbol) if "USDT" in symbol else fetch_alpha_vantage_forex(symbol[:3], symbol[3:] or "USD")
     entry_price = float(live_data.get("price") or live_data.get("rate") or 0.0)
     
@@ -296,12 +281,10 @@ def execute_demo_trade(username: str, symbol: str, volume: float, trade_type: st
 
 @app.get("/demo/ai_feedback/{username}")
 def get_demo_ai_feedback(username: str):
-    """AI analyzes demo performance and gives advice for the real account."""
     if username not in demo_accounts_db:
         return {"error": "No demo account found"}
     
     account = demo_accounts_db[username]
-    # Update prices for feedback
     for trade in account.active_demo_trades:
         live_data = fetch_alpha_vantage_crypto(trade.symbol) if "USDT" in trade.symbol else fetch_alpha_vantage_forex(trade.symbol[:3], trade.symbol[3:])
         trade.current_price = float(live_data.get("price") or live_data.get("rate") or trade.current_price)
@@ -324,7 +307,7 @@ User Balance: {account.demo_balance} USD
 TASK:
 1. Evaluate their current demo performance.
 2. Provide CRITICAL advice: Should they replicate these trades in their MAIN Forex account?
-3. Warn about potential market turns (e.g., BTC reversals).
+3. Warn about potential market turns.
 4. Suggest exact adjustments to stop losses or take profits for their REAL account.
 
 Be calculative and direct."""
@@ -337,13 +320,11 @@ Be calculative and direct."""
     }
 
 def update_account_pnl(username: str):
-    """Update PnL for all trades in an account using live prices."""
     if username not in accounts_db:
         return
     
     account = accounts_db[username]
     for trade in account.trades:
-        # Fetch live price
         live_data = fetch_alpha_vantage_crypto(trade.symbol) if "USDT" in trade.symbol else fetch_alpha_vantage_forex(trade.symbol[:3], trade.symbol[3:])
         current_price = float(live_data.get("price") or live_data.get("rate") or trade.current_price)
         
@@ -355,9 +336,7 @@ def update_account_pnl(username: str):
 
 @app.get("/account/monitor/{username}")
 def monitor_account(username: str):
-    """Monitor account balance and trades with live currency conversion."""
     if username not in accounts_db:
-        # Mocking an account for demo if not found
         accounts_db[username] = AccountState(
             username=username,
             balance=1000000.0,
@@ -370,21 +349,19 @@ def monitor_account(username: str):
     update_account_pnl(username)
     account = accounts_db[username]
     
-    # Get live NGN rate
-    ngn_data = fetch_alpha_vantage_forex("USD", "NGN")
-    usd_to_ngn = float(ngn_data.get("rate") or 1500.0)
+    ngn_rate = get_ngn_rate()
     
     total_pnl_usd = sum(t.pnl for t in account.trades)
-    total_pnl_ngn = total_pnl_usd * usd_to_ngn
+    total_pnl_ngn = total_pnl_usd * ngn_rate
     
     return {
         "username": username,
         "balance_ngn": account.balance,
-        "balance_usd": account.balance / usd_to_ngn,
+        "balance_usd": account.balance / ngn_rate,
         "active_trades": account.trades,
         "total_pnl_usd": total_pnl_usd,
         "total_pnl_ngn": total_pnl_ngn,
-        "usd_to_ngn_rate": usd_to_ngn,
+        "usd_to_ngn_rate": ngn_rate,
         "status": "alert" if total_pnl_usd < -50 else "healthy"
     }
 
@@ -400,23 +377,14 @@ class AnalyzeRequest(BaseModel):
     prompt: str = "test prompt"
 
 users_db = {}
-chat_history_db = {}
 
 @app.get("/")
 def health_check():
     return {"status": "healthy", "service": "AI Trading Bot Backend"}
 
-@app.post("/analyze")
-def analyze_market_endpoint(request: AnalyzeRequest):
-    try:
-        result = get_ai_response(request.prompt)
-        return {"analysis": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/predictions")
-def get_predictions_public():
-    return generate_market_predictions()
+def get_predictions_public(amount_ngn: float = 0.0):
+    return generate_market_predictions(amount_ngn)
 
 @app.get("/get_predictions")
 def get_predictions(username: str, symbol: str):
@@ -429,14 +397,12 @@ def get_predictions(username: str, symbol: str):
 
 @app.get("/advice/{symbol}")
 def get_trading_advice(symbol: str):
-    """Get comprehensive institutional-grade trading advice with caching."""
     symbol = symbol.upper()
     current_time = time.time()
     
-    # Cache check
     if symbol in ADVICE_CACHE:
         cache_data, timestamp = ADVICE_CACHE[symbol]
-        if current_time - timestamp < 3600:  # 1 hour cache for deep advice
+        if current_time - timestamp < 3600:
             return cache_data
 
     prompt = f"Perform deep analysis on {symbol} and return JSON with recommendation, confidence, trade_setup, technical_analysis, and risk_assessment."
@@ -451,7 +417,6 @@ def get_trading_advice(symbol: str):
         data = json.loads(content)
         result = {"success": True, "generated_at": datetime.utcnow().isoformat(), "advice": data}
         
-        # Update cache
         ADVICE_CACHE[symbol] = (result, current_time)
         return result
     except Exception as e:
@@ -467,19 +432,18 @@ def chat_with_ai(chat: ChatMessage):
         preds_resp = generate_market_predictions()
         signals = preds_resp.get("signals", [])
         
-        # Enhanced system prompt for better reasoning and currency handling
         system_prompt = f"""You are an ELITE AI Trading Strategist and Financial Consultant. 
 Your reasoning must be highly calculative, professional, and institutional-grade.
 
 CORE CAPABILITIES:
-1. GLOBAL CURRENCY HANDLING: You are an expert in all global currencies, including Nigerian Naira (NGN), USD, EUR, etc.
-2. CALCULATIVE ADVICE: When users mention specific amounts (e.g., 'I have 500,000 Naira'), calculate position sizes, potential profits, and risks precisely.
-3. CONVERSION EXPERTISE: Always consider current market exchange rates (approximately 1 USD = 1,500 NGN or latest market rates) when giving advice.
+1. GLOBAL CURRENCY HANDLING: Expert in global currencies, including Nigerian Naira (NGN).
+2. CALCULATIVE ADVICE: Calculate position sizes, potential profits, and risks precisely.
+3. CONVERSION EXPERTISE: Use approximately 1 USD = 1,600 NGN or latest market rates.
 4. RISK MANAGEMENT: Never suggest more than 1-5% risk per trade.
 
 Current Market Signals: {json.dumps(signals[:5])}.
 
-Always provide specific, numbered advice with calculations if the user provides financial data."""
+Always provide specific advice with calculations if the user provides financial data."""
         
         full_prompt = f"{system_prompt}\nUser: {chat.message}\nAI:"
         ai_response = get_ai_response(full_prompt)
@@ -496,9 +460,11 @@ def connect_account(user: UserAccount):
 def market_analysis():
     predictions = generate_market_predictions()
     if predictions.get("success"):
+        signals = predictions.get("signals", [])
+        top_picks = [s for s in signals if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]][:3]
         return {
             "market_health": "healthy",
-            "best_opportunities": predictions.get("top_picks", []),
+            "best_opportunities": top_picks,
             "total_signals_analyzed": predictions.get("total_signals", 0)
         }
     return {"error": "Analysis failed", "details": predictions.get("error")}
