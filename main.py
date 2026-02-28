@@ -85,8 +85,12 @@ CACHE_DURATION_SECONDS = 600  # 10 minutes for predictions
 # Trading symbols for AI and backtesting
 # ----------------------------
 TRADING_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "EURUSD", "GBPUSD", "USDJPY",
-    "AUDUSD", "USDCAD", "NZDUSD", "USDCHF", "SOLUSDT", "ADAUSDT", "DOGEUSDT"
+    # Forex (15 pairs)
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD", "USDCHF",
+    "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "EURCAD", "AUDCAD", "EURAUD", "GBPAUD",
+    # Crypto (15 pairs)
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "DOGEUSDT",
+    "DOTUSDT", "MATICUSDT", "LTCUSDT", "SHIBUSDT", "TRXUSDT", "AVAXUSDT", "LINKUSDT", "UNIUSDT"
 ]
 
 # ----------------------------
@@ -111,14 +115,15 @@ def generate_market_predictions(investment_amount_ngn: float = 0.0) -> Dict[str,
 LIVE MARKET CONTEXT: {live_data}
 INVESTMENT CONTEXT: {investment_amount_ngn} NGN (Approx. {investment_usd:.2f} USD)
 
-Analyze these pairs with 70%+ ACCURACY RIGOR. For each signal, you MUST include:
+Analyze these assets with 70%+ ACCURACY RIGOR. For each signal, you MUST include:
 1. Exact entry, stop-loss, and 3 take-profit targets.
 2. HOLD TIME: Specify exactly how many minutes or hours to hold the trade.
 3. RISK ADVICE: Based on {investment_amount_ngn} NGN, calculate the exact position size to use in Naira.
 4. BACK-OUT STRATEGY: Define a specific 'Exit Trigger' (e.g., 'If price stays below X for 15 mins, BACK OUT').
 
-FOREX: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF
-CRYPTO: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT
+ASSETS TO ANALYZE:
+FOREX: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF, EURGBP, EURJPY, GBPJPY, AUDJPY, EURCAD, AUDCAD, EURAUD, GBPAUD
+CRYPTO: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT, DOTUSDT, MATICUSDT, LTCUSDT, SHIBUSDT, TRXUSDT, AVAXUSDT, LINKUSDT, UNIUSDT
 
 Return JSON array:
 [
