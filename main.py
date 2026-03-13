@@ -12,7 +12,7 @@ from backtest_api import load_history_df, run_backtest_from_signals, signals_fro
 from models import (
     init_db, get_db, User, DemoAccount, DemoTrade,
     ChatMessage as DBChatMessage, TradeJournalEntry as DBJournalEntry,
-    WatchlistItem, UserActivity
+    WatchlistItem, UserActivity, Conversation, UserMemory
 )
 from market_data import (
     get_symbol_analysis, format_for_ai_prompt,
@@ -512,6 +512,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 class ChatMessage(BaseModel):
     message: str
     username: Optional[str] = "guest"
+    conversation_id: Optional[int] = None   # omit to auto-create a new thread
 
 class RiskCalcRequest(BaseModel):
     balance_ngn: float
@@ -694,71 +695,366 @@ Return ONLY valid JSON:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# ----------------------------
-# AI Chat — Persistent per user
-# ----------------------------
+# ═══════════════════════════════════════════════════
+#  MEMORY HELPERS — ARIA remembers facts about users
+# ═══════════════════════════════════════════════════
+
+def get_user_memories(user: User, db: Session) -> str:
+    """Return a formatted block of everything ARIA remembers about this user."""
+    memories = db.query(UserMemory).filter(UserMemory.user_id == user.id).all()
+    if not memories:
+        return "No memories yet — learn about the user from this conversation."
+    lines = [f"- {m.key}: {m.value}" for m in memories]
+    return "\n".join(lines)
+
+
+def extract_and_save_memories(user: User, user_message: str, aria_response: str, db: Session):
+    """
+    Ask the AI to extract any personal facts from the exchange and save them.
+    Only runs if the message might contain personal info (cheap heuristic).
+    """
+    keywords = ["my name", "i am", "i'm", "i work", "i live", "i want", "i trade",
+                "my goal", "my balance", "i have", "call me", "know that", "remember"]
+    if not any(k in user_message.lower() for k in keywords):
+        return
+
+    existing = get_user_memories(user, db)
+    extract_prompt = f"""You are a memory extraction assistant.
+Extract ONLY clear personal facts the user stated about themselves.
+
+USER MESSAGE: {user_message}
+ARIA RESPONSE: {aria_response}
+ALREADY KNOWN: {existing}
+
+Return a JSON array of new or updated facts ONLY (skip anything already known):
+[
+  {{"key": "name", "value": "Simeon"}},
+  {{"key": "occupation", "value": "software engineer"}},
+  {{"key": "trading_goal", "value": "grow ₦500,000 to ₦2,000,000"}},
+  {{"key": "location", "value": "Lagos"}},
+  {{"key": "preferred_pairs", "value": "BTCUSDT, EURUSD"}},
+  {{"key": "experience_level", "value": "beginner"}}
+]
+Return [] if nothing new was stated. Output ONLY valid JSON. No explanation."""
+
+    try:
+        content = get_ai_response(extract_prompt)
+        content = re.sub(r"```json|```", "", content.strip()).strip()
+        m = re.search(r"\[.*\]", content, re.DOTALL)
+        if not m:
+            return
+        facts = json.loads(m.group(0))
+        for fact in facts:
+            key   = str(fact.get("key",   "")).strip().lower().replace(" ", "_")
+            value = str(fact.get("value", "")).strip()
+            if not key or not value:
+                continue
+            existing_mem = db.query(UserMemory).filter(
+                UserMemory.user_id == user.id,
+                UserMemory.key == key
+            ).first()
+            if existing_mem:
+                existing_mem.value = value
+                existing_mem.updated_at = datetime.utcnow()
+            else:
+                db.add(UserMemory(user_id=user.id, key=key, value=value, source="user_stated"))
+        db.commit()
+
+        # Also update display_name if "name" was found
+        name_fact = next((f for f in facts if f.get("key") == "name"), None)
+        if name_fact:
+            user.display_name = name_fact["value"]
+            db.commit()
+    except Exception as e:
+        print(f"[MEMORY] extraction error: {e}")
+
+
+def auto_title_conversation(first_message: str) -> str:
+    """Generate a short title from the first message (max 50 chars)."""
+    clean = first_message.strip().replace("\n", " ")
+    if len(clean) <= 50:
+        return clean
+    words = clean.split()
+    title = ""
+    for w in words:
+        if len(title) + len(w) + 1 > 47:
+            break
+        title = (title + " " + w).strip()
+    return title + "..."
+
+
+# ═══════════════════════════════════════════════════
+#  CONVERSATION MANAGEMENT
+# ═══════════════════════════════════════════════════
+
+@app.post("/conversations/{username}")
+def create_conversation(username: str, title: Optional[str] = None, db: Session = Depends(get_db)):
+    """Start a new named conversation thread (like a new chat in ChatGPT sidebar)."""
+    user = get_or_create_user(username, db)
+    conv = Conversation(user_id=user.id, title=title or "New Chat")
+    db.add(conv)
+    db.commit()
+    db.refresh(conv)
+    return {
+        "conversation_id": conv.id,
+        "title": conv.title,
+        "created_at": conv.created_at.isoformat()
+    }
+
+
+@app.get("/conversations/{username}")
+def list_conversations(username: str, db: Session = Depends(get_db)):
+    """List all conversations for a user — like the ChatGPT sidebar."""
+    user = get_or_create_user(username, db)
+    convs = (
+        db.query(Conversation)
+        .filter(Conversation.user_id == user.id)
+        .order_by(Conversation.updated_at.desc())
+        .all()
+    )
+    result = []
+    for c in convs:
+        last_msg = (
+            db.query(DBChatMessage)
+            .filter(DBChatMessage.conversation_id == c.id)
+            .order_by(DBChatMessage.created_at.desc())
+            .first()
+        )
+        msg_count = db.query(DBChatMessage).filter(DBChatMessage.conversation_id == c.id).count()
+        result.append({
+            "conversation_id": c.id,
+            "title":           c.title,
+            "message_count":   msg_count,
+            "last_message":    last_msg.content[:80] + "..." if last_msg and len(last_msg.content) > 80 else (last_msg.content if last_msg else ""),
+            "last_role":       last_msg.role if last_msg else None,
+            "created_at":      c.created_at.isoformat(),
+            "updated_at":      c.updated_at.isoformat(),
+        })
+    return {
+        "username":      username,
+        "total_chats":   len(result),
+        "conversations": result
+    }
+
+
+@app.get("/conversations/{username}/{conv_id}")
+def get_conversation(username: str, conv_id: int, db: Session = Depends(get_db)):
+    """Get full message history of a specific conversation."""
+    user = get_or_create_user(username, db)
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    msgs = (
+        db.query(DBChatMessage)
+        .filter(DBChatMessage.conversation_id == conv_id)
+        .order_by(DBChatMessage.created_at.asc())
+        .all()
+    )
+    return {
+        "conversation_id": conv.id,
+        "title":           conv.title,
+        "username":        username,
+        "messages": [
+            {
+                "id":      m.id,
+                "role":    m.role,
+                "content": m.content,
+                "time":    m.created_at.isoformat()
+            }
+            for m in msgs
+        ],
+        "total_messages": len(msgs),
+        "created_at":     conv.created_at.isoformat(),
+    }
+
+
+@app.patch("/conversations/{username}/{conv_id}/rename")
+def rename_conversation(username: str, conv_id: int, title: str, db: Session = Depends(get_db)):
+    """Rename a conversation."""
+    user = get_or_create_user(username, db)
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    conv.title = title
+    db.commit()
+    return {"status": "success", "conversation_id": conv_id, "new_title": title}
+
+
+@app.delete("/conversations/{username}/{conv_id}")
+def delete_conversation(username: str, conv_id: int, db: Session = Depends(get_db)):
+    """Delete a conversation and all its messages."""
+    user = get_or_create_user(username, db)
+    conv = db.query(Conversation).filter(
+        Conversation.id == conv_id,
+        Conversation.user_id == user.id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    db.delete(conv)
+    db.commit()
+    return {"status": "deleted", "conversation_id": conv_id}
+
+
+@app.delete("/conversations/{username}")
+def delete_all_conversations(username: str, db: Session = Depends(get_db)):
+    """Delete ALL conversations for a user."""
+    user = get_or_create_user(username, db)
+    db.query(Conversation).filter(Conversation.user_id == user.id).delete()
+    db.commit()
+    return {"status": "success", "message": f"All conversations deleted for {username}"}
+
+
+# ═══════════════════════════════════════════════════
+#  MAIN CHAT ENDPOINT — Full memory + conversation
+# ═══════════════════════════════════════════════════
+
 @app.post("/chat")
 def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
+    """
+    Send a message to ARIA.
+    - Pass conversation_id to continue an existing thread.
+    - Omit conversation_id to auto-create a new thread.
+    ARIA remembers facts about the user across ALL conversations.
+    """
     user = get_or_create_user(chat.username, db)
     log_activity(user, "sent_chat", db=db)
 
-    # Load last 10 messages from DB
-    history = db.query(DBChatMessage).filter(
-        DBChatMessage.user_id == user.id
-    ).order_by(DBChatMessage.created_at.desc()).limit(10).all()
-    history_text = "\n".join([f"{m.role.upper()}: {m.content}" for m in reversed(history)])
+    # ── resolve / create conversation ──
+    conv_id = getattr(chat, "conversation_id", None)
+    conv = None
+    if conv_id:
+        conv = db.query(Conversation).filter(
+            Conversation.id == conv_id,
+            Conversation.user_id == user.id
+        ).first()
 
-    preds = generate_market_predictions(user.balance_ngn)
-    signals = preds.get("signals", [])
+    if not conv:
+        # Auto-create a new conversation
+        conv = Conversation(user_id=user.id, title=auto_title_conversation(chat.message))
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+        conv_id = conv.id
+
+    # ── load this conversation's history (last 12 turns) ──
+    history = (
+        db.query(DBChatMessage)
+        .filter(DBChatMessage.conversation_id == conv_id)
+        .order_by(DBChatMessage.created_at.desc())
+        .limit(12)
+        .all()
+    )
+    history_text = "\n".join(
+        [f"{m.role.upper()}: {m.content}" for m in reversed(history)]
+    )
+
+    # ── load long-term memories ──
+    memories = get_user_memories(user, db)
+    name = user.display_name or user.username
+
+    # ── market context ──
     ngn_rate = get_ngn_rate()
-    profile = get_user_profile_summary(user, db)
+    preds    = generate_market_predictions(user.balance_ngn)
+    signals  = preds.get("signals", [])
+    profile  = get_user_profile_summary(user, db)
 
+    # ── build system prompt ──
     system_prompt = f"""You are ARIA — Advanced Revenue Intelligence Analyst.
-You are a world-class AI trading strategist who knows every user personally.
+You are a world-class AI trading strategist with a warm, confident personality.
+You remember everything about the people you work with and use that knowledge naturally.
 
-USER PROFILE: {profile}
-LIVE USD/NGN: {ngn_rate:.2f}
-CURRENT TOP SIGNALS: {json.dumps(signals[:5], indent=2)}
-TIME: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC
+━━━ WHO YOU ARE TALKING TO ━━━
+Name: {name}
+{profile}
+Live USD/NGN Rate: {ngn_rate:.2f}
+Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC
 
-CONVERSATION HISTORY:
-{history_text if history_text else "No previous messages."}
+━━━ WHAT YOU REMEMBER ABOUT {name.upper()} ━━━
+{memories}
 
-YOUR CAPABILITIES:
-1. Precision position sizing in NGN and USD
-2. Full technical analysis (RSI, MACD, EMA, BB, Volume, Patterns)
-3. Risk management — never exceed 2-3% per trade for this user's style
-4. Explain complex topics simply
-5. Personalized advice based on user's trade history and win rate
-6. Live price awareness and session timing
-7. Portfolio allocation and diversification advice
+━━━ CURRENT TOP MARKET SIGNALS ━━━
+{json.dumps([{{
+    "symbol": s.get("symbol"),
+    "signal": s.get("signal"),
+    "confidence": s.get("confidence"),
+    "entry": s.get("entry_price"),
+    "data_source": s.get("data_source")
+}} for s in signals[:5]], indent=2)}
 
-RULES:
-- Always show calculations when amounts are mentioned
-- Reference the user's trading style ({user.trading_style}) and risk level ({user.risk_tolerance})
-- If user mentions NGN amounts, immediately convert and calculate position size
-- End with a brief risk reminder
-- Be direct, professional, and specific — no vague advice"""
+━━━ THIS CONVERSATION (recent history) ━━━
+{history_text if history_text else "This is the start of this conversation."}
 
-    full_prompt = f"{system_prompt}\n\nUser: {chat.message}\nARIA:"
+━━━ YOUR RULES ━━━
+1. Address {name} by name naturally (not every sentence — just when it feels right)
+2. If {name} tells you something personal, acknowledge it warmly and remember it
+3. If {name} mentions an amount in NGN, instantly convert it: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD
+4. Recommend 2% risk per trade for their style ({user.trading_style}) and tolerance ({user.risk_tolerance})
+5. Always show exact calculations — never say "roughly" without showing the maths
+6. If you don't know something live (price, news), say so clearly
+7. End responses with a brief risk note only if giving a trade recommendation
+8. Be warm, direct, and specific — avoid vague generalities"""
+
+    full_prompt = f"{system_prompt}\n\n{name}: {chat.message}\nARIA:"
     response = get_ai_response(full_prompt)
 
-    # Save to DB
-    db.add(DBChatMessage(user_id=user.id, role="user", content=chat.message))
-    db.add(DBChatMessage(user_id=user.id, role="aria", content=response))
+    # ── save messages to DB ──
+    db.add(DBChatMessage(user_id=user.id, conversation_id=conv_id, role="user", content=chat.message))
+    db.add(DBChatMessage(user_id=user.id, conversation_id=conv_id, role="aria", content=response))
+
+    # ── update conversation timestamp ──
+    conv.updated_at = datetime.utcnow()
+
+    # ── auto-title if this is the first message ──
+    if conv.title == "New Chat" and not history:
+        conv.title = auto_title_conversation(chat.message)
+
     db.commit()
 
-    return {"success": True, "username": chat.username, "response": response, "timestamp": datetime.utcnow().isoformat()}
+    # ── extract + save memories in background (non-blocking) ──
+    try:
+        extract_and_save_memories(user, chat.message, response, db)
+    except Exception as e:
+        print(f"[MEMORY] non-critical error: {e}")
 
+    return {
+        "success":         True,
+        "username":        chat.username,
+        "display_name":    name,
+        "conversation_id": conv_id,
+        "conversation_title": conv.title,
+        "response":        response,
+        "timestamp":       datetime.utcnow().isoformat()
+    }
+
+
+# ── legacy single-user history endpoint (kept for backwards compat) ──
 @app.get("/chat/history/{username}")
 def get_chat_history(username: str, limit: int = 30, db: Session = Depends(get_db)):
     user = get_or_create_user(username, db)
-    msgs = db.query(DBChatMessage).filter(
-        DBChatMessage.user_id == user.id
-    ).order_by(DBChatMessage.created_at.asc()).limit(limit).all()
+    msgs = (
+        db.query(DBChatMessage)
+        .filter(DBChatMessage.user_id == user.id)
+        .order_by(DBChatMessage.created_at.asc())
+        .limit(limit)
+        .all()
+    )
     return {
         "username": username,
-        "history": [{"role": m.role, "content": m.content, "time": m.created_at.isoformat()} for m in msgs],
+        "history": [
+            {
+                "role":            m.role,
+                "content":         m.content,
+                "conversation_id": m.conversation_id,
+                "time":            m.created_at.isoformat()
+            }
+            for m in msgs
+        ],
         "total": len(msgs)
     }
 
@@ -767,7 +1063,76 @@ def clear_chat_history(username: str, db: Session = Depends(get_db)):
     user = get_or_create_user(username, db)
     db.query(DBChatMessage).filter(DBChatMessage.user_id == user.id).delete()
     db.commit()
-    return {"status": "success", "message": f"Chat history cleared for {username}"}
+    return {"status": "success", "message": f"All chat history cleared for {username}"}
+
+
+# ═══════════════════════════════════════════════════
+#  MEMORY ENDPOINTS — See / manage what ARIA remembers
+# ═══════════════════════════════════════════════════
+
+@app.get("/memory/{username}")
+def get_memory(username: str, db: Session = Depends(get_db)):
+    """See everything ARIA currently remembers about you."""
+    user = get_or_create_user(username, db)
+    memories = db.query(UserMemory).filter(UserMemory.user_id == user.id).all()
+    return {
+        "username":     username,
+        "display_name": user.display_name,
+        "memory_count": len(memories),
+        "memories": [
+            {
+                "key":        m.key,
+                "value":      m.value,
+                "source":     m.source,
+                "updated_at": m.updated_at.isoformat()
+            }
+            for m in memories
+        ],
+        "note": "ARIA uses these facts to personalise every conversation."
+    }
+
+
+@app.post("/memory/{username}")
+def add_memory(username: str, key: str, value: str, db: Session = Depends(get_db)):
+    """Manually tell ARIA something to remember about you."""
+    user = get_or_create_user(username, db)
+    key = key.strip().lower().replace(" ", "_")
+    existing = db.query(UserMemory).filter(
+        UserMemory.user_id == user.id, UserMemory.key == key
+    ).first()
+    if existing:
+        existing.value = value
+        existing.updated_at = datetime.utcnow()
+    else:
+        db.add(UserMemory(user_id=user.id, key=key, value=value, source="user_stated"))
+    if key == "name":
+        user.display_name = value
+    db.commit()
+    return {"status": "saved", "key": key, "value": value}
+
+
+@app.delete("/memory/{username}/{key}")
+def delete_memory(username: str, key: str, db: Session = Depends(get_db)):
+    """Tell ARIA to forget a specific fact."""
+    user = get_or_create_user(username, db)
+    deleted = db.query(UserMemory).filter(
+        UserMemory.user_id == user.id,
+        UserMemory.key == key.lower()
+    ).delete()
+    db.commit()
+    if deleted:
+        return {"status": "forgotten", "key": key}
+    raise HTTPException(status_code=404, detail=f"No memory found with key '{key}'")
+
+
+@app.delete("/memory/{username}")
+def clear_all_memory(username: str, db: Session = Depends(get_db)):
+    """Clear ALL of ARIA's memories about this user."""
+    user = get_or_create_user(username, db)
+    db.query(UserMemory).filter(UserMemory.user_id == user.id).delete()
+    user.display_name = None
+    db.commit()
+    return {"status": "success", "message": f"All memories cleared for {username}"}
 
 # ----------------------------
 # Risk Calculator
