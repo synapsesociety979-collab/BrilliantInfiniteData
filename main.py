@@ -1,13 +1,24 @@
 # main.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import os, json, re, time, requests, random, math
 from datetime import datetime, timedelta
 from ai_provider import get_ai_response
+from sqlalchemy.orm import Session
 
 from fastapi.middleware.cors import CORSMiddleware
 from backtest_api import load_history_df, run_backtest_from_signals, signals_from_sma, router as backtest_router
+from models import (
+    init_db, get_db, User, DemoAccount, DemoTrade,
+    ChatMessage as DBChatMessage, TradeJournalEntry as DBJournalEntry,
+    WatchlistItem, UserActivity
+)
+
+# ----------------------------
+# DB init on startup
+# ----------------------------
+init_db()
 
 # ----------------------------
 # Alpha Vantage Integration
@@ -17,63 +28,67 @@ ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 def fetch_alpha_vantage_forex(from_symbol: str, to_symbol: str = "USD") -> Dict:
     url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={from_symbol}&to_currency={to_symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
     try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        rate_data = data.get("Realtime Currency Exchange Rate", {})
-        if rate_data:
+        r = requests.get(url, timeout=10)
+        data = r.json().get("Realtime Currency Exchange Rate", {})
+        if data:
             return {
-                "rate": float(rate_data.get("5. Exchange Rate") or 0),
-                "bid": float(rate_data.get("8. Bid Price") or 0),
-                "ask": float(rate_data.get("9. Ask Price") or 0),
-                "last_refreshed": rate_data.get("6. Last Refreshed")
+                "rate": float(data.get("5. Exchange Rate") or 0),
+                "bid": float(data.get("8. Bid Price") or 0),
+                "ask": float(data.get("9. Ask Price") or 0),
+                "last_refreshed": data.get("6. Last Refreshed")
             }
     except Exception as e:
-        print(f"Alpha Vantage Forex Error: {e}")
+        print(f"AV Forex Error: {e}")
     return {}
 
 def fetch_alpha_vantage_crypto(symbol: str) -> Dict:
-    base_symbol = symbol.replace("USDT", "")
-    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base_symbol}&to_currency=USD&apikey={ALPHA_VANTAGE_API_KEY}"
+    base = symbol.replace("USDT", "").replace("BUSD", "")
+    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base}&to_currency=USD&apikey={ALPHA_VANTAGE_API_KEY}"
     try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        rate_data = data.get("Realtime Currency Exchange Rate", {})
-        if rate_data:
+        r = requests.get(url, timeout=10)
+        data = r.json().get("Realtime Currency Exchange Rate", {})
+        if data:
             return {
-                "price": float(rate_data.get("5. Exchange Rate") or 0),
-                "last_refreshed": rate_data.get("6. Last Refreshed")
+                "price": float(data.get("5. Exchange Rate") or 0),
+                "last_refreshed": data.get("6. Last Refreshed")
             }
     except Exception as e:
-        print(f"Alpha Vantage Crypto Error: {e}")
+        print(f"AV Crypto Error: {e}")
     return {}
 
+def get_live_price(symbol: str) -> float:
+    if "USDT" in symbol or "BUSD" in symbol:
+        d = fetch_alpha_vantage_crypto(symbol)
+        return float(d.get("price") or 0)
+    else:
+        d = fetch_alpha_vantage_forex(symbol[:3], symbol[3:] or "USD")
+        return float(d.get("rate") or 0)
+
 def get_ngn_rate() -> float:
-    data = fetch_alpha_vantage_forex("USD", "NGN")
-    return float(data.get("rate") or 1600.0)
+    d = fetch_alpha_vantage_forex("USD", "NGN")
+    return float(d.get("rate") or 1600.0)
 
 def get_market_context() -> str:
     context = []
-    key_forex = ["EUR", "GBP", "JPY", "AUD", "CAD"]
-    key_crypto = ["BTC", "ETH", "SOL", "BNB"]
-    for f in key_forex:
-        data = fetch_alpha_vantage_forex(f)
-        if data and data.get("rate"):
-            context.append(f"{f}/USD: {data['rate']} (updated: {data.get('last_refreshed', 'N/A')})")
-    for c in key_crypto:
-        data = fetch_alpha_vantage_crypto(c)
-        if data and data.get("price"):
-            context.append(f"{c}/USD: {data['price']} (updated: {data.get('last_refreshed', 'N/A')})")
-    return " | ".join(context) if context else "Live market data currently unavailable."
+    for f in ["EUR", "GBP", "JPY", "AUD", "CAD"]:
+        d = fetch_alpha_vantage_forex(f)
+        if d.get("rate"):
+            context.append(f"{f}/USD={d['rate']:.5f}")
+    for c in ["BTC", "ETH", "SOL", "BNB"]:
+        d = fetch_alpha_vantage_crypto(c)
+        if d.get("price"):
+            context.append(f"{c}=${d['price']:,.2f}")
+    return " | ".join(context) if context else "Live data unavailable"
 
 # ----------------------------
-# Cache Configuration
+# Cache
 # ----------------------------
-PREDICTIONS_CACHE = {}
-ADVICE_CACHE = {}
-CACHE_DURATION_SECONDS = 600
+PREDICTIONS_CACHE: Dict[str, Any] = {}
+ADVICE_CACHE: Dict[str, Any] = {}
+CACHE_TTL = 600
 
 # ----------------------------
-# Trading symbols
+# Symbol config
 # ----------------------------
 TRADING_SYMBOLS = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD", "USDCHF",
@@ -82,7 +97,6 @@ TRADING_SYMBOLS = [
     "DOTUSDT", "MATICUSDT", "LTCUSDT", "SHIBUSDT", "TRXUSDT", "AVAXUSDT", "LINKUSDT", "UNIUSDT"
 ]
 
-# Default starting prices for GBM simulator
 SYMBOL_BASE_PRICES = {
     "EURUSD": 1.0850, "GBPUSD": 1.2700, "USDJPY": 149.50, "AUDUSD": 0.6530,
     "USDCAD": 1.3600, "NZDUSD": 0.6050, "USDCHF": 0.8950, "EURGBP": 0.8550,
@@ -95,105 +109,160 @@ SYMBOL_BASE_PRICES = {
 }
 
 # ----------------------------
-# AI Generation — Enhanced Accuracy
+# DB helpers
 # ----------------------------
-def generate_market_predictions(investment_amount_ngn: float = 0.0) -> Dict[str, Any]:
-    global PREDICTIONS_CACHE
-    current_time = time.time()
-    cache_key = f"preds_{investment_amount_ngn}"
+def get_or_create_user(username: str, db: Session) -> User:
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        user = User(username=username)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    else:
+        user.last_active = datetime.utcnow()
+        db.commit()
+    return user
 
-    if cache_key in PREDICTIONS_CACHE and (current_time - PREDICTIONS_CACHE[cache_key]["timestamp"] < CACHE_DURATION_SECONDS):
+def log_activity(user: User, action: str, symbol: str = None, details: dict = None, db: Session = None):
+    if db:
+        entry = UserActivity(user_id=user.id, action=action, symbol=symbol, details=details)
+        db.add(entry)
+        db.commit()
+
+def get_user_profile_summary(user: User, db: Session) -> str:
+    """Build a text summary of user behavior for AI personalization."""
+    journal = db.query(DBJournalEntry).filter(DBJournalEntry.user_id == user.id).order_by(DBJournalEntry.logged_at.desc()).limit(20).all()
+    watchlist = db.query(WatchlistItem).filter(WatchlistItem.user_id == user.id).all()
+    activity = db.query(UserActivity).filter(UserActivity.user_id == user.id).order_by(UserActivity.created_at.desc()).limit(30).all()
+
+    wins = [j for j in journal if j.result == "WIN"]
+    losses = [j for j in journal if j.result == "LOSS"]
+    win_rate = (len(wins) / len(journal) * 100) if journal else 0
+    most_traded = {}
+    for j in journal:
+        most_traded[j.symbol] = most_traded.get(j.symbol, 0) + 1
+    top_symbol = max(most_traded, key=most_traded.get) if most_traded else "N/A"
+    recent_actions = [f"{a.action} {a.symbol or ''}" for a in activity[:10]]
+    watched = [w.symbol for w in watchlist]
+
+    return (
+        f"Username: {user.username} | Balance: {user.balance_ngn:,.0f} NGN | "
+        f"Risk Tolerance: {user.risk_tolerance} | Style: {user.trading_style} | "
+        f"Preferred Pairs: {user.preferred_pairs or watched or ['any']} | "
+        f"Total Trades: {len(journal)} | Win Rate: {win_rate:.1f}% | Top Symbol: {top_symbol} | "
+        f"Recent Activity: {', '.join(recent_actions[:5])}"
+    )
+
+# ----------------------------
+# AI — Enhanced Predictions
+# ----------------------------
+def generate_market_predictions(investment_amount_ngn: float = 0.0, user_profile: str = "") -> Dict[str, Any]:
+    global PREDICTIONS_CACHE
+    now = time.time()
+    cache_key = f"preds_{investment_amount_ngn}"
+    if cache_key in PREDICTIONS_CACHE and (now - PREDICTIONS_CACHE[cache_key]["ts"] < CACHE_TTL):
         return PREDICTIONS_CACHE[cache_key]["data"]
 
-    live_data = get_market_context()
+    live = get_market_context()
     ngn_rate = get_ngn_rate()
-    investment_usd = investment_amount_ngn / ngn_rate if investment_amount_ngn > 0 else 0
-    now_utc = datetime.utcnow()
-    hour = now_utc.hour
-    if 7 <= hour < 12:
-        session = "London Session (high liquidity — best for EURUSD, GBPUSD, EURGBP)"
-    elif 12 <= hour < 17:
-        session = "London/New York Overlap (PEAK liquidity — all pairs active)"
-    elif 17 <= hour < 21:
-        session = "New York Session (best for USD pairs and crypto)"
+    inv_usd = investment_amount_ngn / ngn_rate if investment_amount_ngn > 0 else 0
+    utc = datetime.utcnow()
+    h = utc.hour
+    if 7 <= h < 12:
+        session = "London Session — prioritize EURUSD, GBPUSD, EURGBP, EURJPY"
+    elif 12 <= h < 17:
+        session = "London/NY Overlap — PEAK liquidity, all pairs active"
+    elif 17 <= h < 21:
+        session = "New York Session — USD pairs and crypto are most active"
     else:
-        session = "Asian Session (best for JPY pairs: USDJPY, GBPJPY, AUDJPY)"
+        session = "Asian Session — prioritize JPY pairs: USDJPY, GBPJPY, AUDJPY"
 
-    prompt = f"""You are an ELITE INSTITUTIONAL QUANTITATIVE ANALYST with 20 years of market experience.
+    personalization = f"\nUSER PROFILE: {user_profile}" if user_profile else ""
 
-LIVE MARKET DATA: {live_data}
-CURRENT SESSION: {session} (UTC {now_utc.strftime('%H:%M')})
-INVESTOR BUDGET: {investment_amount_ngn:,.0f} NGN = ~${investment_usd:,.2f} USD (Rate: {ngn_rate:.2f} NGN/USD)
+    prompt = f"""You are ARIA — an elite institutional quantitative trading analyst with 20+ years experience.
 
-STRICT ANALYSIS PROTOCOL — Apply ALL of the following for each asset:
-1. MULTI-TIMEFRAME TREND: Confirm direction on 15m, 1h, AND 4h. Only trade WITH all 3 timeframes aligned.
-2. KEY TECHNICAL INDICATORS:
-   - RSI(14): Overbought>70 (sell bias), Oversold<30 (buy bias)
-   - MACD(12,26,9): Signal line crossover direction
-   - EMA(20,50,200): Price vs EMAs for trend strength
-   - Bollinger Bands: Squeeze = breakout imminent; upper/lower band touches
-   - Volume: Confirm moves with above-average volume
-3. CHART PATTERNS: Identify any active pattern (H&S, double top/bottom, flags, wedges, triangles)
-4. KEY S/R LEVELS: Use recent swing highs/lows and round numbers
-5. SESSION FILTER: Prioritize pairs active in the current session above
-6. RISK/REWARD: MINIMUM 1:2 ratio required — reject any setup below this
-7. POSITION SIZING: Risk exactly 2% of {investment_amount_ngn:,.0f} NGN per trade
+LIVE PRICES: {live}
+CURRENT SESSION: {session} | UTC: {utc.strftime('%H:%M')}
+INVESTOR BUDGET: {investment_amount_ngn:,.0f} NGN (~${inv_usd:,.2f} USD @ {ngn_rate:.2f}){personalization}
 
-ASSETS TO ANALYZE:
-FOREX (15): EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF, EURGBP, EURJPY, GBPJPY, AUDJPY, EURCAD, AUDCAD, EURAUD, GBPAUD
-CRYPTO (15): BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT, DOTUSDT, MATICUSDT, LTCUSDT, SHIBUSDT, TRXUSDT, AVAXUSDT, LINKUSDT, UNIUSDT
+MANDATORY ANALYSIS PROTOCOL for EVERY asset — you must evaluate ALL of these:
 
-Output ONLY a valid JSON array. Only include signals where confidence >= 72:
+TECHNICAL LAYERS:
+1. TREND ALIGNMENT: Confirm direction across 15m + 1H + 4H timeframes (all 3 must agree)
+2. RSI(14): Only trade RSI 30-70 zone; oversold <35 = buy bias; overbought >65 = sell bias
+3. MACD(12,26,9): Signal line crossover must confirm direction
+4. EMA STACK: Price above EMA20 > EMA50 > EMA200 = strong bullish; reverse = bearish
+5. BOLLINGER BANDS(20,2): Squeeze = breakout incoming; band rejection = reversal signal
+6. VOLUME: Entry must have above-average volume confirmation
+7. CHART PATTERN: Identify flags, wedges, triangles, H&S, double tops/bottoms, pin bars
+8. SUPPORT/RESISTANCE: Use psychological levels (round numbers) + swing highs/lows
+9. SESSION FILTER: Bonus weight to pairs fitting the current session above
+10. ATR-BASED SL: Stop loss must use ATR(14) × 1.5 — not arbitrary
+
+QUALITY FILTER (REJECT any signal that fails):
+- All 3 timeframes NOT aligned → SKIP
+- RSI outside 25-75 zone → SKIP (extreme = risky)  
+- Risk/reward below 1:2 → SKIP
+- Volume not confirming → SKIP
+
+POSITION SIZING (mandatory):
+- Risk exactly 2% of {investment_amount_ngn:,.0f} NGN = {investment_amount_ngn * 0.02:,.0f} NGN per trade
+- Convert to USD: {investment_amount_ngn * 0.02 / ngn_rate:,.2f} USD
+
+ASSETS TO ANALYZE (30 total):
+FOREX: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF, EURGBP, EURJPY, GBPJPY, AUDJPY, EURCAD, AUDCAD, EURAUD, GBPAUD
+CRYPTO: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT, DOTUSDT, MATICUSDT, LTCUSDT, SHIBUSDT, TRXUSDT, AVAXUSDT, LINKUSDT, UNIUSDT
+
+Return ONLY a valid JSON array. Skip assets that fail quality filters. Only include confidence >= 73:
 [
   {{
-    "symbol": "PAIR",
-    "signal": "STRONG_BUY|BUY|HOLD|SELL|STRONG_SELL",
-    "confidence": 72-99,
+    "symbol": "SYMBOL",
+    "signal": "STRONG_BUY|BUY|SELL|STRONG_SELL",
+    "confidence": 73-98,
     "category": "forex|crypto",
     "timeframe": "scalp(5-15m)|intraday(1-4h)|swing(daily)",
     "session_fit": "excellent|good|fair",
-    "entry_price": "exact price",
-    "stop_loss": "price (ATR-based)",
+    "entry_price": "specific price",
+    "stop_loss": "ATR-based SL",
     "take_profit_1": "1:1 target",
     "take_profit_2": "1:2 target",
     "take_profit_3": "1:3 target",
-    "risk_reward": "1:X",
-    "hold_time": "e.g. 2-4 hours",
-    "position_size_ngn": "2% risk amount in NGN",
-    "position_size_usd": "equivalent in USD",
-    "back_out_trigger": "Specific invalidation condition",
+    "risk_reward": "1:X.X",
+    "hold_time": "e.g. 2-4 hours or 1-2 days",
+    "position_size_ngn": "{investment_amount_ngn * 0.02:,.0f} NGN (2% risk)",
+    "position_size_usd": "{investment_amount_ngn * 0.02 / ngn_rate:.2f} USD",
+    "back_out_trigger": "exact price or condition that invalidates setup",
     "indicators": {{
-      "rsi": "value + bias",
-      "macd": "bullish/bearish crossover",
-      "ema_trend": "above/below 20/50/200 EMA",
-      "pattern": "chart pattern if any"
+      "rsi": "value + reading",
+      "macd": "crossover signal",
+      "ema_bias": "above/below EMAs",
+      "volume": "above/below average",
+      "pattern": "detected chart pattern"
     }},
-    "rationale": "3-sentence institutional justification referencing specific levels"
+    "key_levels": {{
+      "support": "price",
+      "resistance": "price"
+    }},
+    "rationale": "3 specific sentences referencing exact levels and indicator readings"
   }}
 ]
-CRITICAL: Pure JSON only. No text before or after. Reject all setups below 1:2 R/R."""
+CRITICAL RULES: Pure JSON only. No text outside the array. HOLD signals are excluded."""
 
     try:
         content = get_ai_response(prompt)
-        if not content:
-            return {"success": False, "error": "AI returned empty content"}
-        if content.startswith("ERROR:"):
-            return {"success": False, "error": content}
-
-        content = content.strip()
-        json_match = re.search(r"\[.*\]", content, re.DOTALL)
-        if json_match:
-            content = json_match.group(0)
-        else:
-            content = re.sub(r"```json|```", "", content).strip()
-
+        if not content or content.startswith("ERROR:"):
+            return {"success": False, "error": content or "Empty response"}
+        content = re.sub(r"```json|```", "", content.strip()).strip()
+        m = re.search(r"\[.*\]", content, re.DOTALL)
+        if m:
+            content = m.group(0)
         data = json.loads(content)
-        data = [s for s in data if isinstance(s, dict) and s.get("confidence", 0) >= 72]
-
+        data = [s for s in data if isinstance(s, dict) and int(s.get("confidence", 0)) >= 73]
         strong = [s for s in data if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]]
+
         result = {
             "success": True,
-            "generated_at": datetime.utcnow().isoformat(),
+            "generated_at": utc.isoformat(),
             "active_session": session,
             "investment_context_ngn": investment_amount_ngn,
             "usd_ngn_rate": ngn_rate,
@@ -202,230 +271,186 @@ CRITICAL: Pure JSON only. No text before or after. Reject all setups below 1:2 R
             "total_signals": len(data),
             "strong_signals_count": len(strong),
             "top_picks": strong[:5],
-            "disclaimer": "Trading involves substantial risk. Signals are AI-generated based on pattern confluence — not guaranteed."
+            "disclaimer": "Signals are AI-generated from pattern confluence. Trading involves risk."
         }
-        PREDICTIONS_CACHE[cache_key] = {"data": result, "timestamp": current_time}
+        PREDICTIONS_CACHE[cache_key] = {"data": result, "ts": now}
         return result
     except Exception as e:
         return {"success": False, "error": f"Prediction failed: {str(e)}"}
 
 # ----------------------------
-# Helper: Dynamic AI Signal Filtering
+# Personalized Signal for 1 Symbol (FIXED)
 # ----------------------------
-def get_filtered_ai_signals(symbol: str, confidence_threshold: float = 72.0) -> List[Dict]:
+def get_personalized_signal(symbol: str, user: User, db: Session) -> Dict:
+    """Generate a focused AI signal for a single symbol, personalized to the user."""
     symbol = symbol.upper()
+    live_price = get_live_price(symbol)
+    ngn_rate = get_ngn_rate()
+    inv_usd = user.balance_ngn / ngn_rate if user.balance_ngn > 0 else 0
+    profile = get_user_profile_summary(user, db)
+
+    # First check if already in the predictions cache
+    preds = generate_market_predictions(user.balance_ngn)
+    if preds.get("success"):
+        match = next((s for s in preds.get("signals", []) if s.get("symbol") == symbol), None)
+        if match:
+            match["personalized"] = True
+            match["live_price"] = live_price
+            match["user_context"] = f"Personalized for {user.username} ({user.trading_style} trader)"
+            return match
+
+    # If not in cache, generate a targeted signal just for this symbol
+    utc = datetime.utcnow()
+    prompt = f"""You are ARIA, an elite institutional trading analyst.
+
+SYMBOL REQUESTED: {symbol}
+LIVE PRICE: {live_price if live_price else "unavailable"}
+USER PROFILE: {profile}
+USER BALANCE: {user.balance_ngn:,.0f} NGN (~${inv_usd:,.2f} USD)
+USER STYLE: {user.trading_style} | RISK TOLERANCE: {user.risk_tolerance}
+TIME: {utc.strftime('%Y-%m-%d %H:%M')} UTC
+
+Perform a DEEP analysis of {symbol} ONLY. Apply full institutional protocol:
+- Multi-timeframe trend (15m, 1H, 4H alignment)
+- RSI, MACD, EMA stack, Bollinger Bands
+- Key support/resistance levels
+- Chart pattern detection
+- Session timing check
+- ATR-based stop loss (1.5× ATR)
+- Minimum 1:2 R/R required
+- Position size: 2% of {user.balance_ngn:,.0f} NGN = {user.balance_ngn * 0.02:,.0f} NGN
+
+Return ONLY valid JSON (single object, not array):
+{{
+  "symbol": "{symbol}",
+  "signal": "STRONG_BUY|BUY|HOLD|SELL|STRONG_SELL",
+  "confidence": 0-99,
+  "category": "forex|crypto",
+  "timeframe": "scalp|intraday|swing",
+  "session_fit": "excellent|good|fair|poor",
+  "live_price": "{live_price}",
+  "entry_price": "specific price",
+  "stop_loss": "ATR-based",
+  "take_profit_1": "1:1 target",
+  "take_profit_2": "1:2 target",
+  "take_profit_3": "1:3 target",
+  "risk_reward": "1:X",
+  "hold_time": "duration",
+  "position_size_ngn": "2% of budget in NGN",
+  "position_size_usd": "equivalent USD",
+  "back_out_trigger": "exact invalidation condition",
+  "indicators": {{
+    "rsi": "value + interpretation",
+    "macd": "signal",
+    "ema_bias": "trend",
+    "volume": "reading",
+    "pattern": "chart pattern or none"
+  }},
+  "key_levels": {{"support": "level", "resistance": "level"}},
+  "personalized_note": "Note tailored to this user's style and history",
+  "rationale": "3 sentences referencing exact levels"
+}}"""
+
     try:
-        df = load_history_df(symbol)
-    except Exception:
-        return [{"symbol": symbol, "signal": "HOLD", "confidence": 0, "note": "No history found"}]
-
-    preds_resp = generate_market_predictions()
-    if not preds_resp.get("success"):
-        return [{"symbol": symbol, "signal": "HOLD", "confidence": 0, "note": preds_resp.get("error")}]
-
-    raw_preds = preds_resp.get("signals", [])
-    symbol_preds = [p for p in raw_preds if p.get("symbol", "").upper() == symbol]
-    high_conf = [p for p in symbol_preds if p.get("confidence", 0) >= confidence_threshold]
-
-    filtered_preds = []
-    for p in high_conf:
-        try:
-            sma_signals = signals_from_sma(df)
-            metrics, _, _ = run_backtest_from_signals(df, sma_signals)
-            if metrics.get("total_return_pct", 0) > 0:
-                filtered_preds.append(p)
-        except Exception:
-            filtered_preds.append(p)
-
-    return filtered_preds if filtered_preds else [{"symbol": symbol, "signal": "HOLD", "confidence": 0}]
+        content = get_ai_response(prompt)
+        if not content or content.startswith("ERROR:"):
+            return {"symbol": symbol, "signal": "HOLD", "confidence": 0, "error": "AI unavailable", "live_price": live_price}
+        content = re.sub(r"```json|```", "", content.strip()).strip()
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if m:
+            content = m.group(0)
+        data = json.loads(content)
+        data["personalized"] = True
+        return data
+    except Exception as e:
+        return {"symbol": symbol, "signal": "HOLD", "confidence": 0, "error": str(e), "live_price": live_price}
 
 # ----------------------------
-# Simulator — Geometric Brownian Motion
+# Simulator
 # ----------------------------
-def simulate_ohlcv(symbol: str, num_candles: int = 100, interval_minutes: int = 15, seed: int = None) -> List[Dict]:
-    """Generate realistic OHLCV candles using Geometric Brownian Motion."""
+def simulate_ohlcv(symbol: str, num_candles: int = 150, interval_minutes: int = 15, seed: int = None) -> List[Dict]:
     s = symbol.upper()
     base_price = SYMBOL_BASE_PRICES.get(s, 1.0)
     is_crypto = "USDT" in s
-
-    # Volatility per candle (annualised sigma converted to per-candle)
     annual_sigma = 0.65 if is_crypto else 0.08
-    dt = (interval_minutes / 60) / 8760  # fraction of a year
+    dt = (interval_minutes / 60) / 8760
     sigma = annual_sigma * math.sqrt(dt)
-    drift = 0.0001  # slight upward drift
-
-    rng = random.Random(seed if seed else int(time.time()))
-    candles = []
-    price = base_price
+    rng = random.Random(seed or int(time.time()))
+    candles, price = [], base_price
     now = datetime.utcnow() - timedelta(minutes=interval_minutes * num_candles)
 
     for i in range(num_candles):
-        # GBM step
         z = rng.gauss(0, 1)
-        pct_change = drift * dt + sigma * z
-        close = price * (1 + pct_change)
-
-        # Build OHLC within the candle
-        candle_vol = abs(rng.gauss(0, sigma * 0.5))
-        high = max(price, close) * (1 + abs(rng.gauss(0, candle_vol)))
-        low = min(price, close) * (1 - abs(rng.gauss(0, candle_vol)))
-        open_p = price
-
-        # Volume (simulate realistic volume spikes)
-        base_vol = 1000 if is_crypto else 100000
-        volume = rng.uniform(base_vol * 0.5, base_vol * 2.5)
-
-        ts = now + timedelta(minutes=interval_minutes * i)
+        pct = 0.00005 * dt + sigma * z
+        close = price * (1 + pct)
+        cv = abs(rng.gauss(0, sigma * 0.4))
+        high = max(price, close) * (1 + abs(rng.gauss(0, cv)))
+        low  = min(price, close) * (1 - abs(rng.gauss(0, cv)))
+        bvol = 2000 if is_crypto else 200000
+        vol  = rng.uniform(bvol * 0.5, bvol * 2.5)
+        dp   = 4 if is_crypto else 5
+        ts   = now + timedelta(minutes=interval_minutes * i)
         candles.append({
-            "time": int(ts.timestamp()),
-            "datetime": ts.strftime("%Y-%m-%d %H:%M"),
-            "open": round(open_p, 5 if not is_crypto else 4),
-            "high": round(high, 5 if not is_crypto else 4),
-            "low": round(low, 5 if not is_crypto else 4),
-            "close": round(close, 5 if not is_crypto else 4),
-            "volume": round(volume, 2)
+            "time": int(ts.timestamp()), "datetime": ts.strftime("%Y-%m-%d %H:%M"),
+            "open": round(price, dp), "high": round(high, dp),
+            "low": round(low, dp), "close": round(close, dp), "volume": round(vol, 2)
         })
         price = close
-
     return candles
 
 def run_strategy_on_candles(candles: List[Dict], initial_balance: float = 10000.0) -> Dict:
-    """Run SMA(20/50) crossover strategy on candles, return equity curve + trades."""
     if len(candles) < 51:
-        return {"error": "Not enough candles for strategy (need 51+)"}
-
+        return {"error": "Need 51+ candles"}
     closes = [c["close"] for c in candles]
 
-    def sma(data, period):
-        return [None] * (period - 1) + [
-            sum(data[i:i + period]) / period for i in range(len(data) - period + 1)
-        ]
+    def sma(d, p):
+        return [None] * (p - 1) + [sum(d[i:i+p]) / p for i in range(len(d) - p + 1)]
 
-    sma20 = sma(closes, 20)
-    sma50 = sma(closes, 50)
-
-    balance = initial_balance
-    position = None  # None | {"entry": price, "entry_idx": int, "type": "BUY"}
-    trades = []
-    equity_curve = []
+    s20, s50 = sma(closes, 20), sma(closes, 50)
+    balance, position, trades, equity_curve = initial_balance, None, [], []
 
     for i in range(50, len(candles)):
         c = candles[i]
-        s20 = sma20[i]
-        s20_prev = sma20[i - 1]
-        s50 = sma50[i]
-        s50_prev = sma50[i - 1]
-
-        if s20 is None or s50 is None or s20_prev is None or s50_prev is None:
-            equity_curve.append({"time": c["time"], "datetime": c["datetime"], "equity": round(balance, 2)})
-            continue
-
-        # BUY signal: SMA20 crosses above SMA50
-        if s20_prev <= s50_prev and s20 > s50 and position is None:
-            position = {"entry": c["close"], "entry_idx": i, "type": "BUY", "time": c["time"], "datetime": c["datetime"]}
-
-        # SELL signal: SMA20 crosses below SMA50
-        elif s20_prev >= s50_prev and s20 < s50 and position is not None:
-            pnl_pct = (c["close"] - position["entry"]) / position["entry"]
-            pnl_usd = balance * 0.1 * pnl_pct  # risk 10% per trade in simulator
-            balance += pnl_usd
-            trades.append({
-                "type": "BUY",
-                "entry_time": position["time"],
-                "entry_datetime": position["datetime"],
-                "entry_price": position["entry"],
-                "exit_time": c["time"],
-                "exit_datetime": c["datetime"],
-                "exit_price": c["close"],
-                "pnl_pct": round(pnl_pct * 100, 3),
-                "pnl_usd": round(pnl_usd, 2),
-                "result": "WIN" if pnl_usd > 0 else "LOSS"
-            })
-            position = None
-
+        if s20[i] and s50[i] and s20[i-1] and s50[i-1]:
+            if s20[i-1] <= s50[i-1] and s20[i] > s50[i] and position is None:
+                position = {"entry": c["close"], "time": c["time"], "datetime": c["datetime"]}
+            elif s20[i-1] >= s50[i-1] and s20[i] < s50[i] and position is not None:
+                pnl_pct = (c["close"] - position["entry"]) / position["entry"]
+                pnl_usd = balance * 0.1 * pnl_pct
+                balance += pnl_usd
+                trades.append({
+                    "type": "BUY", "entry_price": position["entry"],
+                    "entry_time": position["time"], "entry_datetime": position["datetime"],
+                    "exit_price": c["close"], "exit_time": c["time"], "exit_datetime": c["datetime"],
+                    "pnl_pct": round(pnl_pct * 100, 3), "pnl_usd": round(pnl_usd, 2),
+                    "result": "WIN" if pnl_usd > 0 else "LOSS"
+                })
+                position = None
         equity_curve.append({"time": c["time"], "datetime": c["datetime"], "equity": round(balance, 2)})
 
-    # Performance stats
-    wins = [t for t in trades if t["result"] == "WIN"]
+    wins   = [t for t in trades if t["result"] == "WIN"]
     losses = [t for t in trades if t["result"] == "LOSS"]
-    total_pnl = balance - initial_balance
-    win_rate = (len(wins) / len(trades) * 100) if trades else 0
-    avg_win = (sum(t["pnl_usd"] for t in wins) / len(wins)) if wins else 0
-    avg_loss = (sum(t["pnl_usd"] for t in losses) / len(losses)) if losses else 0
-
     return {
-        "initial_balance": initial_balance,
-        "final_balance": round(balance, 2),
-        "total_pnl_usd": round(total_pnl, 2),
-        "total_pnl_pct": round((total_pnl / initial_balance) * 100, 2),
-        "total_trades": len(trades),
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate_pct": round(win_rate, 1),
-        "avg_win_usd": round(avg_win, 2),
-        "avg_loss_usd": round(avg_loss, 2),
-        "strategy": "SMA 20/50 Crossover",
-        "trades": trades,
-        "equity_curve": equity_curve
+        "initial_balance": initial_balance, "final_balance": round(balance, 2),
+        "total_pnl_usd": round(balance - initial_balance, 2),
+        "total_pnl_pct": round((balance - initial_balance) / initial_balance * 100, 2),
+        "total_trades": len(trades), "wins": len(wins), "losses": len(losses),
+        "win_rate_pct": round(len(wins) / len(trades) * 100, 1) if trades else 0,
+        "avg_win_usd": round(sum(t["pnl_usd"] for t in wins) / len(wins), 2) if wins else 0,
+        "avg_loss_usd": round(sum(t["pnl_usd"] for t in losses) / len(losses), 2) if losses else 0,
+        "strategy": "SMA 20/50 Crossover", "trades": trades, "equity_curve": equity_curve
     }
 
 # ----------------------------
 # FastAPI App
 # ----------------------------
-app = FastAPI(title="AI Multi-User Trading Bot Backend")
+app = FastAPI(title="AI Trading Bot — ARIA v3.1")
 app.include_router(backtest_router, prefix="/api")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ----------------------------
-# In-memory stores
-# ----------------------------
-accounts_db: Dict[str, Any] = {}
-demo_accounts_db: Dict[str, Any] = {}
-users_db: Dict[str, Any] = {}
-chat_history_db: Dict[str, List[Dict]] = {}
-watchlist_db: Dict[str, List[str]] = {}
-trade_journal_db: Dict[str, List[Dict]] = {}
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ----------------------------
 # Pydantic Models
 # ----------------------------
-class Trade(BaseModel):
-    symbol: str
-    entry_price: float
-    current_price: float
-    volume: float
-    type: str
-    pnl: float = 0.0
-    is_demo: bool = True
-
-class AccountState(BaseModel):
-    username: str
-    balance: float
-    currency: str = "NGN"
-    trades: List[Trade] = []
-
-class DemoAccount(BaseModel):
-    username: str
-    demo_balance: float = 10000.0
-    currency: str = "USD"
-    active_demo_trades: List[Trade] = []
-    trade_history: List[Trade] = []
-
-class UserAccount(BaseModel):
-    username: str
-    mt5_login: Optional[str] = None
-    mt5_password: Optional[str] = None
-    mt5_server: Optional[str] = None
-    binance_api_key: Optional[str] = None
-    binance_api_secret: Optional[str] = None
-
 class ChatMessage(BaseModel):
     message: str
     username: Optional[str] = "guest"
@@ -444,8 +469,9 @@ class TradeIdeaRequest(BaseModel):
     stop_loss: float
     take_profit: float
     rationale: Optional[str] = ""
+    username: Optional[str] = "guest"
 
-class TradeJournalEntry(BaseModel):
+class TradeJournalEntryRequest(BaseModel):
     symbol: str
     direction: str
     entry_price: float
@@ -455,169 +481,234 @@ class TradeJournalEntry(BaseModel):
     pnl_usd: float
     notes: Optional[str] = ""
 
+class UserProfileUpdate(BaseModel):
+    balance_ngn: Optional[float] = None
+    risk_tolerance: Optional[str] = None
+    trading_style: Optional[str] = None
+    preferred_pairs: Optional[List[str]] = None
+
+class DemoTradeRequest(BaseModel):
+    symbol: str
+    volume: float
+    trade_type: str
+
+class UserAccountRequest(BaseModel):
+    username: str
+    mt5_login: Optional[str] = None
+    mt5_server: Optional[str] = None
+
 # ----------------------------
-# Health Check
+# Health
 # ----------------------------
 @app.get("/")
 def health_check():
     return {
-        "status": "healthy",
-        "service": "AI Trading Bot Backend",
-        "version": "3.0",
+        "status": "healthy", "service": "ARIA — AI Trading Bot", "version": "3.1",
         "pairs_monitored": len(TRADING_SYMBOLS),
+        "persistence": "PostgreSQL",
         "features": [
-            "30 Forex+Crypto Signals", "NGN Position Sizing", "Risk Calculator",
-            "Visual Simulator", "Trade Journal", "Watchlist", "Trade Idea Scorer",
-            "AI Chat with History", "Demo Account", "Account Monitor"
+            "30 Pairs (15 Forex + 15 Crypto)", "Personalized Signals per User",
+            "NGN Position Sizing", "Risk Calculator", "Visual Simulator",
+            "Trade Journal (DB)", "Watchlist (DB)", "Chat History (DB)",
+            "User Profiles + Activity Tracking", "Trade Idea Scorer", "Demo Account (DB)"
         ]
+    }
+
+# ----------------------------
+# User Profile
+# ----------------------------
+@app.post("/user/{username}")
+def create_or_update_user(username: str, profile: UserProfileUpdate, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    if profile.balance_ngn is not None:
+        user.balance_ngn = profile.balance_ngn
+    if profile.risk_tolerance is not None:
+        user.risk_tolerance = profile.risk_tolerance
+    if profile.trading_style is not None:
+        user.trading_style = profile.trading_style
+    if profile.preferred_pairs is not None:
+        user.preferred_pairs = profile.preferred_pairs
+    db.commit()
+    db.refresh(user)
+    return {"status": "success", "user": {"username": user.username, "balance_ngn": user.balance_ngn,
+        "risk_tolerance": user.risk_tolerance, "trading_style": user.trading_style,
+        "preferred_pairs": user.preferred_pairs, "created_at": user.created_at.isoformat()}}
+
+@app.get("/user/{username}")
+def get_user_profile(username: str, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    wl = db.query(WatchlistItem).filter(WatchlistItem.user_id == user.id).all()
+    journal = db.query(DBJournalEntry).filter(DBJournalEntry.user_id == user.id).all()
+    wins = [j for j in journal if j.result == "WIN"]
+    return {
+        "username": user.username, "balance_ngn": user.balance_ngn,
+        "risk_tolerance": user.risk_tolerance, "trading_style": user.trading_style,
+        "preferred_pairs": user.preferred_pairs, "watchlist": [w.symbol for w in wl],
+        "stats": {
+            "total_trades": len(journal), "wins": len(wins), "losses": len(journal) - len(wins),
+            "win_rate_pct": round(len(wins) / len(journal) * 100, 1) if journal else 0,
+            "total_pnl_usd": round(sum(j.pnl_usd for j in journal), 2)
+        },
+        "last_active": user.last_active.isoformat(), "member_since": user.created_at.isoformat()
     }
 
 # ----------------------------
 # Predictions
 # ----------------------------
 @app.get("/predictions")
-def get_predictions_public(amount_ngn: float = 0.0):
-    return generate_market_predictions(amount_ngn)
+def get_predictions_public(amount_ngn: float = 0.0, username: Optional[str] = None, db: Session = Depends(get_db)):
+    profile = ""
+    if username:
+        user = get_or_create_user(username, db)
+        profile = get_user_profile_summary(user, db)
+        log_activity(user, "viewed_predictions", db=db)
+    return generate_market_predictions(amount_ngn, user_profile=profile)
 
 @app.get("/get_predictions")
-def get_predictions(username: str, symbol: str):
-    predictions = get_filtered_ai_signals(symbol)
-    return {"username": username, "symbol": symbol.upper(), "predictions": predictions}
+def get_personalized_predictions(username: str, symbol: str, db: Session = Depends(get_db)):
+    """FIXED: Personalized signal for a specific symbol without needing a CSV file."""
+    user = get_or_create_user(username, db)
+    log_activity(user, "viewed_signal", symbol=symbol.upper(), db=db)
+    signal = get_personalized_signal(symbol, user, db)
+    return {
+        "username": username,
+        "symbol": symbol.upper(),
+        "signal": signal,
+        "ngn_rate": get_ngn_rate(),
+        "generated_at": datetime.utcnow().isoformat()
+    }
 
 @app.get("/market_analysis")
-def market_analysis():
-    predictions = generate_market_predictions()
-    if predictions.get("success"):
-        signals = predictions.get("signals", [])
-        top_picks = [s for s in signals if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]][:5]
-        forex_signals = [s for s in signals if s.get("category") == "forex"]
-        crypto_signals = [s for s in signals if s.get("category") == "crypto"]
-        return {
-            "market_health": "healthy",
-            "active_session": predictions.get("active_session"),
-            "best_opportunities": top_picks,
-            "forex_signals": len(forex_signals),
-            "crypto_signals": len(crypto_signals),
-            "total_signals_analyzed": predictions.get("total_signals", 0)
-        }
-    return {"error": "Analysis failed", "details": predictions.get("error")}
+def market_analysis(db: Session = Depends(get_db)):
+    preds = generate_market_predictions()
+    if not preds.get("success"):
+        return {"error": "Analysis failed", "details": preds.get("error")}
+    signals = preds.get("signals", [])
+    forex = [s for s in signals if s.get("category") == "forex"]
+    crypto = [s for s in signals if s.get("category") == "crypto"]
+    strong = [s for s in signals if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]]
+    return {
+        "market_health": "healthy", "active_session": preds.get("active_session"),
+        "total_signals": len(signals), "forex_signals": len(forex), "crypto_signals": len(crypto),
+        "strong_signals": len(strong), "best_opportunities": strong[:5],
+        "usd_ngn_rate": preds.get("usd_ngn_rate"),
+        "generated_at": preds.get("generated_at")
+    }
 
 @app.get("/advice/{symbol}")
-def get_trading_advice(symbol: str):
+def get_trading_advice(symbol: str, username: Optional[str] = None, db: Session = Depends(get_db)):
     symbol = symbol.upper()
-    current_time = time.time()
-    if symbol in ADVICE_CACHE:
-        cache_data, ts = ADVICE_CACHE[symbol]
-        if current_time - ts < 3600:
-            return cache_data
-
-    prompt = f"""Perform deep institutional analysis on {symbol}.
+    now = time.time()
+    if symbol in ADVICE_CACHE and (now - ADVICE_CACHE[symbol]["ts"] < 3600):
+        return ADVICE_CACHE[symbol]["data"]
+    if username:
+        user = get_or_create_user(username, db)
+        log_activity(user, "viewed_advice", symbol=symbol, db=db)
+    live_price = get_live_price(symbol)
+    prompt = f"""Deep institutional analysis for {symbol}. Live price: {live_price}.
 Return ONLY valid JSON:
 {{
-  "symbol": "{symbol}",
-  "recommendation": "BUY|SELL|HOLD",
-  "confidence": 0-100,
+  "symbol": "{symbol}", "live_price": "{live_price}",
+  "recommendation": "BUY|SELL|HOLD", "confidence": 0-99,
   "trade_setup": {{
-    "entry": "price", "stop_loss": "price",
-    "take_profit_1": "price", "take_profit_2": "price", "take_profit_3": "price",
+    "entry": "price", "stop_loss": "ATR-based",
+    "take_profit_1": "1:1", "take_profit_2": "1:2", "take_profit_3": "1:3",
     "risk_reward": "1:X", "hold_time": "duration"
   }},
   "technical_analysis": {{
-    "trend": "bullish/bearish/ranging",
-    "rsi": "value + interpretation",
-    "macd": "signal",
-    "key_support": "level",
-    "key_resistance": "level",
-    "pattern": "chart pattern"
+    "trend": "bullish/bearish/ranging", "rsi": "value + interpretation",
+    "macd": "signal", "ema_stack": "alignment", "volume": "assessment",
+    "key_support": "level", "key_resistance": "level", "pattern": "detected pattern"
   }},
-  "risk_assessment": {{
-    "risk_level": "low/medium/high",
-    "max_position_size": "% of capital",
-    "invalidation": "condition that cancels this setup"
-  }},
-  "rationale": "3 sentences"
+  "risk_assessment": {{"risk_level": "low/medium/high", "max_position_pct": "X%", "invalidation": "condition"}},
+  "rationale": "3 institutional sentences with specific levels"
 }}"""
     try:
         content = get_ai_response(prompt)
-        if content.startswith("ERROR:"):
-            return {"success": False, "error": content}
         content = re.sub(r"```json|```", "", content.strip()).strip()
-        json_match = re.search(r"\{.*\}", content, re.DOTALL)
-        if json_match:
-            content = json_match.group(0)
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if m:
+            content = m.group(0)
         data = json.loads(content)
         result = {"success": True, "generated_at": datetime.utcnow().isoformat(), "advice": data}
-        ADVICE_CACHE[symbol] = (result, current_time)
+        ADVICE_CACHE[symbol] = {"data": result, "ts": now}
         return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 # ----------------------------
-# AI Chat — with per-user history
+# AI Chat — Persistent per user
 # ----------------------------
 @app.post("/chat")
-def chat_with_ai(chat: ChatMessage):
-    username = chat.username or "guest"
-    if username not in chat_history_db:
-        chat_history_db[username] = []
+def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
+    user = get_or_create_user(chat.username, db)
+    log_activity(user, "sent_chat", db=db)
 
-    history = chat_history_db[username]
-    preds_resp = generate_market_predictions()
-    signals = preds_resp.get("signals", [])
+    # Load last 10 messages from DB
+    history = db.query(DBChatMessage).filter(
+        DBChatMessage.user_id == user.id
+    ).order_by(DBChatMessage.created_at.desc()).limit(10).all()
+    history_text = "\n".join([f"{m.role.upper()}: {m.content}" for m in reversed(history)])
+
+    preds = generate_market_predictions(user.balance_ngn)
+    signals = preds.get("signals", [])
     ngn_rate = get_ngn_rate()
+    profile = get_user_profile_summary(user, db)
 
-    system_prompt = f"""You are ARIA — Advanced Revenue Intelligence Analyst — an elite AI trading strategist.
+    system_prompt = f"""You are ARIA — Advanced Revenue Intelligence Analyst.
+You are a world-class AI trading strategist who knows every user personally.
 
-LIVE CONTEXT:
-- Active Market Signals: {json.dumps(signals[:6], indent=2)}
-- USD/NGN Rate: {ngn_rate:.2f}
-- UTC Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}
+USER PROFILE: {profile}
+LIVE USD/NGN: {ngn_rate:.2f}
+CURRENT TOP SIGNALS: {json.dumps(signals[:5], indent=2)}
+TIME: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC
+
+CONVERSATION HISTORY:
+{history_text if history_text else "No previous messages."}
 
 YOUR CAPABILITIES:
-1. Precise NGN/USD position sizing and lot size calculations
-2. Multi-timeframe technical analysis (RSI, MACD, EMA, BB, Volume)
-3. Risk management: max 1-3% per trade, never exceed
-4. Trade idea evaluation and feedback
-5. Market psychology and sentiment interpretation
-6. Portfolio allocation advice
-7. Explain any trading concept in simple terms
-
-CONVERSATION HISTORY (last 6 turns):
-{json.dumps(history[-6:], indent=2)}
+1. Precision position sizing in NGN and USD
+2. Full technical analysis (RSI, MACD, EMA, BB, Volume, Patterns)
+3. Risk management — never exceed 2-3% per trade for this user's style
+4. Explain complex topics simply
+5. Personalized advice based on user's trade history and win rate
+6. Live price awareness and session timing
+7. Portfolio allocation and diversification advice
 
 RULES:
-- Always show calculations when financial figures are mentioned
-- Format responses clearly with numbered points when giving advice
-- If user mentions an amount in NGN, convert to USD and calculate position size
-- End advice with a one-line risk reminder"""
+- Always show calculations when amounts are mentioned
+- Reference the user's trading style ({user.trading_style}) and risk level ({user.risk_tolerance})
+- If user mentions NGN amounts, immediately convert and calculate position size
+- End with a brief risk reminder
+- Be direct, professional, and specific — no vague advice"""
 
     full_prompt = f"{system_prompt}\n\nUser: {chat.message}\nARIA:"
-    ai_response = get_ai_response(full_prompt)
+    response = get_ai_response(full_prompt)
 
-    # Save to history
-    history.append({"role": "user", "content": chat.message, "time": datetime.utcnow().isoformat()})
-    history.append({"role": "aria", "content": ai_response, "time": datetime.utcnow().isoformat()})
-    if len(history) > 40:
-        chat_history_db[username] = history[-40:]
+    # Save to DB
+    db.add(DBChatMessage(user_id=user.id, role="user", content=chat.message))
+    db.add(DBChatMessage(user_id=user.id, role="aria", content=response))
+    db.commit()
 
-    return {
-        "success": True,
-        "username": username,
-        "response": ai_response,
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    return {"success": True, "username": chat.username, "response": response, "timestamp": datetime.utcnow().isoformat()}
 
 @app.get("/chat/history/{username}")
-def get_chat_history(username: str):
+def get_chat_history(username: str, limit: int = 30, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    msgs = db.query(DBChatMessage).filter(
+        DBChatMessage.user_id == user.id
+    ).order_by(DBChatMessage.created_at.asc()).limit(limit).all()
     return {
         "username": username,
-        "history": chat_history_db.get(username, []),
-        "total_messages": len(chat_history_db.get(username, []))
+        "history": [{"role": m.role, "content": m.content, "time": m.created_at.isoformat()} for m in msgs],
+        "total": len(msgs)
     }
 
 @app.delete("/chat/history/{username}")
-def clear_chat_history(username: str):
-    chat_history_db[username] = []
+def clear_chat_history(username: str, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    db.query(DBChatMessage).filter(DBChatMessage.user_id == user.id).delete()
+    db.commit()
     return {"status": "success", "message": f"Chat history cleared for {username}"}
 
 # ----------------------------
@@ -627,327 +718,368 @@ def clear_chat_history(username: str):
 def calculate_risk(req: RiskCalcRequest):
     ngn_rate = get_ngn_rate()
     balance_usd = req.balance_ngn / ngn_rate
-    risk_amount_ngn = req.balance_ngn * (req.risk_percent / 100)
-    risk_amount_usd = risk_amount_ngn / ngn_rate
-
-    price_diff = abs(req.entry_price - req.stop_loss_price)
-    risk_pct_per_unit = price_diff / req.entry_price
-
-    if risk_pct_per_unit > 0:
-        position_size_usd = risk_amount_usd / risk_pct_per_unit
-        units = position_size_usd / req.entry_price
-    else:
-        position_size_usd = 0
-        units = 0
-
+    risk_ngn = req.balance_ngn * (req.risk_percent / 100)
+    risk_usd = risk_ngn / ngn_rate
+    dist = abs(req.entry_price - req.stop_loss_price)
+    pct_dist = dist / req.entry_price if req.entry_price > 0 else 0
+    pos_usd = risk_usd / pct_dist if pct_dist > 0 else 0
+    units = pos_usd / req.entry_price if req.entry_price > 0 else 0
     is_crypto = "USDT" in req.symbol.upper()
-    pip_value = price_diff if is_crypto else price_diff * 10000
+    pip_dist = dist if is_crypto else dist * 10000
 
     return {
-        "symbol": req.symbol.upper(),
-        "balance_ngn": req.balance_ngn,
-        "balance_usd": round(balance_usd, 2),
-        "risk_percent": req.risk_percent,
-        "risk_amount_ngn": round(risk_amount_ngn, 2),
-        "risk_amount_usd": round(risk_amount_usd, 2),
-        "entry_price": req.entry_price,
-        "stop_loss_price": req.stop_loss_price,
-        "stop_distance_pct": round(risk_pct_per_unit * 100, 4),
-        "recommended_position_size_usd": round(position_size_usd, 2),
-        "units_to_buy": round(units, 6),
-        "pip_distance": round(pip_value, 1) if not is_crypto else None,
-        "note": "Position sized to risk exactly your specified % of balance."
+        "symbol": req.symbol.upper(), "balance_ngn": req.balance_ngn,
+        "balance_usd": round(balance_usd, 2), "risk_percent": req.risk_percent,
+        "risk_amount_ngn": round(risk_ngn, 2), "risk_amount_usd": round(risk_usd, 4),
+        "entry_price": req.entry_price, "stop_loss_price": req.stop_loss_price,
+        "stop_distance_pct": round(pct_dist * 100, 4),
+        "recommended_position_usd": round(pos_usd, 2),
+        "units": round(units, 6),
+        "pip_distance": round(pip_dist, 1) if not is_crypto else None,
+        "note": f"Risking {req.risk_percent}% of your NGN balance per this trade."
     }
 
 # ----------------------------
 # Trade Idea Scorer
 # ----------------------------
 @app.post("/score_trade")
-def score_trade_idea(idea: TradeIdeaRequest):
-    rr = abs(idea.take_profit - idea.entry) / abs(idea.entry - idea.stop_loss) if abs(idea.entry - idea.stop_loss) > 0 else 0
-    direction = idea.direction.upper()
+def score_trade_idea(idea: TradeIdeaRequest, db: Session = Depends(get_db)):
+    user = get_or_create_user(idea.username, db)
+    log_activity(user, "scored_trade", symbol=idea.symbol, db=db)
+    dist_sl = abs(idea.entry - idea.stop_loss)
+    dist_tp = abs(idea.take_profit - idea.entry)
+    rr = dist_tp / dist_sl if dist_sl > 0 else 0
+    profile = get_user_profile_summary(user, db)
 
-    prompt = f"""You are an elite institutional trade reviewer.
+    prompt = f"""Elite institutional trade reviewer. Evaluate this trade idea for user {idea.username}.
+USER PROFILE: {profile}
 
-TRADE IDEA SUBMITTED:
-- Symbol: {idea.symbol.upper()}
-- Direction: {direction}
-- Entry: {idea.entry}
-- Stop Loss: {idea.stop_loss}
-- Take Profit: {idea.take_profit}
-- Calculated R/R: 1:{round(rr, 2)}
-- Trader's Rationale: {idea.rationale}
+TRADE:
+Symbol: {idea.symbol.upper()} | Direction: {idea.direction.upper()}
+Entry: {idea.entry} | Stop Loss: {idea.stop_loss} | Take Profit: {idea.take_profit}
+Calculated R/R: 1:{round(rr, 2)} | Rationale: {idea.rationale}
 
-EVALUATE THIS TRADE and return ONLY valid JSON:
+Return ONLY valid JSON:
 {{
-  "score": 0-100,
-  "grade": "A+|A|B|C|D|F",
-  "verdict": "TAKE IT|RISKY BUT OK|AVOID",
-  "risk_reward": "1:{round(rr, 2)}",
-  "rr_assessment": "excellent(>1:3)|good(1:2-3)|weak(<1:2)|negative",
-  "strengths": ["point1", "point2"],
-  "weaknesses": ["point1", "point2"],
-  "improvements": ["suggestion1", "suggestion2"],
+  "score": 0-100, "grade": "A+|A|B|C|D|F", "verdict": "TAKE IT|RISKY BUT CONSIDER|AVOID",
+  "rr_ratio": "1:{round(rr, 2)}", "rr_assessment": "excellent(>1:3)|good(1:2-3)|weak(<1:2)",
+  "strengths": ["strength1", "strength2"],
+  "weaknesses": ["weakness1", "weakness2"],
+  "improvements": ["improvement1", "improvement2"],
   "adjusted_entry": "better entry if applicable",
-  "adjusted_sl": "tighter SL if applicable",
+  "adjusted_sl": "better SL if applicable",
   "adjusted_tp": "better TP if applicable",
-  "summary": "2 sentence professional opinion"
+  "personalized_feedback": "feedback specific to this user's style and history",
+  "summary": "2-sentence professional verdict"
 }}"""
-
     try:
         content = get_ai_response(prompt)
         content = re.sub(r"```json|```", "", content.strip()).strip()
-        json_match = re.search(r"\{.*\}", content, re.DOTALL)
-        if json_match:
-            content = json_match.group(0)
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if m:
+            content = m.group(0)
         data = json.loads(content)
         return {"success": True, "trade_idea": idea.dict(), "analysis": data}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 # ----------------------------
-# Watchlist
+# Watchlist — DB persistent
 # ----------------------------
 @app.post("/watchlist/{username}")
-def add_to_watchlist(username: str, symbol: str):
+def add_to_watchlist(username: str, symbol: str, db: Session = Depends(get_db)):
     symbol = symbol.upper()
     if symbol not in TRADING_SYMBOLS:
-        raise HTTPException(status_code=400, detail=f"{symbol} is not a supported trading pair")
-    if username not in watchlist_db:
-        watchlist_db[username] = []
-    if symbol not in watchlist_db[username]:
-        watchlist_db[username].append(symbol)
-    return {"status": "success", "watchlist": watchlist_db[username]}
+        raise HTTPException(status_code=400, detail=f"{symbol} not supported")
+    user = get_or_create_user(username, db)
+    exists = db.query(WatchlistItem).filter(WatchlistItem.user_id == user.id, WatchlistItem.symbol == symbol).first()
+    if not exists:
+        db.add(WatchlistItem(user_id=user.id, symbol=symbol))
+        db.commit()
+    items = db.query(WatchlistItem).filter(WatchlistItem.user_id == user.id).all()
+    return {"status": "success", "watchlist": [w.symbol for w in items]}
 
 @app.delete("/watchlist/{username}/{symbol}")
-def remove_from_watchlist(username: str, symbol: str):
-    symbol = symbol.upper()
-    if username in watchlist_db and symbol in watchlist_db[username]:
-        watchlist_db[username].remove(symbol)
-    return {"status": "success", "watchlist": watchlist_db.get(username, [])}
+def remove_from_watchlist(username: str, symbol: str, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    db.query(WatchlistItem).filter(WatchlistItem.user_id == user.id, WatchlistItem.symbol == symbol.upper()).delete()
+    db.commit()
+    items = db.query(WatchlistItem).filter(WatchlistItem.user_id == user.id).all()
+    return {"status": "success", "watchlist": [w.symbol for w in items]}
 
 @app.get("/watchlist/{username}")
-def get_watchlist(username: str):
-    symbols = watchlist_db.get(username, [])
-    preds = generate_market_predictions()
-    signals_map = {s.get("symbol"): s for s in preds.get("signals", [])}
-
-    items = []
-    for sym in symbols:
-        sig = signals_map.get(sym, {})
-        live = fetch_alpha_vantage_crypto(sym) if "USDT" in sym else fetch_alpha_vantage_forex(sym[:3], sym[3:])
-        items.append({
-            "symbol": sym,
-            "live_price": live.get("price") or live.get("rate"),
-            "signal": sig.get("signal", "N/A"),
-            "confidence": sig.get("confidence", "N/A"),
-            "entry_price": sig.get("entry_price", "N/A"),
-            "stop_loss": sig.get("stop_loss", "N/A"),
-            "hold_time": sig.get("hold_time", "N/A")
+def get_watchlist(username: str, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    items = db.query(WatchlistItem).filter(WatchlistItem.user_id == user.id).all()
+    preds = generate_market_predictions(user.balance_ngn)
+    sig_map = {s.get("symbol"): s for s in preds.get("signals", [])}
+    result = []
+    for w in items:
+        sig = sig_map.get(w.symbol, {})
+        price = get_live_price(w.symbol)
+        result.append({
+            "symbol": w.symbol, "live_price": price,
+            "signal": sig.get("signal", "N/A"), "confidence": sig.get("confidence", "N/A"),
+            "entry_price": sig.get("entry_price", "N/A"), "stop_loss": sig.get("stop_loss", "N/A"),
+            "hold_time": sig.get("hold_time", "N/A"), "added_at": w.added_at.isoformat()
         })
-
-    return {"username": username, "watchlist": items, "total": len(items)}
+    return {"username": username, "watchlist": result, "total": len(result)}
 
 # ----------------------------
-# Trade Journal
+# Trade Journal — DB persistent
 # ----------------------------
 @app.post("/journal/{username}")
-def add_journal_entry(username: str, entry: TradeJournalEntry):
-    if username not in trade_journal_db:
-        trade_journal_db[username] = []
-    record = entry.dict()
-    record["logged_at"] = datetime.utcnow().isoformat()
-    trade_journal_db[username].append(record)
-    return {"status": "success", "entry": record}
+def add_journal_entry(username: str, entry: TradeJournalEntryRequest, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    record = DBJournalEntry(
+        user_id=user.id, symbol=entry.symbol.upper(), direction=entry.direction.upper(),
+        entry_price=entry.entry_price, exit_price=entry.exit_price, volume=entry.volume,
+        result=entry.result.upper(), pnl_usd=entry.pnl_usd, notes=entry.notes
+    )
+    db.add(record)
+    log_activity(user, "logged_trade", symbol=entry.symbol.upper(),
+                 details={"result": entry.result, "pnl": entry.pnl_usd}, db=db)
+    db.commit()
+    db.refresh(record)
+    return {"status": "success", "entry_id": record.id, "logged_at": record.logged_at.isoformat()}
 
 @app.get("/journal/{username}")
-def get_journal(username: str):
-    entries = trade_journal_db.get(username, [])
+def get_journal(username: str, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    entries = db.query(DBJournalEntry).filter(DBJournalEntry.user_id == user.id).order_by(DBJournalEntry.logged_at.desc()).all()
     if not entries:
         return {"username": username, "entries": [], "stats": {}}
-
-    wins = [e for e in entries if e.get("result", "").upper() == "WIN"]
-    losses = [e for e in entries if e.get("result", "").upper() == "LOSS"]
-    total_pnl = sum(e.get("pnl_usd", 0) for e in entries)
-    win_rate = (len(wins) / len(entries) * 100) if entries else 0
-    avg_win = (sum(e["pnl_usd"] for e in wins) / len(wins)) if wins else 0
-    avg_loss = (sum(e["pnl_usd"] for e in losses) / len(losses)) if losses else 0
-    best = max(entries, key=lambda e: e.get("pnl_usd", 0))
-    worst = min(entries, key=lambda e: e.get("pnl_usd", 0))
+    wins   = [e for e in entries if e.result == "WIN"]
+    losses = [e for e in entries if e.result == "LOSS"]
+    total_pnl = sum(e.pnl_usd for e in entries)
+    sym_freq = {}
+    for e in entries:
+        sym_freq[e.symbol] = sym_freq.get(e.symbol, 0) + 1
+    best  = max(entries, key=lambda e: e.pnl_usd)
+    worst = min(entries, key=lambda e: e.pnl_usd)
 
     return {
         "username": username,
-        "entries": entries,
+        "entries": [{"id": e.id, "symbol": e.symbol, "direction": e.direction,
+                     "entry_price": e.entry_price, "exit_price": e.exit_price,
+                     "volume": e.volume, "result": e.result, "pnl_usd": e.pnl_usd,
+                     "notes": e.notes, "logged_at": e.logged_at.isoformat()} for e in entries],
         "stats": {
-            "total_trades": len(entries),
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate_pct": round(win_rate, 1),
+            "total_trades": len(entries), "wins": len(wins), "losses": len(losses),
+            "win_rate_pct": round(len(wins) / len(entries) * 100, 1),
             "total_pnl_usd": round(total_pnl, 2),
-            "avg_win_usd": round(avg_win, 2),
-            "avg_loss_usd": round(avg_loss, 2),
-            "best_trade": best,
-            "worst_trade": worst
+            "avg_win_usd": round(sum(e.pnl_usd for e in wins) / len(wins), 2) if wins else 0,
+            "avg_loss_usd": round(sum(e.pnl_usd for e in losses) / len(losses), 2) if losses else 0,
+            "most_traded_symbol": max(sym_freq, key=sym_freq.get),
+            "best_trade": {"symbol": best.symbol, "pnl_usd": best.pnl_usd},
+            "worst_trade": {"symbol": worst.symbol, "pnl_usd": worst.pnl_usd}
         }
     }
 
 # ----------------------------
-# Visual Simulator (Graph-Ready)
-# ----------------------------
-@app.get("/simulator/candles/{symbol}")
-def get_simulator_candles(symbol: str, candles: int = 120, interval: int = 15, seed: int = None):
-    """Returns simulated OHLCV candlestick data ready for charting."""
-    symbol = symbol.upper()
-    if symbol not in SYMBOL_BASE_PRICES and symbol not in TRADING_SYMBOLS:
-        raise HTTPException(status_code=400, detail=f"Unsupported symbol: {symbol}")
-    candle_data = simulate_ohlcv(symbol, num_candles=min(candles, 300), interval_minutes=interval, seed=seed)
-    return {
-        "symbol": symbol,
-        "interval_minutes": interval,
-        "total_candles": len(candle_data),
-        "chart_type": "candlestick",
-        "candles": candle_data,
-        "meta": {
-            "base_price": SYMBOL_BASE_PRICES.get(symbol),
-            "note": "Simulated data using Geometric Brownian Motion — for demo trading practice only."
-        }
-    }
-
-@app.get("/simulator/run/{symbol}")
-def run_simulator(symbol: str, candles: int = 150, interval: int = 15, balance: float = 10000.0, seed: int = None):
-    """Full trading simulation: candles + equity curve + trade markers + performance stats."""
-    symbol = symbol.upper()
-    if symbol not in SYMBOL_BASE_PRICES and symbol not in TRADING_SYMBOLS:
-        raise HTTPException(status_code=400, detail=f"Unsupported symbol: {symbol}")
-
-    candle_data = simulate_ohlcv(symbol, num_candles=min(candles, 300), interval_minutes=interval, seed=seed)
-    results = run_strategy_on_candles(candle_data, initial_balance=balance)
-
-    if "error" in results:
-        raise HTTPException(status_code=400, detail=results["error"])
-
-    # Build entry/exit markers separately for chart overlay
-    entry_markers = [
-        {"time": t["entry_time"], "datetime": t["entry_datetime"], "price": t["entry_price"], "label": "BUY", "color": "#00ff88"}
-        for t in results["trades"]
-    ]
-    exit_markers = [
-        {"time": t["exit_time"], "datetime": t["exit_datetime"], "price": t["exit_price"],
-         "label": "WIN" if t["result"] == "WIN" else "LOSS",
-         "color": "#00bfff" if t["result"] == "WIN" else "#ff4444"}
-        for t in results["trades"]
-    ]
-
-    return {
-        "symbol": symbol,
-        "interval_minutes": interval,
-        "simulation_candles": len(candle_data),
-        "strategy": results["strategy"],
-        "performance": {
-            "initial_balance_usd": results["initial_balance"],
-            "final_balance_usd": results["final_balance"],
-            "total_pnl_usd": results["total_pnl_usd"],
-            "total_pnl_pct": results["total_pnl_pct"],
-            "total_trades": results["total_trades"],
-            "wins": results["wins"],
-            "losses": results["losses"],
-            "win_rate_pct": results["win_rate_pct"],
-            "avg_win_usd": results["avg_win_usd"],
-            "avg_loss_usd": results["avg_loss_usd"],
-        },
-        "chart_data": {
-            "candles": candle_data,
-            "equity_curve": results["equity_curve"],
-            "entry_markers": entry_markers,
-            "exit_markers": exit_markers
-        },
-        "trades": results["trades"],
-        "disclaimer": "Simulated results do not guarantee future performance."
-    }
-
-# ----------------------------
-# Demo Account
+# Demo Account — DB persistent
 # ----------------------------
 @app.post("/demo/open_account/{username}")
-def open_demo_account(username: str, initial_balance: float = 10000.0):
-    demo_accounts_db[username] = DemoAccount(username=username, demo_balance=initial_balance)
-    return {"status": "success", "message": f"Demo account opened for {username} with ${initial_balance:,.2f}"}
+def open_demo_account(username: str, initial_balance: float = 10000.0, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    existing = db.query(DemoAccount).filter(DemoAccount.user_id == user.id).first()
+    if existing:
+        return {"status": "exists", "message": f"Demo account already exists. Balance: ${existing.balance:,.2f}", "balance": existing.balance}
+    acct = DemoAccount(user_id=user.id, balance=initial_balance)
+    db.add(acct)
+    db.commit()
+    db.refresh(acct)
+    return {"status": "success", "message": f"Demo account opened for {username}", "balance": acct.balance, "account_id": acct.id}
 
 @app.post("/demo/execute_trade/{username}")
-def execute_demo_trade(username: str, symbol: str, volume: float, trade_type: str):
-    if username not in demo_accounts_db:
-        open_demo_account(username)
-    account = demo_accounts_db[username]
-    symbol = symbol.upper()
-    live_data = fetch_alpha_vantage_crypto(symbol) if "USDT" in symbol else fetch_alpha_vantage_forex(symbol[:3], symbol[3:] or "USD")
-    entry_price = float(live_data.get("price") or live_data.get("rate") or 0.0)
+def execute_demo_trade(username: str, req: DemoTradeRequest, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    acct = db.query(DemoAccount).filter(DemoAccount.user_id == user.id).first()
+    if not acct:
+        acct = DemoAccount(user_id=user.id, balance=10000.0)
+        db.add(acct)
+        db.commit()
+        db.refresh(acct)
+
+    symbol = req.symbol.upper()
+    entry_price = get_live_price(symbol)
     if entry_price == 0.0:
-        raise HTTPException(status_code=400, detail="Could not fetch live price for entry")
-    new_trade = Trade(symbol=symbol, entry_price=entry_price, current_price=entry_price, volume=volume, type=trade_type.upper(), is_demo=True)
-    account.active_demo_trades.append(new_trade)
-    return {"status": "success", "trade": new_trade}
+        raise HTTPException(status_code=400, detail=f"Could not fetch live price for {symbol}")
+
+    trade = DemoTrade(
+        demo_account_id=acct.id, symbol=symbol, entry_price=entry_price,
+        current_price=entry_price, volume=req.volume, trade_type=req.trade_type.upper()
+    )
+    db.add(trade)
+    log_activity(user, "opened_demo_trade", symbol=symbol, details={"entry": entry_price, "volume": req.volume}, db=db)
+    db.commit()
+    db.refresh(trade)
+    return {"status": "success", "trade_id": trade.id, "symbol": symbol, "entry_price": entry_price, "volume": req.volume, "type": trade.trade_type}
+
+@app.post("/demo/close_trade/{username}/{trade_id}")
+def close_demo_trade(username: str, trade_id: int, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    acct = db.query(DemoAccount).filter(DemoAccount.user_id == user.id).first()
+    if not acct:
+        raise HTTPException(status_code=404, detail="No demo account found")
+    trade = db.query(DemoTrade).filter(DemoTrade.id == trade_id, DemoTrade.demo_account_id == acct.id).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    exit_price = get_live_price(trade.symbol)
+    if exit_price == 0:
+        exit_price = trade.current_price
+    pnl = (exit_price - trade.entry_price) * trade.volume if trade.trade_type == "BUY" else (trade.entry_price - exit_price) * trade.volume
+    trade.exit_price = exit_price
+    trade.current_price = exit_price
+    trade.pnl = pnl
+    trade.is_active = False
+    trade.closed_at = datetime.utcnow()
+    acct.balance += pnl
+    db.commit()
+    return {"status": "closed", "symbol": trade.symbol, "entry": trade.entry_price, "exit": exit_price, "pnl_usd": round(pnl, 2), "new_balance": round(acct.balance, 2)}
+
+@app.get("/demo/account/{username}")
+def get_demo_account(username: str, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    acct = db.query(DemoAccount).filter(DemoAccount.user_id == user.id).first()
+    if not acct:
+        return {"error": "No demo account found. POST /demo/open_account/{username} to create one."}
+
+    active = db.query(DemoTrade).filter(DemoTrade.demo_account_id == acct.id, DemoTrade.is_active == True).all()
+    closed = db.query(DemoTrade).filter(DemoTrade.demo_account_id == acct.id, DemoTrade.is_active == False).all()
+
+    # Refresh PnL for active trades
+    total_floating_pnl = 0
+    active_list = []
+    for t in active:
+        price = get_live_price(t.symbol) or t.current_price
+        pnl = (price - t.entry_price) * t.volume if t.trade_type == "BUY" else (t.entry_price - price) * t.volume
+        t.current_price = price
+        t.pnl = pnl
+        total_floating_pnl += pnl
+        active_list.append({"id": t.id, "symbol": t.symbol, "type": t.trade_type,
+                             "entry_price": t.entry_price, "current_price": price,
+                             "volume": t.volume, "pnl_usd": round(pnl, 2), "opened_at": t.opened_at.isoformat()})
+    db.commit()
+
+    wins = [t for t in closed if t.pnl > 0]
+    return {
+        "username": username, "balance_usd": round(acct.balance, 2),
+        "floating_pnl_usd": round(total_floating_pnl, 2),
+        "equity_usd": round(acct.balance + total_floating_pnl, 2),
+        "active_trades": active_list,
+        "trade_history": [{"id": t.id, "symbol": t.symbol, "type": t.trade_type,
+                           "entry": t.entry_price, "exit": t.exit_price,
+                           "pnl_usd": round(t.pnl, 2), "closed_at": t.closed_at.isoformat() if t.closed_at else None}
+                          for t in closed[-20:]],
+        "stats": {
+            "total_closed_trades": len(closed), "wins": len(wins),
+            "losses": len(closed) - len(wins),
+            "win_rate_pct": round(len(wins) / len(closed) * 100, 1) if closed else 0,
+            "realized_pnl_usd": round(sum(t.pnl for t in closed), 2)
+        }
+    }
 
 @app.get("/demo/ai_feedback/{username}")
-def get_demo_ai_feedback(username: str):
-    if username not in demo_accounts_db:
+def get_demo_ai_feedback(username: str, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
+    acct = db.query(DemoAccount).filter(DemoAccount.user_id == user.id).first()
+    if not acct:
         return {"error": "No demo account found"}
-    account = demo_accounts_db[username]
-    for trade in account.active_demo_trades:
-        live_data = fetch_alpha_vantage_crypto(trade.symbol) if "USDT" in trade.symbol else fetch_alpha_vantage_forex(trade.symbol[:3], trade.symbol[3:])
-        trade.current_price = float(live_data.get("price") or live_data.get("rate") or trade.current_price)
-        trade.pnl = (trade.current_price - trade.entry_price) * trade.volume if trade.type == "BUY" else (trade.entry_price - trade.current_price) * trade.volume
+    active = db.query(DemoTrade).filter(DemoTrade.demo_account_id == acct.id, DemoTrade.is_active == True).all()
+    if not active:
+        return {"error": "No active trades to analyze"}
 
-    summary = [f"{t.type} {t.volume} {t.symbol} @ {t.entry_price}, now {t.current_price}, PnL: ${t.pnl:.2f}" for t in account.active_demo_trades]
-    prompt = f"""Elite Trading Risk Manager reviewing DEMO TRADES for {username}:
-{json.dumps(summary)}
-Balance: ${account.demo_balance:,.2f} USD
+    summary = []
+    for t in active:
+        price = get_live_price(t.symbol) or t.current_price
+        pnl = (price - t.entry_price) * t.volume if t.trade_type == "BUY" else (t.entry_price - price) * t.volume
+        summary.append(f"{t.trade_type} {t.volume} {t.symbol} @ {t.entry_price} | Now: {price} | PnL: ${pnl:.2f}")
 
-1. Evaluate performance — is this profitable strategy?
-2. Should they replicate these in a LIVE account? What to adjust?
-3. Identify any dangerous positions.
-4. Suggest exact SL/TP improvements.
-Be precise and calculative."""
+    profile = get_user_profile_summary(user, db)
+    prompt = f"""Elite trading risk manager reviewing DEMO TRADES.
+USER: {profile}
+ACTIVE TRADES: {json.dumps(summary)}
+DEMO BALANCE: ${acct.balance:,.2f}
+
+Provide a direct, calculative review:
+1. Which trades are profitable and which are at risk?
+2. Should any trade be closed NOW? Justify with specific levels.
+3. Adjust SL/TP for active trades with exact new levels.
+4. Is the overall portfolio over-leveraged or well-managed?
+5. One specific improvement for this trader's style."""
 
     feedback = get_ai_response(prompt)
-    return {"username": username, "demo_performance": account.active_demo_trades, "ai_strategic_advice": feedback}
+    return {"username": username, "balance": acct.balance, "active_trades": summary, "ai_strategic_advice": feedback}
 
 # ----------------------------
 # Account Monitor
 # ----------------------------
-def update_account_pnl(username: str):
-    if username not in accounts_db:
-        return
-    account = accounts_db[username]
-    for trade in account.trades:
-        live_data = fetch_alpha_vantage_crypto(trade.symbol) if "USDT" in trade.symbol else fetch_alpha_vantage_forex(trade.symbol[:3], trade.symbol[3:])
-        current_price = float(live_data.get("price") or live_data.get("rate") or trade.current_price)
-        trade.current_price = current_price
-        trade.pnl = (current_price - trade.entry_price) * trade.volume if trade.type == "BUY" else (trade.entry_price - current_price) * trade.volume
-
 @app.get("/account/monitor/{username}")
-def monitor_account(username: str):
-    if username not in accounts_db:
-        accounts_db[username] = AccountState(username=username, balance=1000000.0, trades=[
-            Trade(symbol="BTCUSDT", entry_price=43000.0, current_price=43500.0, volume=0.01, type="BUY"),
-            Trade(symbol="EURUSD", entry_price=1.0850, current_price=1.0900, volume=10000, type="BUY")
-        ])
-    update_account_pnl(username)
-    account = accounts_db[username]
+def monitor_account(username: str, db: Session = Depends(get_db)):
+    user = get_or_create_user(username, db)
     ngn_rate = get_ngn_rate()
-    total_pnl_usd = sum(t.pnl for t in account.trades)
-    total_pnl_ngn = total_pnl_usd * ngn_rate
+    demo_acct = db.query(DemoAccount).filter(DemoAccount.user_id == user.id).first()
+    journal = db.query(DBJournalEntry).filter(DBJournalEntry.user_id == user.id).all()
+    wins = [j for j in journal if j.result == "WIN"]
+    total_pnl = sum(j.pnl_usd for j in journal)
+
     return {
-        "username": username,
-        "balance_ngn": account.balance,
-        "balance_usd": round(account.balance / ngn_rate, 2),
-        "active_trades": account.trades,
-        "total_pnl_usd": round(total_pnl_usd, 2),
-        "total_pnl_ngn": round(total_pnl_ngn, 2),
-        "usd_to_ngn_rate": ngn_rate,
-        "status": "alert" if total_pnl_usd < -50 else "healthy"
+        "username": username, "balance_ngn": user.balance_ngn,
+        "balance_usd": round(user.balance_ngn / ngn_rate, 2),
+        "usd_ngn_rate": ngn_rate,
+        "demo_account": {"balance_usd": demo_acct.balance if demo_acct else None, "exists": demo_acct is not None},
+        "trading_stats": {
+            "total_trades": len(journal), "wins": len(wins),
+            "losses": len(journal) - len(wins),
+            "win_rate_pct": round(len(wins) / len(journal) * 100, 1) if journal else 0,
+            "total_pnl_usd": round(total_pnl, 2),
+            "total_pnl_ngn": round(total_pnl * ngn_rate, 2)
+        },
+        "profile": {"risk_tolerance": user.risk_tolerance, "trading_style": user.trading_style,
+                    "preferred_pairs": user.preferred_pairs, "member_since": user.created_at.isoformat()}
     }
 
+# ----------------------------
+# Simulator
+# ----------------------------
+@app.get("/simulator/candles/{symbol}")
+def get_simulator_candles(symbol: str, candles: int = 120, interval: int = 15, seed: int = None):
+    symbol = symbol.upper()
+    candle_data = simulate_ohlcv(symbol, num_candles=min(candles, 300), interval_minutes=interval, seed=seed)
+    return {
+        "symbol": symbol, "interval_minutes": interval, "total_candles": len(candle_data),
+        "chart_type": "candlestick", "candles": candle_data,
+        "meta": {"base_price": SYMBOL_BASE_PRICES.get(symbol), "note": "Simulated via GBM — demo only."}
+    }
+
+@app.get("/simulator/run/{symbol}")
+def run_simulator(symbol: str, candles: int = 150, interval: int = 15, balance: float = 10000.0, seed: int = None):
+    symbol = symbol.upper()
+    candle_data = simulate_ohlcv(symbol, num_candles=min(candles, 300), interval_minutes=interval, seed=seed)
+    results = run_strategy_on_candles(candle_data, initial_balance=balance)
+    if "error" in results:
+        raise HTTPException(status_code=400, detail=results["error"])
+    entry_markers = [{"time": t["entry_time"], "datetime": t["entry_datetime"], "price": t["entry_price"], "label": "BUY", "color": "#00ff88"} for t in results["trades"]]
+    exit_markers  = [{"time": t["exit_time"],  "datetime": t["exit_datetime"],  "price": t["exit_price"],  "label": t["result"], "color": "#00bfff" if t["result"] == "WIN" else "#ff4444"} for t in results["trades"]]
+    return {
+        "symbol": symbol, "interval_minutes": interval, "strategy": results["strategy"],
+        "performance": {
+            "initial_balance_usd": results["initial_balance"], "final_balance_usd": results["final_balance"],
+            "total_pnl_usd": results["total_pnl_usd"], "total_pnl_pct": results["total_pnl_pct"],
+            "total_trades": results["total_trades"], "wins": results["wins"], "losses": results["losses"],
+            "win_rate_pct": results["win_rate_pct"]
+        },
+        "chart_data": {"candles": candle_data, "equity_curve": results["equity_curve"], "entry_markers": entry_markers, "exit_markers": exit_markers},
+        "trades": results["trades"],
+        "disclaimer": "Simulated results. Past performance is not indicative of future results."
+    }
+
+# ----------------------------
+# Connect Account
+# ----------------------------
 @app.post("/connect_account")
-def connect_account(user: UserAccount):
-    users_db[user.username] = user
-    return {"status": "success", "message": f"User {user.username} connected"}
+def connect_account(req: UserAccountRequest, db: Session = Depends(get_db)):
+    user = get_or_create_user(req.username, db)
+    return {"status": "success", "message": f"Account connected for {req.username}", "user_id": user.id}
