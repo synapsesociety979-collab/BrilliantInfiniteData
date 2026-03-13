@@ -14,6 +14,10 @@ from models import (
     ChatMessage as DBChatMessage, TradeJournalEntry as DBJournalEntry,
     WatchlistItem, UserActivity
 )
+from market_data import (
+    get_symbol_analysis, format_for_ai_prompt,
+    fetch_realtime_quote
+)
 
 # ----------------------------
 # DB init on startup
@@ -57,12 +61,17 @@ def fetch_alpha_vantage_crypto(symbol: str) -> Dict:
     return {}
 
 def get_live_price(symbol: str) -> float:
+    # First try to get price from full candle analysis (already cached)
+    analysis = get_symbol_analysis(symbol)
+    if analysis.get("live_price"):
+        return float(analysis["live_price"])
+    # Fallback to real-time quote
     if "USDT" in symbol or "BUSD" in symbol:
-        d = fetch_alpha_vantage_crypto(symbol)
-        return float(d.get("price") or 0)
+        base = symbol.replace("USDT", "").replace("BUSD", "")
+        d = fetch_realtime_quote(base, "USD")
     else:
-        d = fetch_alpha_vantage_forex(symbol[:3], symbol[3:] or "USD")
-        return float(d.get("rate") or 0)
+        d = fetch_realtime_quote(symbol[:3], symbol[3:] or "USD")
+    return float(d.get("price") or 0)
 
 def get_ngn_rate() -> float:
     d = fetch_alpha_vantage_forex("USD", "NGN")
@@ -156,97 +165,137 @@ def get_user_profile_summary(user: User, db: Session) -> str:
 # ----------------------------
 # AI — Enhanced Predictions
 # ----------------------------
+def _get_session_priority_symbols(h: int) -> List[str]:
+    """Return symbols ordered by current market session — most active first."""
+    if 7 <= h < 12:
+        priority = ["EURUSD", "GBPUSD", "EURGBP", "EURJPY", "GBPJPY", "EURCAD", "EURAUD", "GBPAUD",
+                    "BTCUSDT", "ETHUSDT", "USDCHF", "AUDUSD", "USDJPY", "SOLUSDT", "BNBUSDT"]
+    elif 12 <= h < 17:
+        priority = ["EURUSD", "GBPUSD", "USDJPY", "BTCUSDT", "ETHUSDT", "SOLUSDT", "USDCAD",
+                    "USDCHF", "EURGBP", "GBPJPY", "EURJPY", "XRPUSDT", "BNBUSDT", "AVAXUSDT", "LINKUSDT"]
+    elif 17 <= h < 21:
+        priority = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "AVAXUSDT", "LINKUSDT",
+                    "UNIUSDT", "ADAUSDT", "DOGEUSDT", "EURUSD", "GBPUSD", "USDCAD", "MATICUSDT", "TRXUSDT"]
+    else:
+        priority = ["USDJPY", "GBPJPY", "AUDJPY", "EURJPY", "AUDCAD", "AUDUSD", "NZDUSD",
+                    "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOTUSDT", "LTCUSDT", "XRPUSDT", "SHIBUSDT", "TRXUSDT"]
+    # Add remaining symbols not already in list
+    remaining = [s for s in TRADING_SYMBOLS if s not in priority]
+    return priority + remaining
+
+
 def generate_market_predictions(investment_amount_ngn: float = 0.0, user_profile: str = "") -> Dict[str, Any]:
     global PREDICTIONS_CACHE
     now = time.time()
-    cache_key = f"preds_{investment_amount_ngn}"
+    cache_key = f"preds_{int(investment_amount_ngn)}"
     if cache_key in PREDICTIONS_CACHE and (now - PREDICTIONS_CACHE[cache_key]["ts"] < CACHE_TTL):
         return PREDICTIONS_CACHE[cache_key]["data"]
 
-    live = get_market_context()
     ngn_rate = get_ngn_rate()
     inv_usd = investment_amount_ngn / ngn_rate if investment_amount_ngn > 0 else 0
     utc = datetime.utcnow()
     h = utc.hour
+
     if 7 <= h < 12:
-        session = "London Session — prioritize EURUSD, GBPUSD, EURGBP, EURJPY"
+        session = "London Session — EURUSD, GBPUSD, EURGBP most active"
     elif 12 <= h < 17:
         session = "London/NY Overlap — PEAK liquidity, all pairs active"
     elif 17 <= h < 21:
-        session = "New York Session — USD pairs and crypto are most active"
+        session = "New York Session — USD pairs and crypto most active"
     else:
-        session = "Asian Session — prioritize JPY pairs: USDJPY, GBPJPY, AUDJPY"
+        session = "Asian Session — JPY pairs: USDJPY, GBPJPY, AUDJPY most active"
 
     personalization = f"\nUSER PROFILE: {user_profile}" if user_profile else ""
 
-    prompt = f"""You are ARIA — an elite institutional quantitative trading analyst with 20+ years experience.
+    # Fetch REAL live data for session-priority symbols (up to 12 to respect rate limits)
+    priority_symbols = _get_session_priority_symbols(h)
+    real_data_symbols = priority_symbols[:12]
+    live_data_blocks = []
+    has_real_data = False
 
-LIVE PRICES: {live}
-CURRENT SESSION: {session} | UTC: {utc.strftime('%H:%M')}
-INVESTOR BUDGET: {investment_amount_ngn:,.0f} NGN (~${inv_usd:,.2f} USD @ {ngn_rate:.2f}){personalization}
+    print(f"[ARIA] Fetching real market data for {len(real_data_symbols)} symbols...")
+    for sym in real_data_symbols:
+        analysis = get_symbol_analysis(sym)
+        block = format_for_ai_prompt(analysis)
+        live_data_blocks.append(block)
+        if analysis.get("live_price"):
+            has_real_data = True
 
-MANDATORY ANALYSIS PROTOCOL for EVERY asset — you must evaluate ALL of these:
+    # Remaining symbols — AI will use pattern reasoning
+    remaining_symbols = [s for s in TRADING_SYMBOLS if s not in real_data_symbols]
+    remaining_text = ", ".join(remaining_symbols)
 
-TECHNICAL LAYERS:
-1. TREND ALIGNMENT: Confirm direction across 15m + 1H + 4H timeframes (all 3 must agree)
-2. RSI(14): Only trade RSI 30-70 zone; oversold <35 = buy bias; overbought >65 = sell bias
-3. MACD(12,26,9): Signal line crossover must confirm direction
-4. EMA STACK: Price above EMA20 > EMA50 > EMA200 = strong bullish; reverse = bearish
-5. BOLLINGER BANDS(20,2): Squeeze = breakout incoming; band rejection = reversal signal
-6. VOLUME: Entry must have above-average volume confirmation
-7. CHART PATTERN: Identify flags, wedges, triangles, H&S, double tops/bottoms, pin bars
-8. SUPPORT/RESISTANCE: Use psychological levels (round numbers) + swing highs/lows
-9. SESSION FILTER: Bonus weight to pairs fitting the current session above
-10. ATR-BASED SL: Stop loss must use ATR(14) × 1.5 — not arbitrary
+    live_data_section = "\n\n".join(live_data_blocks)
+    data_source_note = "LIVE Alpha Vantage data" if has_real_data else "AI pattern reasoning (live data unavailable)"
 
-QUALITY FILTER (REJECT any signal that fails):
-- All 3 timeframes NOT aligned → SKIP
-- RSI outside 25-75 zone → SKIP (extreme = risky)  
-- Risk/reward below 1:2 → SKIP
-- Volume not confirming → SKIP
+    prompt = f"""You are ARIA — elite institutional quantitative trading analyst. Data source: {data_source_note}
 
-POSITION SIZING (mandatory):
-- Risk exactly 2% of {investment_amount_ngn:,.0f} NGN = {investment_amount_ngn * 0.02:,.0f} NGN per trade
-- Convert to USD: {investment_amount_ngn * 0.02 / ngn_rate:,.2f} USD
+SESSION: {session} | UTC: {utc.strftime('%H:%M')} | Budget: {investment_amount_ngn:,.0f} NGN (~${inv_usd:,.2f} USD @ {ngn_rate:.2f}){personalization}
 
-ASSETS TO ANALYZE (30 total):
-FOREX: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, NZDUSD, USDCHF, EURGBP, EURJPY, GBPJPY, AUDJPY, EURCAD, AUDCAD, EURAUD, GBPAUD
-CRYPTO: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, SOLUSDT, ADAUSDT, DOGEUSDT, DOTUSDT, MATICUSDT, LTCUSDT, SHIBUSDT, TRXUSDT, AVAXUSDT, LINKUSDT, UNIUSDT
+━━━ REAL LIVE MARKET DATA (use these EXACT indicator values) ━━━
+{live_data_section}
 
-Return ONLY a valid JSON array. Skip assets that fail quality filters. Only include confidence >= 73:
+━━━ ADDITIONAL SYMBOLS (use pattern reasoning) ━━━
+{remaining_text}
+
+━━━ YOUR ANALYSIS RULES ━━━
+For symbols WITH live data above:
+- Use the EXACT RSI, MACD, EMA, Bollinger, ATR, Support/Resistance values provided
+- You are INTERPRETING real data — do NOT make up different values
+- Use the provided ATR-based SL/TP levels as your base, adjust only slightly
+- REJECT the symbol if indicators show conflicting signals
+
+For symbols without live data:
+- Use institutional pattern reasoning
+- Be MORE conservative (lower confidence: 73-80 max)
+
+QUALITY GATES — skip any signal that fails:
+✗ RSI outside 28-72 range → skip
+✗ MACD and RSI disagree on direction → skip
+✗ Price between EMA20 and EMA50 with no clear bias → skip
+✗ Volume below average with no squeeze → skip
+✗ R:R below 1:2 → skip
+
+POSITION SIZING: 2% risk per trade
+- Risk per trade: {investment_amount_ngn * 0.02:,.0f} NGN = ${investment_amount_ngn * 0.02 / ngn_rate:.2f} USD
+
+Return ONLY a valid JSON array. Include only signals with confidence >= 73. Exclude HOLD signals.
 [
   {{
     "symbol": "SYMBOL",
     "signal": "STRONG_BUY|BUY|SELL|STRONG_SELL",
-    "confidence": 73-98,
+    "confidence": 73-97,
+    "data_source": "live_data|ai_reasoning",
     "category": "forex|crypto",
     "timeframe": "scalp(5-15m)|intraday(1-4h)|swing(daily)",
     "session_fit": "excellent|good|fair",
-    "entry_price": "specific price",
-    "stop_loss": "ATR-based SL",
+    "live_price": "actual price from data",
+    "entry_price": "specific entry level",
+    "stop_loss": "ATR-based stop",
     "take_profit_1": "1:1 target",
     "take_profit_2": "1:2 target",
     "take_profit_3": "1:3 target",
     "risk_reward": "1:X.X",
-    "hold_time": "e.g. 2-4 hours or 1-2 days",
-    "position_size_ngn": "{investment_amount_ngn * 0.02:,.0f} NGN (2% risk)",
-    "position_size_usd": "{investment_amount_ngn * 0.02 / ngn_rate:.2f} USD",
-    "back_out_trigger": "exact price or condition that invalidates setup",
+    "hold_time": "duration",
+    "position_size_ngn": "{investment_amount_ngn * 0.02:,.0f} NGN",
+    "position_size_usd": "${investment_amount_ngn * 0.02 / ngn_rate:.2f}",
+    "back_out_trigger": "exact price/condition that invalidates this trade",
     "indicators": {{
-      "rsi": "value + reading",
-      "macd": "crossover signal",
-      "ema_bias": "above/below EMAs",
-      "volume": "above/below average",
-      "pattern": "detected chart pattern"
+      "rsi": "value from live data + interpretation",
+      "macd": "reading from live data",
+      "ema_bias": "price vs EMA stack",
+      "bollinger": "band position",
+      "volume": "reading",
+      "pattern": "chart pattern detected"
     }},
     "key_levels": {{
-      "support": "price",
-      "resistance": "price"
+      "support": "level",
+      "resistance": "level"
     }},
-    "rationale": "3 specific sentences referencing exact levels and indicator readings"
+    "rationale": "3 sentences referencing the EXACT indicator values from live data"
   }}
 ]
-CRITICAL RULES: Pure JSON only. No text outside the array. HOLD signals are excluded."""
+Output ONLY the JSON array. No text outside the array."""
 
     try:
         content = get_ai_response(prompt)
@@ -259,11 +308,18 @@ CRITICAL RULES: Pure JSON only. No text outside the array. HOLD signals are excl
         data = json.loads(content)
         data = [s for s in data if isinstance(s, dict) and int(s.get("confidence", 0)) >= 73]
         strong = [s for s in data if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]]
+        live_count = len([s for s in data if s.get("data_source") == "live_data"])
 
         result = {
             "success": True,
             "generated_at": utc.isoformat(),
             "active_session": session,
+            "data_quality": {
+                "source": data_source_note,
+                "live_data_symbols": real_data_symbols,
+                "signals_from_live_data": live_count,
+                "signals_from_ai_reasoning": len(data) - live_count
+            },
             "investment_context_ngn": investment_amount_ngn,
             "usd_ngn_rate": ngn_rate,
             "model": "llama-3.3-70b-versatile",
@@ -271,7 +327,7 @@ CRITICAL RULES: Pure JSON only. No text outside the array. HOLD signals are excl
             "total_signals": len(data),
             "strong_signals_count": len(strong),
             "top_picks": strong[:5],
-            "disclaimer": "Signals are AI-generated from pattern confluence. Trading involves risk."
+            "disclaimer": "Signals are data-driven using live Alpha Vantage feeds. Trading involves substantial risk."
         }
         PREDICTIONS_CACHE[cache_key] = {"data": result, "ts": now}
         return result
@@ -282,73 +338,74 @@ CRITICAL RULES: Pure JSON only. No text outside the array. HOLD signals are excl
 # Personalized Signal for 1 Symbol (FIXED)
 # ----------------------------
 def get_personalized_signal(symbol: str, user: User, db: Session) -> Dict:
-    """Generate a focused AI signal for a single symbol, personalized to the user."""
+    """Generate a focused AI signal for a single symbol using REAL live data + user personalization."""
     symbol = symbol.upper()
-    live_price = get_live_price(symbol)
     ngn_rate = get_ngn_rate()
     inv_usd = user.balance_ngn / ngn_rate if user.balance_ngn > 0 else 0
     profile = get_user_profile_summary(user, db)
-
-    # First check if already in the predictions cache
-    preds = generate_market_predictions(user.balance_ngn)
-    if preds.get("success"):
-        match = next((s for s in preds.get("signals", []) if s.get("symbol") == symbol), None)
-        if match:
-            match["personalized"] = True
-            match["live_price"] = live_price
-            match["user_context"] = f"Personalized for {user.username} ({user.trading_style} trader)"
-            return match
-
-    # If not in cache, generate a targeted signal just for this symbol
     utc = datetime.utcnow()
+
+    # Fetch real live data first
+    analysis = get_symbol_analysis(symbol)
+    live_data_block = format_for_ai_prompt(analysis)
+    live_price = analysis.get("live_price", 0)
+    has_live = bool(live_price)
+
     prompt = f"""You are ARIA, an elite institutional trading analyst.
 
-SYMBOL REQUESTED: {symbol}
-LIVE PRICE: {live_price if live_price else "unavailable"}
-USER PROFILE: {profile}
-USER BALANCE: {user.balance_ngn:,.0f} NGN (~${inv_usd:,.2f} USD)
-USER STYLE: {user.trading_style} | RISK TOLERANCE: {user.risk_tolerance}
-TIME: {utc.strftime('%Y-%m-%d %H:%M')} UTC
+━━━ REAL LIVE MARKET DATA FOR {symbol} ━━━
+{live_data_block}
 
-Perform a DEEP analysis of {symbol} ONLY. Apply full institutional protocol:
-- Multi-timeframe trend (15m, 1H, 4H alignment)
-- RSI, MACD, EMA stack, Bollinger Bands
-- Key support/resistance levels
-- Chart pattern detection
-- Session timing check
-- ATR-based stop loss (1.5× ATR)
-- Minimum 1:2 R/R required
-- Position size: 2% of {user.balance_ngn:,.0f} NGN = {user.balance_ngn * 0.02:,.0f} NGN
+━━━ USER CONTEXT ━━━
+{profile}
+Balance: {user.balance_ngn:,.0f} NGN (~${inv_usd:,.2f} USD)
+Trading Style: {user.trading_style} | Risk Tolerance: {user.risk_tolerance}
+Time: {utc.strftime('%Y-%m-%d %H:%M')} UTC
+Position size (2% risk): {user.balance_ngn * 0.02:,.0f} NGN = ${user.balance_ngn * 0.02 / ngn_rate:.2f} USD
 
-Return ONLY valid JSON (single object, not array):
+━━━ ANALYSIS INSTRUCTIONS ━━━
+{"Use the EXACT indicator values from the live data block above. Do NOT invent different values." if has_live else "No live data available — use institutional pattern reasoning."}
+
+Provide a personalized deep analysis for {symbol} considering:
+- The user's {user.trading_style} style (adjust hold time and entry precision accordingly)
+- Their {user.risk_tolerance} risk tolerance (adjust position size and SL distance)
+- Their trade history and win rate in their profile above
+- {"The EXACT RSI, MACD, EMA, ATR, support/resistance from live data" if has_live else "Conservative estimates since no live data"}
+
+Return ONLY a valid JSON object:
 {{
   "symbol": "{symbol}",
   "signal": "STRONG_BUY|BUY|HOLD|SELL|STRONG_SELL",
   "confidence": 0-99,
+  "data_source": "{"live_data" if has_live else "ai_reasoning"}",
   "category": "forex|crypto",
   "timeframe": "scalp|intraday|swing",
   "session_fit": "excellent|good|fair|poor",
-  "live_price": "{live_price}",
-  "entry_price": "specific price",
-  "stop_loss": "ATR-based",
+  "live_price": "{live_price if live_price else 'unavailable'}",
+  "entry_price": "specific price (use live data levels)",
+  "stop_loss": "ATR-based SL (use ATR from live data if available)",
   "take_profit_1": "1:1 target",
   "take_profit_2": "1:2 target",
   "take_profit_3": "1:3 target",
   "risk_reward": "1:X",
-  "hold_time": "duration",
-  "position_size_ngn": "2% of budget in NGN",
-  "position_size_usd": "equivalent USD",
-  "back_out_trigger": "exact invalidation condition",
+  "hold_time": "duration matching user's {user.trading_style} style",
+  "position_size_ngn": "{user.balance_ngn * 0.02:,.0f} NGN (2% of balance)",
+  "position_size_usd": "${user.balance_ngn * 0.02 / ngn_rate:.2f} USD",
+  "back_out_trigger": "exact price or condition invalidating this setup",
   "indicators": {{
-    "rsi": "value + interpretation",
-    "macd": "signal",
-    "ema_bias": "trend",
-    "volume": "reading",
-    "pattern": "chart pattern or none"
+    "rsi": "EXACT value from live data + interpretation",
+    "macd": "EXACT reading from live data",
+    "ema_bias": "EXACT EMA position from live data",
+    "bollinger": "EXACT band position from live data",
+    "volume": "EXACT volume reading",
+    "pattern": "chart pattern detected"
   }},
-  "key_levels": {{"support": "level", "resistance": "level"}},
-  "personalized_note": "Note tailored to this user's style and history",
-  "rationale": "3 sentences referencing exact levels"
+  "key_levels": {{
+    "support": "EXACT level from live data",
+    "resistance": "EXACT level from live data"
+  }},
+  "personalized_note": "Specific note for this user's trading style, history, and risk profile",
+  "rationale": "3 sentences using EXACT indicator values from live data"
 }}"""
 
     try:
@@ -361,6 +418,7 @@ Return ONLY valid JSON (single object, not array):
             content = m.group(0)
         data = json.loads(content)
         data["personalized"] = True
+        data["raw_live_analysis"] = analysis
         return data
     except Exception as e:
         return {"symbol": symbol, "signal": "HOLD", "confidence": 0, "error": str(e), "live_price": live_price}
@@ -1044,6 +1102,30 @@ def monitor_account(username: str, db: Session = Depends(get_db)):
 # ----------------------------
 # Simulator
 # ----------------------------
+@app.get("/live_data/{symbol}")
+def get_live_technical_data(symbol: str, username: Optional[str] = None, db: Session = Depends(get_db)):
+    """Returns real live OHLCV-based technical indicators for any symbol."""
+    symbol = symbol.upper()
+    if username:
+        user = get_or_create_user(username, db)
+        log_activity(user, "viewed_live_data", symbol=symbol, db=db)
+    analysis = get_symbol_analysis(symbol)
+    return {
+        "symbol": symbol,
+        "success": bool(analysis.get("live_price")),
+        "data_source": analysis.get("data_source", "unavailable"),
+        "live_price": analysis.get("live_price"),
+        "last_candle_time": analysis.get("last_candle_time"),
+        "candles_used": analysis.get("candles_used"),
+        "indicators": analysis.get("indicators", {}),
+        "key_levels": analysis.get("key_levels", {}),
+        "trend_bias": analysis.get("trend_bias"),
+        "fetched_at": datetime.utcnow().isoformat(),
+        "cache_ttl_minutes": 15,
+        "note": "Data from Alpha Vantage 5-min OHLCV candles. Cached 15 min to respect rate limits."
+    }
+
+
 @app.get("/simulator/candles/{symbol}")
 def get_simulator_candles(symbol: str, candles: int = 120, interval: int = 15, seed: int = None):
     symbol = symbol.upper()
