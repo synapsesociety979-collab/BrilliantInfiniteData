@@ -21,41 +21,43 @@ class User(Base):
 
     id              = Column(Integer, primary_key=True, index=True)
     username        = Column(String, unique=True, index=True, nullable=False)
-    display_name    = Column(String, nullable=True)          # real / preferred name ARIA uses
+    display_name    = Column(String, nullable=True)
     balance_ngn     = Column(Float, default=0.0)
-    risk_tolerance  = Column(String, default="medium")       # low / medium / high
-    trading_style   = Column(String, default="intraday")     # scalp / intraday / swing
+    risk_tolerance  = Column(String, default="medium")
+    trading_style   = Column(String, default="intraday")
     preferred_pairs = Column(JSON,   default=list)
     created_at      = Column(DateTime, default=datetime.utcnow)
     last_active     = Column(DateTime, default=datetime.utcnow)
 
-    demo_account  = relationship("DemoAccount",       back_populates="user", uselist=False, cascade="all, delete-orphan")
-    conversations = relationship("Conversation",       back_populates="user", cascade="all, delete-orphan")
-    memories      = relationship("UserMemory",         back_populates="user", cascade="all, delete-orphan")
-    trade_journal = relationship("TradeJournalEntry",  back_populates="user", cascade="all, delete-orphan")
-    watchlist     = relationship("WatchlistItem",      back_populates="user", cascade="all, delete-orphan")
-    activity_log  = relationship("UserActivity",       back_populates="user", cascade="all, delete-orphan")
+    demo_account  = relationship("DemoAccount",      back_populates="user", uselist=False, cascade="all, delete-orphan")
+    conversations = relationship("Conversation",      back_populates="user", cascade="all, delete-orphan")
+    memories      = relationship("UserMemory",        back_populates="user", cascade="all, delete-orphan")
+    trade_journal = relationship("TradeJournalEntry", back_populates="user", cascade="all, delete-orphan")
+    watchlist     = relationship("WatchlistItem",     back_populates="user", cascade="all, delete-orphan")
+    activity_log  = relationship("UserActivity",      back_populates="user", cascade="all, delete-orphan")
+    bot_config    = relationship("BotConfig",         back_populates="user", uselist=False, cascade="all, delete-orphan")
+    bot_orders    = relationship("BotOrder",          back_populates="user", cascade="all, delete-orphan")
 
 
 # ─────────────────────────────────────────────
-#  Conversation  (one thread = one sidebar item)
+#  Conversation
 # ─────────────────────────────────────────────
 class Conversation(Base):
     __tablename__ = "conversations"
 
     id         = Column(Integer, primary_key=True, index=True)
     user_id    = Column(Integer, ForeignKey("users.id"), nullable=False)
-    title      = Column(String, default="New Chat")          # auto-generated from first message
+    title      = Column(String, default="New Chat")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    user     = relationship("User",        back_populates="conversations")
+    user     = relationship("User", back_populates="conversations")
     messages = relationship("ChatMessage", back_populates="conversation",
                             cascade="all, delete-orphan", order_by="ChatMessage.created_at")
 
 
 # ─────────────────────────────────────────────
-#  ChatMessage  (belongs to a Conversation)
+#  ChatMessage
 # ─────────────────────────────────────────────
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
@@ -63,7 +65,7 @@ class ChatMessage(Base):
     id              = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=True)
     user_id         = Column(Integer, ForeignKey("users.id"), nullable=False)
-    role            = Column(String,  nullable=False)        # user | aria
+    role            = Column(String,  nullable=False)
     content         = Column(Text,    nullable=False)
     created_at      = Column(DateTime, default=datetime.utcnow)
 
@@ -71,16 +73,16 @@ class ChatMessage(Base):
 
 
 # ─────────────────────────────────────────────
-#  UserMemory  (facts ARIA remembers about user)
+#  UserMemory
 # ─────────────────────────────────────────────
 class UserMemory(Base):
     __tablename__ = "user_memories"
 
     id         = Column(Integer, primary_key=True, index=True)
     user_id    = Column(Integer, ForeignKey("users.id"), nullable=False)
-    key        = Column(String, nullable=False)              # e.g. "name", "occupation", "goal"
-    value      = Column(Text,   nullable=False)              # e.g. "Simeon", "software engineer"
-    source     = Column(String, default="user_stated")       # user_stated | inferred
+    key        = Column(String, nullable=False)
+    value      = Column(Text,   nullable=False)
+    source     = Column(String, default="user_stated")
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", back_populates="memories")
@@ -134,7 +136,7 @@ class TradeJournalEntry(Base):
     entry_price = Column(Float,   nullable=False)
     exit_price  = Column(Float,   nullable=False)
     volume      = Column(Float,   nullable=False)
-    result      = Column(String,  nullable=False)   # WIN | LOSS | BREAK_EVEN
+    result      = Column(String,  nullable=False)
     pnl_usd     = Column(Float,   nullable=False)
     notes       = Column(Text,    default="")
     logged_at   = Column(DateTime, default=datetime.utcnow)
@@ -170,6 +172,120 @@ class UserActivity(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="activity_log")
+
+
+# ─────────────────────────────────────────────
+#  Bot Config  (per-user trading bot settings)
+# ─────────────────────────────────────────────
+class BotConfig(Base):
+    __tablename__ = "bot_configs"
+
+    id                       = Column(Integer, primary_key=True, index=True)
+    user_id                  = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True)
+    is_active                = Column(Boolean, default=False)
+
+    # Risk Engine settings
+    risk_percent             = Column(Float,   default=1.0)      # % of balance risked per trade
+    max_concurrent_trades    = Column(Integer, default=3)        # max open positions at once
+    max_daily_loss_pct       = Column(Float,   default=5.0)      # halt trading if daily loss > X%
+    max_weekly_loss_pct      = Column(Float,   default=10.0)
+    max_lot_size             = Column(Float,   default=1.0)      # hard cap on single trade size
+    min_lot_size             = Column(Float,   default=0.01)
+    min_confidence           = Column(Float,   default=75.0)     # only trade signals above this
+
+    # Market Filter settings
+    max_spread_pips          = Column(Float,   default=3.0)
+    avoid_news_minutes       = Column(Integer, default=30)       # minutes before/after high-impact news
+    min_atr_percentile       = Column(Float,   default=30.0)     # skip if ATR below 30th percentile
+    allowed_sessions         = Column(JSON,    default=lambda: ["london", "newyork", "overlap"])
+    allowed_pairs            = Column(JSON,    default=list)     # empty = all 30 pairs
+
+    # Trade Manager settings
+    use_break_even           = Column(Boolean, default=True)
+    break_even_trigger_rr    = Column(Float,   default=1.0)      # move SL to BE when price = entry + 1R
+    use_trailing_stop        = Column(Boolean, default=True)
+    trail_trigger_rr         = Column(Float,   default=1.5)      # start trailing after 1.5R
+    trail_step_atr           = Column(Float,   default=0.5)      # trail by 0.5 ATR steps
+    use_partial_close        = Column(Boolean, default=True)
+    partial_close_pct        = Column(Float,   default=50.0)     # close 50% at TP1
+    max_hold_hours           = Column(Integer, default=48)       # force close if open > 48h
+
+    # MT5 bridge authentication
+    bridge_api_key           = Column(String,  nullable=True)    # secret key bridge must send
+    mt5_account_number       = Column(String,  nullable=True)
+    mt5_server               = Column(String,  nullable=True)
+    mt5_broker               = Column(String,  nullable=True)
+
+    created_at               = Column(DateTime, default=datetime.utcnow)
+    updated_at               = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="bot_config")
+
+
+# ─────────────────────────────────────────────
+#  Bot Order  (order queue: pending → sent → executed → closed)
+# ─────────────────────────────────────────────
+class BotOrder(Base):
+    __tablename__ = "bot_orders"
+
+    id                   = Column(Integer, primary_key=True, index=True)
+    user_id              = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # Signal details
+    symbol               = Column(String, nullable=False)
+    direction            = Column(String, nullable=False)   # BUY | SELL
+    signal_confidence    = Column(Float,  nullable=True)
+    signal_source        = Column(String, default="aria")
+    timeframe            = Column(String, nullable=True)
+
+    # Pricing (set by risk engine at time of order creation)
+    requested_entry      = Column(Float, nullable=True)
+    stop_loss            = Column(Float, nullable=False)
+    take_profit_1        = Column(Float, nullable=False)
+    take_profit_2        = Column(Float, nullable=True)
+    take_profit_3        = Column(Float, nullable=True)
+    lot_size             = Column(Float, nullable=False)
+
+    # Risk details (logged for audit)
+    risk_percent         = Column(Float, nullable=True)
+    risk_usd             = Column(Float, nullable=True)
+    sl_pips              = Column(Float, nullable=True)
+    rr_ratio             = Column(String, nullable=True)
+
+    # MT5 execution results (filled by bridge)
+    mt5_ticket           = Column(Integer, nullable=True, index=True)
+    filled_price         = Column(Float,   nullable=True)
+    filled_at            = Column(DateTime, nullable=True)
+
+    # Trade management state (updated by bridge during life of trade)
+    current_sl           = Column(Float, nullable=True)    # latest SL (may have trailed)
+    current_price        = Column(Float, nullable=True)    # latest price from bridge
+    floating_pnl_usd     = Column(Float, nullable=True)
+    sl_at_breakeven      = Column(Boolean, default=False)
+    tp1_closed           = Column(Boolean, default=False)  # partial close at TP1 done
+    trailing_active      = Column(Boolean, default=False)
+
+    # Close details
+    close_price          = Column(Float, nullable=True)
+    close_reason         = Column(String, nullable=True)   # TP1/TP2/SL/MANUAL/TIME_EXIT/EMERGENCY
+    realised_pnl_usd     = Column(Float, nullable=True)
+
+    # Status lifecycle
+    # PENDING → QUEUED → SENT → EXECUTED → ACTIVE → CLOSED | REJECTED | CANCELLED
+    status               = Column(String, default="PENDING", index=True)
+    reject_reason        = Column(String, nullable=True)
+
+    # Market filter audit trail
+    filter_passed        = Column(Boolean, default=True)
+    filter_block_reasons = Column(JSON, nullable=True)
+
+    # Timestamps
+    created_at           = Column(DateTime, default=datetime.utcnow)
+    sent_at              = Column(DateTime, nullable=True)
+    executed_at          = Column(DateTime, nullable=True)
+    closed_at            = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="bot_orders")
 
 
 # ─────────────────────────────────────────────

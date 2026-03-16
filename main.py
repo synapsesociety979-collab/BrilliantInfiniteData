@@ -12,8 +12,10 @@ from backtest_api import load_history_df, run_backtest_from_signals, signals_fro
 from models import (
     init_db, get_db, User, DemoAccount, DemoTrade,
     ChatMessage as DBChatMessage, TradeJournalEntry as DBJournalEntry,
-    WatchlistItem, UserActivity, Conversation, UserMemory
+    WatchlistItem, UserActivity, Conversation, UserMemory,
+    BotConfig, BotOrder
 )
+from trading_engine import RiskEngine, MarketFilter, TradeManager
 from market_data import (
     get_symbol_analysis, format_for_ai_prompt,
     fetch_realtime_quote
@@ -1530,3 +1532,843 @@ def run_simulator(symbol: str, candles: int = 150, interval: int = 15, balance: 
 def connect_account(req: UserAccountRequest, db: Session = Depends(get_db)):
     user = get_or_create_user(req.username, db)
     return {"status": "success", "message": f"Account connected for {req.username}", "user_id": user.id}
+
+
+# ════════════════════════════════════════════════════════════════
+#  ARIA AUTO-TRADER  —  Bot Config · Risk Engine · Market Filter
+#                        Trade Manager · MT5 Bridge endpoints
+# ════════════════════════════════════════════════════════════════
+
+import secrets as _secrets
+
+# ── Pydantic models ──────────────────────────────────────────────
+class BotConfigRequest(BaseModel):
+    risk_percent:             Optional[float] = 1.0
+    max_concurrent_trades:    Optional[int]   = 3
+    max_daily_loss_pct:       Optional[float] = 5.0
+    max_weekly_loss_pct:      Optional[float] = 10.0
+    max_lot_size:             Optional[float] = 1.0
+    min_lot_size:             Optional[float] = 0.01
+    min_confidence:           Optional[float] = 75.0
+    max_spread_pips:          Optional[float] = 3.0
+    avoid_news_minutes:       Optional[int]   = 30
+    min_atr_percentile:       Optional[float] = 30.0
+    allowed_sessions:         Optional[List[str]] = None
+    allowed_pairs:            Optional[List[str]] = None
+    use_break_even:           Optional[bool]  = True
+    break_even_trigger_rr:    Optional[float] = 1.0
+    use_trailing_stop:        Optional[bool]  = True
+    trail_trigger_rr:         Optional[float] = 1.5
+    trail_step_atr:           Optional[float] = 0.5
+    use_partial_close:        Optional[bool]  = True
+    partial_close_pct:        Optional[float] = 50.0
+    max_hold_hours:           Optional[int]   = 48
+    mt5_account_number:       Optional[str]   = None
+    mt5_server:               Optional[str]   = None
+    mt5_broker:               Optional[str]   = None
+
+
+class ManualSignalRequest(BaseModel):
+    symbol:             str
+    direction:          str   # BUY | SELL
+    entry_price:        Optional[float] = None
+    stop_loss:          float
+    take_profit_1:      float
+    take_profit_2:      Optional[float] = None
+    take_profit_3:      Optional[float] = None
+    account_balance_usd: float
+    signal_confidence:  Optional[float] = 80.0
+    timeframe:          Optional[str]   = "H1"
+
+
+class BridgeExecutedRequest(BaseModel):
+    order_id:     int
+    mt5_ticket:   int
+    filled_price: float
+    spread_pips:  Optional[float] = None
+    executed_at:  Optional[str]   = None
+
+
+class BridgeRejectedRequest(BaseModel):
+    order_id:    int
+    reason:      str
+    rejected_at: Optional[str] = None
+
+
+class PositionUpdateItem(BaseModel):
+    mt5_ticket:    int
+    symbol:        str
+    current_price: float
+    floating_pnl:  float
+    volume:        float
+    current_sl:    Optional[float] = None
+    current_tp:    Optional[float] = None
+
+
+class PositionUpdateRequest(BaseModel):
+    positions: List[PositionUpdateItem]
+    account:   Optional[Dict[str, Any]] = None
+
+
+class PartialClosedRequest(BaseModel):
+    order_id:    int
+    mt5_ticket:  int
+    close_price: Optional[float] = None
+    success:     bool
+
+
+class ClosedRequest(BaseModel):
+    order_id:    int
+    mt5_ticket:  int
+    close_price: Optional[float] = None
+    close_reason: Optional[str]  = None
+    closed_at:   Optional[str]   = None
+
+
+class BridgeConnectRequest(BaseModel):
+    account_info:    Optional[Dict[str, Any]] = None
+    bridge_version:  Optional[str] = "1.0"
+
+
+# ── Helper: verify bridge key ─────────────────────────────────────
+def _verify_bridge_key(username: str, provided_key: str, db: Session) -> BotConfig:
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    if not cfg:
+        raise HTTPException(status_code=404, detail="Bot not configured for this user")
+    if cfg.bridge_api_key and cfg.bridge_api_key != provided_key:
+        raise HTTPException(status_code=403, detail="Invalid bridge API key")
+    return cfg
+
+
+# ════════════════════════════════════════════════════════════════
+#  1. BOT CONFIGURATION
+# ════════════════════════════════════════════════════════════════
+
+@app.post("/bot/configure/{username}")
+def configure_bot(username: str, req: BotConfigRequest, db: Session = Depends(get_db)):
+    """
+    Create or update the trading bot configuration for a user.
+    Also generates a unique bridge API key if one doesn't exist yet.
+    """
+    user = get_or_create_user(username, db)
+    cfg  = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+
+    if not cfg:
+        cfg = BotConfig(user_id=user.id, bridge_api_key=_secrets.token_urlsafe(32))
+        db.add(cfg)
+
+    fields = req.dict(exclude_none=True)
+    for k, v in fields.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+
+    if cfg.allowed_sessions is None:
+        cfg.allowed_sessions = ["london", "overlap", "newyork"]
+
+    cfg.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(cfg)
+
+    return {
+        "success":        True,
+        "message":        "Bot configured successfully",
+        "bridge_api_key": cfg.bridge_api_key,
+        "note":           "Keep your bridge_api_key secret — paste it in the .env of your mt5_bridge.py",
+        "config": {
+            "is_active":             cfg.is_active,
+            "risk_percent":          cfg.risk_percent,
+            "max_concurrent_trades": cfg.max_concurrent_trades,
+            "max_daily_loss_pct":    cfg.max_daily_loss_pct,
+            "max_weekly_loss_pct":   cfg.max_weekly_loss_pct,
+            "min_confidence":        cfg.min_confidence,
+            "max_spread_pips":       cfg.max_spread_pips,
+            "allowed_sessions":      cfg.allowed_sessions,
+            "allowed_pairs":         cfg.allowed_pairs or "All 30 pairs",
+            "use_trailing_stop":     cfg.use_trailing_stop,
+            "use_break_even":        cfg.use_break_even,
+            "use_partial_close":     cfg.use_partial_close,
+            "mt5_account_number":    cfg.mt5_account_number,
+            "mt5_server":            cfg.mt5_server,
+        }
+    }
+
+
+@app.post("/bot/start/{username}")
+def start_bot(username: str, db: Session = Depends(get_db)):
+    """Activate the bot — it will start processing signals."""
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    if not cfg:
+        raise HTTPException(status_code=400, detail="Configure the bot first via POST /bot/configure/{username}")
+    cfg.is_active  = True
+    cfg.updated_at = datetime.utcnow()
+    db.commit()
+    return {"success": True, "message": "ARIA bot is now ACTIVE — monitoring markets 24/7"}
+
+
+@app.post("/bot/stop/{username}")
+def stop_bot(username: str, db: Session = Depends(get_db)):
+    """Pause the bot — no new orders will be queued. Open trades are unaffected."""
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    if not cfg:
+        raise HTTPException(status_code=404, detail="Bot not configured")
+    cfg.is_active  = False
+    cfg.updated_at = datetime.utcnow()
+    db.commit()
+    return {"success": True, "message": "ARIA bot PAUSED — no new orders will be placed"}
+
+
+@app.get("/bot/status/{username}")
+def bot_status(username: str, db: Session = Depends(get_db)):
+    """Full bot status: config, active orders, today's P&L."""
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    if not cfg:
+        return {"configured": False, "message": "Bot not configured. Call POST /bot/configure/{username} first."}
+
+    active_orders = db.query(BotOrder).filter(
+        BotOrder.user_id == user.id,
+        BotOrder.status.in_(["QUEUED", "SENT", "EXECUTED", "ACTIVE"])
+    ).all()
+
+    today = datetime.utcnow().date()
+    closed_today = db.query(BotOrder).filter(
+        BotOrder.user_id    == user.id,
+        BotOrder.status     == "CLOSED",
+        BotOrder.closed_at  >= datetime.combine(today, datetime.min.time()),
+    ).all()
+
+    daily_pnl  = sum(o.realised_pnl_usd or 0 for o in closed_today)
+    total_closed = db.query(BotOrder).filter(BotOrder.user_id == user.id, BotOrder.status == "CLOSED").count()
+    total_wins   = db.query(BotOrder).filter(BotOrder.user_id == user.id, BotOrder.status == "CLOSED",
+                                              BotOrder.realised_pnl_usd > 0).count()
+    win_rate = round(total_wins / total_closed * 100, 1) if total_closed > 0 else 0.0
+
+    return {
+        "configured":  True,
+        "is_active":   cfg.is_active,
+        "status_label": "🟢 ACTIVE" if cfg.is_active else "⏸ PAUSED",
+        "config": {
+            "risk_percent":          cfg.risk_percent,
+            "max_concurrent_trades": cfg.max_concurrent_trades,
+            "max_daily_loss_pct":    cfg.max_daily_loss_pct,
+            "min_confidence":        cfg.min_confidence,
+            "max_spread_pips":       cfg.max_spread_pips,
+            "allowed_sessions":      cfg.allowed_sessions,
+            "use_trailing_stop":     cfg.use_trailing_stop,
+            "use_break_even":        cfg.use_break_even,
+        },
+        "active_orders": [
+            {
+                "order_id":  o.id,
+                "symbol":    o.symbol,
+                "direction": o.direction,
+                "lot_size":  o.lot_size,
+                "entry":     o.filled_price or o.requested_entry,
+                "sl":        o.current_sl or o.stop_loss,
+                "tp1":       o.take_profit_1,
+                "status":    o.status,
+                "floating_pnl": o.floating_pnl_usd,
+                "ticket":    o.mt5_ticket,
+            } for o in active_orders
+        ],
+        "todays_performance": {
+            "trades_closed":  len(closed_today),
+            "realised_pnl":   round(daily_pnl, 2),
+            "pnl_sign":       "+" if daily_pnl >= 0 else "",
+        },
+        "all_time_performance": {
+            "total_closed": total_closed,
+            "wins":         total_wins,
+            "losses":       total_closed - total_wins,
+            "win_rate_pct": win_rate,
+        }
+    }
+
+
+# ════════════════════════════════════════════════════════════════
+#  2. PLACE A TRADE  (passes through Risk Engine + Market Filter)
+# ════════════════════════════════════════════════════════════════
+
+@app.post("/bot/trade/{username}")
+def place_bot_trade(username: str, req: ManualSignalRequest, db: Session = Depends(get_db)):
+    """
+    Queue a trade after passing it through:
+      1. Market Filter  — spread, session, news, volatility, confidence
+      2. Risk Engine    — lot size, daily loss limit, concurrent position cap
+    If everything passes, an order is written to DB with status=QUEUED.
+    The MT5 bridge will pick it up within seconds.
+    """
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    if not cfg:
+        raise HTTPException(status_code=400, detail="Configure bot first")
+    if not cfg.is_active:
+        raise HTTPException(status_code=400, detail="Bot is paused. Call /bot/start/{username} first.")
+
+    symbol     = req.symbol.upper()
+    direction  = req.direction.upper()
+    confidence = req.signal_confidence or 80.0
+
+    # ── Get live market data for filter checks ──────────────────
+    analysis = get_symbol_analysis(symbol)
+    indicators = analysis.get("indicators", {})
+    atr        = indicators.get("atr")
+    atr_avg    = indicators.get("atr_avg") or (atr * 1.2 if atr else None)
+
+    # ── 1. Market Filter ────────────────────────────────────────
+    filter_result = MarketFilter.run_all_checks(
+        symbol             = symbol,
+        signal_confidence  = confidence,
+        config             = cfg,
+        current_spread_pips= None,   # bridge will re-check live spread at execution
+        atr                = atr,
+        atr_avg            = atr_avg,
+    )
+
+    if not filter_result["approved"]:
+        return {
+            "success":  False,
+            "approved": False,
+            "blocks":   filter_result["blocks"],
+            "warnings": filter_result.get("warnings", []),
+            "message":  "Trade BLOCKED by Market Filter — no order queued",
+        }
+
+    # ── 2. Risk Engine — daily loss check ───────────────────────
+    loss_check = RiskEngine.check_daily_loss(user.id, cfg, db)
+    if not loss_check["allowed"]:
+        return {
+            "success": False,
+            "approved": False,
+            "blocks": [loss_check["reason"]],
+            "message": "Trade BLOCKED by Risk Engine — daily/weekly loss limit reached",
+        }
+
+    # ── 3. Risk Engine — concurrent positions check ─────────────
+    conc_check = RiskEngine.check_concurrent_positions(user.id, symbol, cfg, db)
+    if not conc_check["allowed"]:
+        return {
+            "success": False,
+            "approved": False,
+            "blocks": [conc_check["reason"]],
+            "message": "Trade BLOCKED — too many concurrent positions",
+        }
+
+    # ── 4. Risk Engine — calculate lot size ─────────────────────
+    entry = req.entry_price or analysis.get("live_price") or 0
+    if not entry:
+        raise HTTPException(status_code=400, detail="entry_price not provided and live price unavailable")
+
+    sizing = RiskEngine.calculate_lot_size(
+        account_balance_usd = req.account_balance_usd,
+        risk_percent        = cfg.risk_percent,
+        entry               = entry,
+        stop_loss           = req.stop_loss,
+        symbol              = symbol,
+        min_lot             = cfg.min_lot_size,
+        max_lot             = cfg.max_lot_size,
+    )
+    if "error" in sizing:
+        raise HTTPException(status_code=400, detail=sizing["error"])
+
+    # ── 5. Queue the order ───────────────────────────────────────
+    order = BotOrder(
+        user_id           = user.id,
+        symbol            = symbol,
+        direction         = direction,
+        signal_confidence = confidence,
+        signal_source     = "aria",
+        timeframe         = req.timeframe,
+        requested_entry   = entry,
+        stop_loss         = req.stop_loss,
+        take_profit_1     = req.take_profit_1,
+        take_profit_2     = req.take_profit_2,
+        take_profit_3     = req.take_profit_3,
+        lot_size          = sizing["lot_size"],
+        risk_percent      = sizing["risk_percent"],
+        risk_usd          = sizing["risk_usd"],
+        sl_pips           = sizing["sl_pips"],
+        current_sl        = req.stop_loss,
+        filter_passed     = True,
+        filter_block_reasons = filter_result.get("warnings"),
+        status            = "QUEUED",
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+
+    log_activity(user, "bot_order_queued", symbol=symbol, db=db)
+
+    return {
+        "success":   True,
+        "approved":  True,
+        "order_id":  order.id,
+        "status":    "QUEUED",
+        "message":   f"✅ Order queued — MT5 bridge will execute within seconds",
+        "trade_details": {
+            "symbol":     symbol,
+            "direction":  direction,
+            "lot_size":   sizing["lot_size"],
+            "entry":      entry,
+            "stop_loss":  req.stop_loss,
+            "take_profit_1": req.take_profit_1,
+            "take_profit_2": req.take_profit_2,
+        },
+        "risk_details": {
+            "risk_percent":  sizing["risk_percent"],
+            "risk_usd":      sizing["risk_usd"],
+            "sl_pips":       sizing["sl_pips"],
+        },
+        "filter_warnings": filter_result.get("warnings", []),
+    }
+
+
+@app.post("/bot/auto_signal/{username}")
+def auto_signal(username: str, symbol: str, account_balance_usd: float,
+                db: Session = Depends(get_db)):
+    """
+    ARIA generates a signal for the symbol, runs it through all filters,
+    and queues it automatically if it passes.  No manual entry/SL/TP needed —
+    ARIA calculates everything from live indicator data.
+    """
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    if not cfg or not cfg.is_active:
+        return {"success": False, "message": "Bot not configured or not active"}
+
+    sym      = symbol.upper()
+    analysis = get_symbol_analysis(sym)
+    if not analysis.get("live_price"):
+        return {"success": False, "message": f"No live data available for {sym}"}
+
+    indicators = analysis.get("indicators", {})
+    prompt = (
+        f"You are ARIA. Give an auto-trade signal for {sym}.\n"
+        f"Live data: {format_for_ai_prompt(sym, analysis)}\n\n"
+        f"Reply ONLY with this JSON (no text before/after):\n"
+        f'{{"direction":"BUY or SELL","confidence":0-100,"entry":{analysis["live_price"]},'
+        f'"stop_loss":float,"take_profit_1":float,"take_profit_2":float,"reasoning":"one sentence"}}'
+    )
+    try:
+        raw = get_ai_response(prompt)
+        # Extract JSON
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not match:
+            return {"success": False, "message": "AI did not return valid JSON"}
+        signal = json.loads(match.group())
+    except Exception as e:
+        return {"success": False, "message": f"AI signal failed: {e}"}
+
+    req = ManualSignalRequest(
+        symbol              = sym,
+        direction           = signal["direction"],
+        entry_price         = float(signal["entry"]),
+        stop_loss           = float(signal["stop_loss"]),
+        take_profit_1       = float(signal["take_profit_1"]),
+        take_profit_2       = signal.get("take_profit_2"),
+        account_balance_usd = account_balance_usd,
+        signal_confidence   = float(signal.get("confidence", 78)),
+        timeframe           = "H1",
+    )
+    result = place_bot_trade(username=username, req=req, db=db)
+    result["ai_reasoning"] = signal.get("reasoning", "")
+    return result
+
+
+# ════════════════════════════════════════════════════════════════
+#  3. MT5 BRIDGE ENDPOINTS  (called by mt5_bridge.py on Windows)
+# ════════════════════════════════════════════════════════════════
+
+@app.post("/bot/bridge_connect/{username}")
+def bridge_connect(username: str, req: BridgeConnectRequest,
+                   x_bridge_key: Optional[str] = None,
+                   db: Session = Depends(get_db)):
+    """MT5 bridge calls this on startup to register itself."""
+    from fastapi import Header
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "status":  "connected",
+        "message": f"Bridge registered for {username}",
+        "account": req.account_info,
+        "server_time": datetime.utcnow().isoformat(),
+    }
+
+
+@app.get("/bot/queue/{username}")
+def get_order_queue(username: str, bridge_key: str, db: Session = Depends(get_db)):
+    """
+    MT5 bridge polls this endpoint every 5 seconds.
+    Returns orders with status=QUEUED and marks them SENT.
+    """
+    cfg = _verify_bridge_key(username, bridge_key, db)
+    user = db.query(User).filter(User.username == username).first()
+
+    queued = db.query(BotOrder).filter(
+        BotOrder.user_id == user.id,
+        BotOrder.status  == "QUEUED",
+    ).all()
+
+    orders_out = []
+    for o in queued:
+        orders_out.append({
+            "order_id":     o.id,
+            "symbol":       o.symbol,
+            "direction":    o.direction,
+            "lot_size":     o.lot_size,
+            "entry_price":  o.requested_entry,
+            "stop_loss":    o.stop_loss,
+            "take_profit_1": o.take_profit_1,
+            "take_profit_2": o.take_profit_2,
+        })
+        o.status  = "SENT"
+        o.sent_at = datetime.utcnow()
+
+    db.commit()
+    return {"orders": orders_out, "count": len(orders_out)}
+
+
+@app.post("/bot/executed/{username}")
+def order_executed(username: str, bridge_key: str, req: BridgeExecutedRequest,
+                   db: Session = Depends(get_db)):
+    """Bridge reports a successful MT5 execution."""
+    cfg   = _verify_bridge_key(username, bridge_key, db)
+    order = db.query(BotOrder).filter(BotOrder.id == req.order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    order.mt5_ticket   = req.mt5_ticket
+    order.filled_price = req.filled_price
+    order.current_sl   = order.stop_loss
+    order.status       = "ACTIVE"
+    order.executed_at  = datetime.fromisoformat(req.executed_at) if req.executed_at else datetime.utcnow()
+
+    db.commit()
+    return {"success": True, "message": f"Order {req.order_id} marked ACTIVE"}
+
+
+@app.post("/bot/rejected/{username}")
+def order_rejected(username: str, bridge_key: str, req: BridgeRejectedRequest,
+                   db: Session = Depends(get_db)):
+    """Bridge reports a failed MT5 execution."""
+    cfg   = _verify_bridge_key(username, bridge_key, db)
+    order = db.query(BotOrder).filter(BotOrder.id == req.order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    order.status        = "REJECTED"
+    order.reject_reason = req.reason
+    db.commit()
+    return {"success": True, "message": f"Order {req.order_id} marked REJECTED: {req.reason}"}
+
+
+@app.post("/bot/position_update/{username}")
+def position_update(username: str, bridge_key: str, req: PositionUpdateRequest,
+                    db: Session = Depends(get_db)):
+    """
+    Bridge sends current position state every 10 seconds.
+    We run TradeManager on each position and return instructions.
+    """
+    cfg  = _verify_bridge_key(username, bridge_key, db)
+    instructions = []
+
+    for pos in req.positions:
+        order = db.query(BotOrder).filter(
+            BotOrder.mt5_ticket == pos.mt5_ticket
+        ).first()
+        if not order:
+            continue
+
+        # Update floating state
+        order.current_price   = pos.current_price
+        order.floating_pnl_usd = pos.floating_pnl
+        if pos.current_sl:
+            order.current_sl = pos.current_sl
+
+        # Run Trade Manager
+        decision = TradeManager.evaluate_position(order, pos.current_price, cfg)
+        action   = decision.get("action", "HOLD")
+
+        if action == "HOLD":
+            pass
+
+        elif action in ("MOVE_SL_BREAKEVEN", "TRAIL_SL"):
+            new_sl = decision.get("new_sl")
+            if new_sl:
+                order.current_sl = new_sl
+                if action == "MOVE_SL_BREAKEVEN":
+                    order.sl_at_breakeven = True
+                else:
+                    order.trailing_active = True
+                instructions.append({
+                    "order_id":   order.id,
+                    "mt5_ticket": pos.mt5_ticket,
+                    "symbol":     order.symbol,
+                    "action":     action,
+                    "new_sl":     new_sl,
+                    "details":    decision.get("details"),
+                })
+
+        elif action == "PARTIAL_CLOSE":
+            order.tp1_closed     = True
+            order.sl_at_breakeven = True
+            order.current_sl     = decision.get("new_sl") or order.current_sl
+            instructions.append({
+                "order_id":   order.id,
+                "mt5_ticket": pos.mt5_ticket,
+                "symbol":     order.symbol,
+                "action":     "PARTIAL_CLOSE",
+                "close_pct":  cfg.partial_close_pct,
+                "new_sl":     decision.get("new_sl"),
+                "details":    decision.get("details"),
+            })
+
+        elif action == "CLOSE":
+            instructions.append({
+                "order_id":    order.id,
+                "mt5_ticket":  pos.mt5_ticket,
+                "symbol":      order.symbol,
+                "action":      "CLOSE",
+                "close_reason": decision.get("close_reason"),
+                "details":     decision.get("details"),
+            })
+
+    db.commit()
+    return {"instructions": instructions, "processed": len(req.positions)}
+
+
+@app.post("/bot/partial_closed/{username}")
+def partial_closed(username: str, bridge_key: str, req: PartialClosedRequest,
+                   db: Session = Depends(get_db)):
+    """Bridge confirms a partial close was executed."""
+    cfg   = _verify_bridge_key(username, bridge_key, db)
+    order = db.query(BotOrder).filter(BotOrder.id == req.order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    order.tp1_closed = True
+    db.commit()
+    return {"success": True, "message": f"TP1 partial close confirmed for order {req.order_id}"}
+
+
+@app.post("/bot/closed/{username}")
+def position_closed(username: str, bridge_key: str, req: ClosedRequest,
+                    db: Session = Depends(get_db)):
+    """Bridge reports a position was fully closed."""
+    cfg   = _verify_bridge_key(username, bridge_key, db)
+    order = db.query(BotOrder).filter(BotOrder.id == req.order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    entry = order.filled_price or order.requested_entry or 0
+    close = req.close_price or 0
+
+    pnl = TradeManager.calculate_pnl(
+        direction = order.direction,
+        entry     = entry,
+        close     = close,
+        lot_size  = order.lot_size,
+        symbol    = order.symbol,
+    ) if (entry and close) else None
+
+    order.status           = "CLOSED"
+    order.close_price      = close
+    order.close_reason     = req.close_reason
+    order.realised_pnl_usd = pnl
+    order.closed_at        = datetime.fromisoformat(req.closed_at) if req.closed_at else datetime.utcnow()
+
+    # Also log to trade journal
+    user = db.query(User).filter(User.id == order.user_id).first()
+    if user and entry and close:
+        journal = DBJournalEntry(
+            user_id     = user.id,
+            symbol      = order.symbol,
+            direction   = order.direction,
+            entry_price = entry,
+            exit_price  = close,
+            volume      = order.lot_size,
+            result      = "WIN" if (pnl or 0) > 0 else ("LOSS" if (pnl or 0) < 0 else "BREAK_EVEN"),
+            pnl_usd     = pnl or 0,
+            notes       = f"Auto-trade | Reason: {req.close_reason} | Ticket: {req.mt5_ticket}",
+        )
+        db.add(journal)
+
+    db.commit()
+    return {
+        "success":  True,
+        "order_id": order.id,
+        "symbol":   order.symbol,
+        "pnl_usd":  pnl,
+        "result":   "WIN" if (pnl or 0) > 0 else "LOSS",
+        "message":  f"Order {req.order_id} closed — {'WIN' if (pnl or 0) > 0 else 'LOSS'} ${abs(pnl or 0):.2f}",
+    }
+
+
+# ════════════════════════════════════════════════════════════════
+#  4. PERFORMANCE & HISTORY
+# ════════════════════════════════════════════════════════════════
+
+@app.get("/bot/history/{username}")
+def bot_trade_history(username: str, limit: int = 50, db: Session = Depends(get_db)):
+    """Full closed trade history for the bot."""
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    orders = db.query(BotOrder).filter(
+        BotOrder.user_id == user.id,
+        BotOrder.status  == "CLOSED",
+    ).order_by(BotOrder.closed_at.desc()).limit(limit).all()
+
+    trades = []
+    for o in orders:
+        trades.append({
+            "order_id":   o.id,
+            "symbol":     o.symbol,
+            "direction":  o.direction,
+            "lot_size":   o.lot_size,
+            "entry":      o.filled_price,
+            "close":      o.close_price,
+            "pnl_usd":    o.realised_pnl_usd,
+            "result":     "WIN" if (o.realised_pnl_usd or 0) > 0 else "LOSS",
+            "close_reason": o.close_reason,
+            "risk_percent": o.risk_percent,
+            "risk_usd":   o.risk_usd,
+            "mt5_ticket": o.mt5_ticket,
+            "opened_at":  o.executed_at.isoformat() if o.executed_at else None,
+            "closed_at":  o.closed_at.isoformat() if o.closed_at else None,
+        })
+
+    total = len(orders)
+    wins  = sum(1 for o in orders if (o.realised_pnl_usd or 0) > 0)
+    total_pnl = sum(o.realised_pnl_usd or 0 for o in orders)
+
+    return {
+        "username":   username,
+        "total_trades": total,
+        "wins":       wins,
+        "losses":     total - wins,
+        "win_rate":   round(wins / total * 100, 1) if total else 0,
+        "total_pnl_usd": round(total_pnl, 2),
+        "trades":     trades,
+    }
+
+
+@app.get("/bot/performance/{username}")
+def bot_performance(username: str, db: Session = Depends(get_db)):
+    """Aggregated performance stats: all-time, monthly, weekly breakdown."""
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    all_closed = db.query(BotOrder).filter(
+        BotOrder.user_id == user.id,
+        BotOrder.status  == "CLOSED"
+    ).order_by(BotOrder.closed_at).all()
+
+    def stats(orders):
+        if not orders:
+            return {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0, "pnl_usd": 0}
+        wins = sum(1 for o in orders if (o.realised_pnl_usd or 0) > 0)
+        pnl  = sum(o.realised_pnl_usd or 0 for o in orders)
+        return {
+            "trades":   len(orders),
+            "wins":     wins,
+            "losses":   len(orders) - wins,
+            "win_rate": round(wins / len(orders) * 100, 1),
+            "pnl_usd":  round(pnl, 2),
+        }
+
+    now   = datetime.utcnow()
+    today = now.date()
+    this_week_start  = today - timedelta(days=today.weekday())
+    this_month_start = today.replace(day=1)
+
+    today_orders = [o for o in all_closed if o.closed_at and o.closed_at.date() == today]
+    week_orders  = [o for o in all_closed if o.closed_at and o.closed_at.date() >= this_week_start]
+    month_orders = [o for o in all_closed if o.closed_at and o.closed_at.date() >= this_month_start]
+
+    # Symbol breakdown
+    by_symbol = {}
+    for o in all_closed:
+        if o.symbol not in by_symbol:
+            by_symbol[o.symbol] = []
+        by_symbol[o.symbol].append(o)
+    symbol_stats = {sym: stats(orders) for sym, orders in by_symbol.items()}
+
+    return {
+        "username":   username,
+        "all_time":   stats(all_closed),
+        "this_month": stats(month_orders),
+        "this_week":  stats(week_orders),
+        "today":      stats(today_orders),
+        "by_symbol":  symbol_stats,
+        "generated_at": now.isoformat(),
+    }
+
+
+@app.post("/bot/emergency_stop/{username}")
+def emergency_stop(username: str, db: Session = Depends(get_db)):
+    """
+    EMERGENCY — immediately:
+    1. Pauses the bot (no new orders)
+    2. Cancels all QUEUED orders
+    3. Returns a list of ACTIVE positions the user must manually close in MT5
+    """
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    if cfg:
+        cfg.is_active = False
+
+    queued = db.query(BotOrder).filter(
+        BotOrder.user_id == user.id,
+        BotOrder.status  == "QUEUED",
+    ).all()
+    cancelled_count = len(queued)
+    for o in queued:
+        o.status        = "CANCELLED"
+        o.reject_reason = "EMERGENCY_STOP"
+
+    active = db.query(BotOrder).filter(
+        BotOrder.user_id == user.id,
+        BotOrder.status.in_(["SENT", "EXECUTED", "ACTIVE"])
+    ).all()
+
+    db.commit()
+
+    return {
+        "success":          True,
+        "bot_paused":       True,
+        "cancelled_queued": cancelled_count,
+        "active_positions": [
+            {
+                "order_id":  o.id,
+                "symbol":    o.symbol,
+                "direction": o.direction,
+                "ticket":    o.mt5_ticket,
+                "lot_size":  o.lot_size,
+            } for o in active
+        ],
+        "action_required": (
+            f"⚠️ Bot stopped. {len(active)} live position(s) still open in MT5. "
+            "Close them manually in your MT5 terminal or restart the bridge to allow auto-close."
+        ) if active else "✅ All clear. No open positions.",
+    }
