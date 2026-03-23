@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import os, json, re, time, requests, random, math
 from datetime import datetime, timedelta
-from ai_provider import get_ai_response
+from ai_provider import get_ai_response, get_ai_response_creative
 from sqlalchemy.orm import Session
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -387,74 +387,80 @@ def generate_market_predictions(
         else "AI pattern reasoning (live data unavailable)"
     )
 
-    prompt = f"""You are ARIA — elite institutional quantitative trading analyst. Data source: {data_source_note}
+    prompt = f"""SESSION: {session} | UTC: {utc.strftime("%H:%M")} | Data: {data_source_note}
+Budget: {investment_amount_ngn:,.0f} NGN (~${inv_usd:,.2f} USD @ {ngn_rate:.2f}){personalization}
 
-SESSION: {session} | UTC: {utc.strftime("%H:%M")} | Budget: {investment_amount_ngn:,.0f} NGN (~${inv_usd:,.2f} USD @ {ngn_rate:.2f}){personalization}
-
-━━━ REAL LIVE MARKET DATA (use these EXACT indicator values) ━━━
+━━━ LIVE MARKET DATA WITH CONFLUENCE SCORES ━━━
 {live_data_section}
 
-━━━ ADDITIONAL SYMBOLS (use pattern reasoning) ━━━
+━━━ REMAINING SYMBOLS — use institutional pattern reasoning ━━━
 {remaining_text}
 
-━━━ YOUR ANALYSIS RULES ━━━
-For symbols WITH live data above:
-- Use the EXACT RSI, MACD, EMA, Bollinger, ATR, Support/Resistance values provided
-- You are INTERPRETING real data — do NOT make up different values
-- Use the provided ATR-based SL/TP levels as your base, adjust only slightly
-- REJECT the symbol if indicators show conflicting signals
+━━━ CONFIDENCE CALIBRATION (based on confluence score) ━━━
+Confluence 5-6/6 → confidence 88-97  (STRONG signal — STRONG_BUY/STRONG_SELL)
+Confluence 4/6   → confidence 80-87  (clear signal — BUY/SELL)
+Confluence 3/6   → confidence 73-79  (marginal signal — BUY/SELL only if R:R ≥ 1:2.5)
+Confluence 0-2/6 → DO NOT signal — output HOLD and exclude from JSON
+AI reasoning mode → cap confidence at 78 max
 
-For symbols without live data:
-- Use institutional pattern reasoning
-- Be MORE conservative (lower confidence: 73-80 max)
+━━━ MANDATORY QUALITY GATES — fail ANY = exclude the symbol ━━━
+✗ ADX < 20 → ranging market, skip directional trades
+✗ RSI between 42-58 AND no squeeze → no clear momentum, skip
+✗ MACD histogram and RSI disagree on direction → skip
+✗ Stochastic K and Williams %R disagree on direction → skip
+✗ EMA stack gives no clear direction (price between EMA20/EMA50) → skip
+✗ R:R ratio below 1:1.8 → skip
+✗ Session is poor fit for this symbol → cap confidence at 75
 
-QUALITY GATES — skip any signal that fails:
-✗ RSI outside 28-72 range → skip
-✗ MACD and RSI disagree on direction → skip
-✗ Price between EMA20 and EMA50 with no clear bias → skip
-✗ Volume below average with no squeeze → skip
-✗ R:R below 1:2 → skip
+━━━ SIGNAL RULES ━━━
+- Use EXACT ATR-based SL/TP levels from the data block (do not change them significantly)
+- Entry should be current price or a better entry on a pullback to support/pivot
+- back_out_trigger = the price level where the thesis is WRONG (usually previous S/R)
+- For AI reasoning mode: be conservative, justify with intermarket/macro reasoning
 
 POSITION SIZING: 2% risk per trade
-- Risk per trade: {investment_amount_ngn * 0.02:,.0f} NGN = ${investment_amount_ngn * 0.02 / ngn_rate:.2f} USD
+Risk amount: {investment_amount_ngn * 0.02:,.0f} NGN = ${investment_amount_ngn * 0.02 / ngn_rate:.2f} USD
 
-Return ONLY a valid JSON array. Include only signals with confidence >= 73. Exclude HOLD signals.
+Return ONLY a valid JSON array. Minimum confidence 73. No HOLD signals. No text outside the array.
 [
   {{
     "symbol": "SYMBOL",
     "signal": "STRONG_BUY|BUY|SELL|STRONG_SELL",
     "confidence": 73-97,
+    "confluence_score": "X/6",
     "data_source": "live_data|ai_reasoning",
     "category": "forex|crypto",
     "timeframe": "scalp(5-15m)|intraday(1-4h)|swing(daily)",
-    "session_fit": "excellent|good|fair",
-    "live_price": "actual price from data",
-    "entry_price": "specific entry level",
-    "stop_loss": "ATR-based stop",
-    "take_profit_1": "1:1 target",
-    "take_profit_2": "1:2 target",
-    "take_profit_3": "1:3 target",
+    "session_fit": "excellent|good|fair|poor",
+    "live_price": "exact number",
+    "entry_price": "exact number",
+    "stop_loss": "exact number from ATR data",
+    "take_profit_1": "exact number",
+    "take_profit_2": "exact number",
+    "take_profit_3": "exact number",
     "risk_reward": "1:X.X",
-    "hold_time": "duration",
+    "hold_time": "e.g. 4-8 hours",
     "position_size_ngn": "{investment_amount_ngn * 0.02:,.0f} NGN",
     "position_size_usd": "${investment_amount_ngn * 0.02 / ngn_rate:.2f}",
-    "back_out_trigger": "exact price/condition that invalidates this trade",
+    "back_out_trigger": "exact price that invalidates thesis",
     "indicators": {{
-      "rsi": "value from live data + interpretation",
-      "macd": "reading from live data",
-      "ema_bias": "price vs EMA stack",
+      "rsi": "exact value + reading",
+      "macd": "exact histogram value + direction",
+      "stochastic": "K/D values + zone",
+      "adx": "exact ADX value + trend strength",
+      "williams_r": "exact value + zone",
+      "ema_bias": "price vs EMA20/50/200",
       "bollinger": "band position",
-      "volume": "reading",
-      "pattern": "chart pattern detected"
+      "pattern": "candle pattern"
     }},
     "key_levels": {{
-      "support": "level",
-      "resistance": "level"
+      "support": "exact level",
+      "resistance": "exact level",
+      "pivot": "exact pivot level if available"
     }},
-    "rationale": "3 sentences referencing the EXACT indicator values from live data"
+    "rationale": "3 sentences. Must cite confluence score, specific indicator values, and the one strongest reason for the trade."
   }}
-]
-Output ONLY the JSON array. No text outside the array."""
+]"""
 
     try:
         content = get_ai_response(prompt)
@@ -513,61 +519,66 @@ def get_personalized_signal(symbol: str, user: User, db: Session) -> Dict:
     live_price = analysis.get("live_price", 0)
     has_live = bool(live_price)
 
-    prompt = f"""You are ARIA, an elite institutional trading analyst.
-
-━━━ REAL LIVE MARKET DATA FOR {symbol} ━━━
+    prompt = f"""━━━ MARKET DATA FOR {symbol} ━━━
 {live_data_block}
 
 ━━━ USER CONTEXT ━━━
 {profile}
 Balance: {user.balance_ngn:,.0f} NGN (~${inv_usd:,.2f} USD)
-Trading Style: {user.trading_style} | Risk Tolerance: {user.risk_tolerance}
-Time: {utc.strftime("%Y-%m-%d %H:%M")} UTC
+Style: {user.trading_style} | Risk: {user.risk_tolerance}
+UTC: {utc.strftime("%Y-%m-%d %H:%M")}
 Position size (2% risk): {user.balance_ngn * 0.02:,.0f} NGN = ${user.balance_ngn * 0.02 / ngn_rate:.2f} USD
 
-━━━ ANALYSIS INSTRUCTIONS ━━━
-{"Use the EXACT indicator values from the live data block above. Do NOT invent different values." if has_live else "No live data available — use institutional pattern reasoning."}
+━━━ CONFLUENCE-BASED CONFIDENCE ━━━
+{"Use the confluence score from the data block to calibrate confidence:" if has_live else "AI reasoning mode — cap confidence at 78."}
+{"Score 5-6/6 → 88-97 (STRONG) | Score 4/6 → 80-87 | Score 3/6 → 73-79 | Score 0-2 → HOLD" if has_live else ""}
 
-Provide a personalized deep analysis for {symbol} considering:
-- The user's {user.trading_style} style (adjust hold time and entry precision accordingly)
-- Their {user.risk_tolerance} risk tolerance (adjust position size and SL distance)
-- Their trade history and win rate in their profile above
-- {"The EXACT RSI, MACD, EMA, ATR, support/resistance from live data" if has_live else "Conservative estimates since no live data"}
+━━━ QUALITY GATES (fail any = return HOLD) ━━━
+{"✗ ADX < 20 → HOLD (ranging) | ✗ MACD/RSI conflict → HOLD | ✗ Stoch/Williams disagree → HOLD | ✗ R:R < 1:1.8 → HOLD" if has_live else ""}
 
-Return ONLY a valid JSON object:
+━━━ PERSONALISATION ━━━
+- Timeframe must match {user.trading_style} style
+- SL distance: {"tighter (0.8–1.0×ATR)" if user.risk_tolerance == "low" else ("standard (1.5×ATR)" if user.risk_tolerance == "medium" else "wider (2.0×ATR)")} for {user.risk_tolerance} risk
+- {"Use EXACT indicator values — do not invent numbers." if has_live else "Conservative analysis only — no live data."}
+
+Return ONLY valid JSON:
 {{
   "symbol": "{symbol}",
   "signal": "STRONG_BUY|BUY|HOLD|SELL|STRONG_SELL",
-  "confidence": 0-99,
+  "confidence": 0-97,
+  "confluence_score": "X/6 or N/A",
   "data_source": "{"live_data" if has_live else "ai_reasoning"}",
   "category": "forex|crypto",
   "timeframe": "scalp|intraday|swing",
   "session_fit": "excellent|good|fair|poor",
   "live_price": "{live_price if live_price else "unavailable"}",
-  "entry_price": "specific price (use live data levels)",
-  "stop_loss": "ATR-based SL (use ATR from live data if available)",
-  "take_profit_1": "1:1 target",
-  "take_profit_2": "1:2 target",
-  "take_profit_3": "1:3 target",
-  "risk_reward": "1:X",
-  "hold_time": "duration matching user's {user.trading_style} style",
-  "position_size_ngn": "{user.balance_ngn * 0.02:,.0f} NGN (2% of balance)",
+  "entry_price": "exact number",
+  "stop_loss": "exact number (ATR-based)",
+  "take_profit_1": "exact number",
+  "take_profit_2": "exact number",
+  "take_profit_3": "exact number",
+  "risk_reward": "1:X.X",
+  "hold_time": "duration for {user.trading_style}",
+  "position_size_ngn": "{user.balance_ngn * 0.02:,.0f} NGN",
   "position_size_usd": "${user.balance_ngn * 0.02 / ngn_rate:.2f} USD",
-  "back_out_trigger": "exact price or condition invalidating this setup",
+  "back_out_trigger": "exact invalidation price",
   "indicators": {{
-    "rsi": "EXACT value from live data + interpretation",
-    "macd": "EXACT reading from live data",
-    "ema_bias": "EXACT EMA position from live data",
-    "bollinger": "EXACT band position from live data",
-    "volume": "EXACT volume reading",
-    "pattern": "chart pattern detected"
+    "rsi": "exact value + zone",
+    "macd": "histogram value + direction",
+    "stochastic": "K/D + zone",
+    "adx": "value + trend strength",
+    "williams_r": "value + zone",
+    "ema_bias": "price vs EMA20/50/200",
+    "bollinger": "band position",
+    "pattern": "detected pattern"
   }},
   "key_levels": {{
-    "support": "EXACT level from live data",
-    "resistance": "EXACT level from live data"
+    "support": "exact level",
+    "resistance": "exact level",
+    "pivot": "pivot level if available"
   }},
-  "personalized_note": "Specific note for this user's trading style, history, and risk profile",
-  "rationale": "3 sentences using EXACT indicator values from live data"
+  "personalized_note": "1 sentence addressing this user's specific style, risk, and history",
+  "rationale": "3 sentences: (1) what the confluence/indicators say, (2) why this entry is valid, (3) what the risk is"
 }}"""
 
     try:
@@ -1309,20 +1320,19 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 {history_text if history_text else "This is the start of this conversation."}
 
 ━━━ YOUR RULES ━━━
-1. Address {name} by name naturally (not every sentence — just when it feels right)
-2. If {name} tells you something personal, acknowledge it warmly and remember it
-3. If {name} mentions an amount in NGN, instantly convert it: ₦X = ${{X / {
-        ngn_rate:.2f}:.2f}} USD
-4. Recommend 2% risk per trade for their style ({user.trading_style}) and tolerance ({
-        user.risk_tolerance
-    })
-5. Always show exact calculations — never say "roughly" without showing the maths
-6. If you don't know something live (price, news), say so clearly
-7. End responses with a brief risk note only if giving a trade recommendation
-8. Be warm, direct, and specific — avoid vague generalities"""
+1. Address {name} by name naturally — not every sentence, just when it flows
+2. If {name} shares personal info, acknowledge it warmly and remember it
+3. Any NGN amount → instantly show: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD
+4. Recommend 2% risk per trade for {user.trading_style} / {user.risk_tolerance} risk
+5. Show exact maths — never say "roughly" without the actual calculation
+6. If {name} asks for a trade signal: cite confluence score, ADX, and at least 3 indicators
+7. If you don't know a live price or news event, say so clearly — don't invent data
+8. When giving a signal: always state the invalidation level (back-out trigger)
+9. Tone: warm, direct, institutional confidence — never hype, never guaranteed profits
+10. End trade recommendations with a one-line risk note"""
 
     full_prompt = f"{system_prompt}\n\n{name}: {chat.message}\nARIA:"
-    response = get_ai_response(full_prompt)
+    response = get_ai_response_creative(full_prompt)
 
     # ── save messages to DB ──
     db.add(
@@ -1991,12 +2001,13 @@ def get_live_technical_data(
         "live_price": analysis.get("live_price"),
         "last_candle_time": analysis.get("last_candle_time"),
         "candles_used": analysis.get("candles_used"),
+        "confluence": analysis.get("confluence", {}),
         "indicators": analysis.get("indicators", {}),
         "key_levels": analysis.get("key_levels", {}),
         "trend_bias": analysis.get("trend_bias"),
         "fetched_at": datetime.utcnow().isoformat(),
         "cache_ttl_minutes": 15,
-        "note": "Data from Alpha Vantage 5-min OHLCV candles. Cached 15 min to respect rate limits.",
+        "note": "Data from Alpha Vantage daily candles. Cached 15 min to respect rate limits.",
     }
 
 

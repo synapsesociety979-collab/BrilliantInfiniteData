@@ -314,6 +314,173 @@ def calc_trend(close: pd.Series) -> str:
     return f"RANGING / MIXED — {' | '.join(parts)}"
 
 
+def calc_stochastic(df: pd.DataFrame, k_period=14, d_period=3) -> Tuple[float, float]:
+    """Stochastic %K and %D — overbought >80, oversold <20."""
+    low_min  = df["low"].rolling(k_period).min()
+    high_max = df["high"].rolling(k_period).max()
+    k = 100 * (df["close"] - low_min) / (high_max - low_min + 1e-10)
+    d = k.rolling(d_period).mean()
+    return round(float(k.iloc[-1]), 2), round(float(d.iloc[-1]), 2)
+
+
+def calc_adx(df: pd.DataFrame, period=14) -> Tuple[float, float, float]:
+    """
+    Average Directional Index — measures trend STRENGTH (not direction).
+    ADX > 25 = trending market (tradeable)
+    ADX < 20 = ranging market (avoid directional trades)
+    Returns (ADX, +DI, -DI)
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+    plus_dm  = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    # Zero out where the other is bigger
+    plus_dm  = plus_dm.where(plus_dm > minus_dm, 0)
+    minus_dm = minus_dm.where(minus_dm > plus_dm, 0)
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+
+    atr_s    = tr.rolling(period).sum()
+    plus_di  = 100 * plus_dm.rolling(period).sum()  / (atr_s + 1e-10)
+    minus_di = 100 * minus_dm.rolling(period).sum() / (atr_s + 1e-10)
+    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
+    adx      = dx.rolling(period).mean()
+
+    return (round(float(adx.iloc[-1]), 2),
+            round(float(plus_di.iloc[-1]), 2),
+            round(float(minus_di.iloc[-1]), 2))
+
+
+def calc_williams_r(df: pd.DataFrame, period=14) -> float:
+    """Williams %R — overbought > -20, oversold < -80."""
+    high_max = df["high"].rolling(period).max()
+    low_min  = df["low"].rolling(period).min()
+    wr = -100 * (high_max - df["close"]) / (high_max - low_min + 1e-10)
+    return round(float(wr.iloc[-1]), 2)
+
+
+def calc_pivot_points(df: pd.DataFrame) -> dict:
+    """Classic pivot points from the most recent completed candle."""
+    if len(df) < 2:
+        return {}
+    prev  = df.iloc[-2]   # use previous completed candle
+    H, L, C = prev["high"], prev["low"], prev["close"]
+    pivot = (H + L + C) / 3
+    r1 = 2 * pivot - L
+    r2 = pivot + (H - L)
+    r3 = H + 2 * (pivot - L)
+    s1 = 2 * pivot - H
+    s2 = pivot - (H - L)
+    s3 = L - 2 * (H - pivot)
+    dp = 6
+    return {
+        "pivot": round(pivot, dp),
+        "R1": round(r1, dp), "R2": round(r2, dp), "R3": round(r3, dp),
+        "S1": round(s1, dp), "S2": round(s2, dp), "S3": round(s3, dp),
+    }
+
+
+def calc_confluence_score(
+    rsi: float,
+    macd_hist: float,
+    ema20: Optional[float],
+    ema50: Optional[float],
+    price: float,
+    stoch_k: float,
+    stoch_d: float,
+    adx: float,
+    williams_r: float,
+    bb_pct: float,
+) -> Tuple[str, int, List[str]]:
+    """
+    Score how many independent indicators agree on direction.
+    Returns (direction, confluence_count, reasons[])
+    direction = "BUY" | "SELL" | "NEUTRAL"
+    confluence_count = 0–8 (higher = stronger signal)
+    """
+    bull_points = 0
+    bear_points = 0
+    reasons = []
+
+    # RSI
+    if rsi < 45:
+        bull_points += 1
+        reasons.append(f"RSI {rsi} (bullish zone)")
+    elif rsi > 55:
+        bear_points += 1
+        reasons.append(f"RSI {rsi} (bearish zone)")
+
+    # MACD histogram
+    if macd_hist > 0:
+        bull_points += 1
+        reasons.append("MACD histogram positive")
+    elif macd_hist < 0:
+        bear_points += 1
+        reasons.append("MACD histogram negative")
+
+    # EMA stack
+    if ema20 and ema50:
+        if price > ema20 > ema50:
+            bull_points += 1
+            reasons.append("Price above EMA20 > EMA50 (bullish stack)")
+        elif price < ema20 < ema50:
+            bear_points += 1
+            reasons.append("Price below EMA20 < EMA50 (bearish stack)")
+
+    # Stochastic
+    if stoch_k < 25 and stoch_k > stoch_d:
+        bull_points += 1
+        reasons.append(f"Stoch {stoch_k:.0f} oversold + K crossing above D")
+    elif stoch_k > 75 and stoch_k < stoch_d:
+        bear_points += 1
+        reasons.append(f"Stoch {stoch_k:.0f} overbought + K crossing below D")
+
+    # Williams %R
+    if williams_r < -75:
+        bull_points += 1
+        reasons.append(f"Williams %R {williams_r} oversold")
+    elif williams_r > -25:
+        bear_points += 1
+        reasons.append(f"Williams %R {williams_r} overbought")
+
+    # Bollinger position
+    if bb_pct < 0.20:
+        bull_points += 1
+        reasons.append("Price near lower Bollinger band")
+    elif bb_pct > 0.80:
+        bear_points += 1
+        reasons.append("Price near upper Bollinger band")
+
+    # ADX filter — weak trend reduces confidence
+    adx_note = ""
+    if adx < 20:
+        adx_note = f"ADX {adx} — ranging market, reduced confidence"
+    elif adx > 25:
+        reasons.append(f"ADX {adx} confirms trending conditions")
+
+    total_bull = bull_points
+    total_bear = bear_points
+    net = total_bull - total_bear
+
+    if net >= 2:
+        direction = "BUY"
+        count = total_bull
+    elif net <= -2:
+        direction = "SELL"
+        count = total_bear
+    else:
+        direction = "NEUTRAL"
+        count = max(total_bull, total_bear)
+
+    if adx_note:
+        reasons.append(adx_note)
+
+    return direction, count, reasons
+
+
 def detect_candle_pattern(df: pd.DataFrame) -> str:
     if len(df) < 3:
         return "insufficient data"
@@ -460,6 +627,7 @@ def get_symbol_analysis(symbol: str) -> dict:
     close = df["close"]
     price = round(float(close.iloc[-1]), 6)
 
+    # ── Core indicators ──────────────────────────────────────────
     rsi                        = calc_rsi(close)
     macd_line, sig_line, hist  = calc_macd(close)
     ema20                      = calc_ema(close, 20)
@@ -472,6 +640,23 @@ def get_symbol_analysis(symbol: str) -> dict:
     trend                      = calc_trend(close)
     pattern                    = detect_candle_pattern(df)
 
+    # ── Extra indicators ─────────────────────────────────────────
+    stoch_k, stoch_d = calc_stochastic(df)
+    adx, plus_di, minus_di = calc_adx(df)
+    williams_r = calc_williams_r(df)
+    pivots     = calc_pivot_points(df)
+
+    # ── Confluence score ─────────────────────────────────────────
+    bb_width = bb_upper - bb_lower
+    bb_pct   = (price - bb_lower) / bb_width if bb_width > 0 else 0.5
+
+    conf_direction, conf_count, conf_reasons = calc_confluence_score(
+        rsi=rsi, macd_hist=hist, ema20=ema20, ema50=ema50,
+        price=price, stoch_k=stoch_k, stoch_d=stoch_d,
+        adx=adx, williams_r=williams_r, bb_pct=bb_pct,
+    )
+
+    # ── Human-readable readings ──────────────────────────────────
     if rsi < 30:    rsi_reading = f"{rsi} — OVERSOLD (strong buy bias)"
     elif rsi < 40:  rsi_reading = f"{rsi} — approaching oversold (mild buy bias)"
     elif rsi > 70:  rsi_reading = f"{rsi} — OVERBOUGHT (strong sell bias)"
@@ -481,14 +666,28 @@ def get_symbol_analysis(symbol: str) -> dict:
     if hist > 0:    macd_reading = f"BULLISH (line={macd_line:+.6f}, histogram={hist:+.6f})"
     else:           macd_reading = f"BEARISH (line={macd_line:+.6f}, histogram={hist:+.6f})"
 
-    bb_width = bb_upper - bb_lower
-    bb_pct   = (price - bb_lower) / bb_width if bb_width > 0 else 0.5
     if bb_pct > 0.85:   bb_reading = f"Near UPPER band ({price} ≈ {bb_upper}) — overbought zone"
     elif bb_pct < 0.15: bb_reading = f"Near LOWER band ({price} ≈ {bb_lower}) — oversold zone"
     elif bb_width < close.std() * 0.5:
                         bb_reading = f"SQUEEZE (tight bands, mid={bb_mid}) — breakout imminent"
     else:               bb_reading = f"{bb_pct:.0%} of band (lower={bb_lower}, mid={bb_mid}, upper={bb_upper})"
 
+    if stoch_k > 80:    stoch_reading = f"K={stoch_k} D={stoch_d} — OVERBOUGHT zone"
+    elif stoch_k < 20:  stoch_reading = f"K={stoch_k} D={stoch_d} — OVERSOLD zone"
+    elif stoch_k > stoch_d:
+                        stoch_reading = f"K={stoch_k} D={stoch_d} — bullish crossover"
+    else:               stoch_reading = f"K={stoch_k} D={stoch_d} — bearish crossover"
+
+    if adx > 40:        adx_reading = f"ADX={adx} (STRONG trend) | +DI={plus_di} -DI={minus_di}"
+    elif adx > 25:      adx_reading = f"ADX={adx} (trending) | +DI={plus_di} -DI={minus_di}"
+    elif adx > 20:      adx_reading = f"ADX={adx} (weakening trend) | +DI={plus_di} -DI={minus_di}"
+    else:               adx_reading = f"ADX={adx} (RANGING — low directional strength) | +DI={plus_di} -DI={minus_di}"
+
+    if williams_r > -20:   wr_reading = f"{williams_r} — OVERBOUGHT"
+    elif williams_r < -80: wr_reading = f"{williams_r} — OVERSOLD"
+    else:                  wr_reading = f"{williams_r} — neutral"
+
+    # ── ATR-based SL/TP (1.5R / 3R / 4.5R) ──────────────────────
     sl_buy   = round(price - atr * 1.5, 6)
     sl_sell  = round(price + atr * 1.5, 6)
     tp1_buy  = round(price + atr * 1.5, 6)
@@ -499,16 +698,28 @@ def get_symbol_analysis(symbol: str) -> dict:
     tp3_sell = round(price - atr * 4.5, 6)
 
     result = {
-        "symbol":            symbol,
-        "data_source":       f"Alpha Vantage ({data_interval})",
-        "live_price_source": live_price_source,
-        "live_price":        price,
-        "candles_used":      len(df),
-        "last_candle_time":  str(df["time"].iloc[-1].date()),
-        "ai_only_mode":      False,
+        "symbol":             symbol,
+        "data_source":        f"Alpha Vantage ({data_interval})",
+        "live_price_source":  live_price_source,
+        "live_price":         price,
+        "candles_used":       len(df),
+        "last_candle_time":   str(df["time"].iloc[-1].date()),
+        "ai_only_mode":       False,
+        "confluence": {
+            "direction":    conf_direction,
+            "score":        conf_count,
+            "out_of":       6,
+            "strength":     "STRONG" if conf_count >= 5 else ("MODERATE" if conf_count >= 3 else "WEAK"),
+            "reasons":      conf_reasons,
+            "tradeable":    adx >= 20,
+            "adx_note":     adx_reading,
+        },
         "indicators": {
             "rsi_14":          rsi_reading,
             "macd_12_26_9":    macd_reading,
+            "stochastic_14":   stoch_reading,
+            "adx_14":          adx_reading,
+            "williams_r_14":   wr_reading,
             "ema_stack":       trend,
             "bollinger_bands": bb_reading,
             "volume":          volume_sig,
@@ -518,6 +729,7 @@ def get_symbol_analysis(symbol: str) -> dict:
         "key_levels": {
             "support":          support,
             "resistance":       resistance,
+            "pivot_points":     pivots,
             "atr_sl_for_buy":   sl_buy,
             "atr_sl_for_sell":  sl_sell,
             "atr_tp1_buy":      tp1_buy,
@@ -568,18 +780,32 @@ def format_for_ai_prompt(symbol_or_analysis, analysis: dict = None) -> str:
         ]
         return "\n".join(lines)
 
-    ind = analysis.get("indicators", {})
-    lv  = analysis.get("key_levels", {})
+    ind  = analysis.get("indicators", {})
+    lv   = analysis.get("key_levels", {})
+    conf = analysis.get("confluence", {})
+    piv  = lv.get("pivot_points", {})
+
     lines = [
         f"=== {sym} | Live Price: {price} ({source}) ===",
         f"Data: {analysis.get('data_source')} | Candles: {analysis.get('candles_used')} | Last: {analysis.get('last_candle_time','')}",
-        f"RSI(14):  {ind.get('rsi_14')}",
-        f"MACD:     {ind.get('macd_12_26_9')}",
-        f"EMA:      {ind.get('ema_stack')}",
-        f"BB(20,2): {ind.get('bollinger_bands')}",
-        f"Volume:   {ind.get('volume')}",
-        f"ATR(14):  {ind.get('atr_14')} | Pattern: {ind.get('candle_pattern')}",
-        f"Support:  {lv.get('support')} | Resistance: {lv.get('resistance')}",
+        f"",
+        f"── CONFLUENCE: {conf.get('direction','?')} | Score {conf.get('score',0)}/{conf.get('out_of',6)} ({conf.get('strength','?')}) | Tradeable: {conf.get('tradeable','?')}",
+        f"   Reasons: {' | '.join(conf.get('reasons', ['insufficient data']))}",
+        f"",
+        f"── INDICATORS",
+        f"RSI(14):        {ind.get('rsi_14')}",
+        f"MACD(12,26,9):  {ind.get('macd_12_26_9')}",
+        f"Stochastic(14): {ind.get('stochastic_14')}",
+        f"Williams %R:    {ind.get('williams_r_14')}",
+        f"ADX(14):        {ind.get('adx_14')}",
+        f"EMA Stack:      {ind.get('ema_stack')}",
+        f"Bollinger(20):  {ind.get('bollinger_bands')}",
+        f"ATR(14):        {ind.get('atr_14')} | Pattern: {ind.get('candle_pattern')}",
+        f"Volume:         {ind.get('volume')}",
+        f"",
+        f"── KEY LEVELS",
+        f"Support: {lv.get('support')} | Resistance: {lv.get('resistance')}",
+        f"Pivots: P={piv.get('pivot')} R1={piv.get('R1')} R2={piv.get('R2')} S1={piv.get('S1')} S2={piv.get('S2')}",
         f"BUY  → SL: {lv.get('atr_sl_for_buy')} | TP1: {lv.get('atr_tp1_buy')} | TP2: {lv.get('atr_tp2_buy')} | TP3: {lv.get('atr_tp3_buy')}",
         f"SELL → SL: {lv.get('atr_sl_for_sell')} | TP1: {lv.get('atr_tp1_sell')} | TP2: {lv.get('atr_tp2_sell')} | TP3: {lv.get('atr_tp3_sell')}",
     ]
