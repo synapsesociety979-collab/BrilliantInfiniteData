@@ -144,18 +144,19 @@ def normalize_symbol(symbol: str) -> str:
 def _get_filling_mode(symbol: str) -> int:
     """
     Detect which filling mode the broker supports for this symbol.
-    Tries FOK → IOC → RETURN in order.
+    filling_mode bitmask: 1=FOK, 2=IOC, 4=RETURN
+    ORDER_FILLING constants: FOK=0, IOC=1, RETURN=2
     """
     info = mt5.symbol_info(symbol)
     if info is None:
-        return mt5.ORDER_FILLING_IOC
+        return mt5.ORDER_FILLING_RETURN
 
     filling = info.filling_mode
-    if filling & mt5.SYMBOL_FILLING_FOK:
+    if filling & 1:   # FOK supported
         return mt5.ORDER_FILLING_FOK
-    elif filling & mt5.SYMBOL_FILLING_IOC:
+    elif filling & 2: # IOC supported
         return mt5.ORDER_FILLING_IOC
-    else:
+    else:             # RETURN (most common for ECN/STP brokers like HFM)
         return mt5.ORDER_FILLING_RETURN
 
 
