@@ -1510,31 +1510,42 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
         "UNI": "UNIUSDT", "UNISWAP": "UNIUSDT",
     }
     msg_upper = chat.message.upper()
-    mentioned_symbols = []
-    # Check direct symbol names first (exact match or crypto without USDT)
+    # ── symbol detection: track both canonical symbol AND the alias the user typed ──
+    # mentioned_map: { canonical_symbol -> alias_as_typed_by_user }
+    mentioned_map: dict = {}
+
+    # 1. Direct canonical symbol names in the message
     for sym in TRADING_SYMBOLS:
         if sym in msg_upper:
-            mentioned_symbols.append(sym)
+            mentioned_map[sym] = sym
         elif sym.endswith("USDT") and sym[:-4] in msg_upper.split():
-            # Only add ticker-only match if it's a standalone word (avoids "ADA" matching "CANADA")
-            if sym not in mentioned_symbols:
-                mentioned_symbols.append(sym)
-    # Check aliases (longer aliases first to avoid partial clobbers)
+            # standalone word match only (avoids "ADA" hitting "CANADA")
+            if sym not in mentioned_map:
+                mentioned_map[sym] = sym[:-4]
+
+    # 2. Alias map (longer aliases checked first to avoid partial matches)
     for alias in sorted(SYMBOL_ALIASES.keys(), key=len, reverse=True):
         sym = SYMBOL_ALIASES[alias]
-        if alias in msg_upper and sym not in mentioned_symbols:
-            mentioned_symbols.append(sym)
-    mentioned_symbols = mentioned_symbols[:3]  # max 3 per message
+        if alias in msg_upper and sym not in mentioned_map:
+            mentioned_map[sym] = alias   # remember the exact text the user used
+
+    # limit to 3 symbols per message
+    mentioned_pairs = list(mentioned_map.items())[:3]   # [(canonical, alias_used), ...]
 
     # Fetch live indicator data for each mentioned symbol
     live_data_blocks_chat = []
-    for sym in mentioned_symbols:
+    for sym, alias_used in mentioned_pairs:
         try:
             analysis = get_symbol_analysis(sym)
             block = format_for_ai_prompt(analysis)
             conf = analysis.get("confluence", {})
+            mode = "AI-reasoning — no live candles" if analysis.get("ai_only_mode") else "LIVE candle data"
+            # Header clarifies the notation mapping so ARIA never confuses them
+            alias_note = f" [user typed: '{alias_used}' — same instrument]" if alias_used != sym else ""
             live_data_blocks_chat.append(
-                f"── {sym} LIVE DATA ──\n{block}\n"
+                f"── DATA FOR {sym}{alias_note} ({mode}) ──\n"
+                f"NOTE: {sym} = {alias_used} = same tradeable pair. Use the price/indicators below directly.\n"
+                f"{block}\n"
                 f"CONFLUENCE: {conf.get('direction','?')} | Score {conf.get('score',0)}/6 | "
                 f"Tradeable: {conf.get('tradeable','?')}"
             )
@@ -1543,10 +1554,22 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
 
     live_data_section_chat = "\n\n".join(live_data_blocks_chat) if live_data_blocks_chat else ""
 
+    # Which symbols have injected data (for ARIA's instructions)
+    covered_syms = [sym for sym, _ in mentioned_pairs]
+
     # ── build system prompt ──
     system_prompt = f"""You are ARIA — Advanced Revenue Intelligence Analyst.
 You are a world-class AI trading strategist with a warm, confident personality.
-You have ACCESS TO REAL-TIME LIVE MARKET DATA — use it whenever it is provided below.
+
+━━━ FOREX NOTATION GUIDE (READ FIRST) ━━━
+• EUR/USD = USD/EUR = EURUSD = Fiber — all ONE pair. Price ~1.08
+• GBP/USD = USD/GBP = GBPUSD = Cable — all ONE pair. Price ~1.29
+• USD/JPY = JPY/USD = USDJPY — ONE pair. Price ~150
+• USD/CAD = CAD/USD = USDCAD = Loonie — ONE pair. Price ~1.37
+• When the data block below says "EURUSD" and the user wrote "USD/EUR" — it is THE SAME pair.
+• NEVER invent a price of ~0.92 for "USD/EUR". That is NOT a real market price.
+  EUR/USD is ~1.08 whether written as EUR/USD or USD/EUR.
+• NEVER say "I don't have data for this pair" if a data block is shown below for its canonical symbol.
 
 ━━━ WHO YOU ARE TALKING TO ━━━
 Name: {name}
@@ -1557,9 +1580,11 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 ━━━ WHAT YOU REMEMBER ABOUT {name.upper()} ━━━
 {memories}
 
-{"━━━ LIVE MARKET DATA FOR MENTIONED SYMBOL(S) ━━━" if live_data_section_chat else ""}
+{"━━━ MARKET DATA FOR: " + ", ".join(covered_syms) + " ━━━" if live_data_section_chat else ""}
 {live_data_section_chat}
-{"IMPORTANT: Use the EXACT indicator values above. Do not say you lack real-time data — you have it." if live_data_section_chat else ""}
+{("CRITICAL: Data is shown above for " + ", ".join(covered_syms) + ". "
+  "Use it NOW to generate a signal — do NOT say you lack data for these pairs. "
+  "State the data mode (AI-reasoning / live candles) transparently.") if live_data_section_chat else ""}
 
 ━━━ CURRENT TOP SIGNALS (from live analysis engine) ━━━
 {json.dumps([{
