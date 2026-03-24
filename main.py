@@ -3492,14 +3492,19 @@ def _run_scheduler_cycle(db):
         return
 
     signals = preds.get("signals", [])
-    auto_signals = [s for s in signals if s.get("auto_trade_eligible")]
 
-    if not auto_signals:
-        print("[SCHEDULER] No auto-trade eligible signals this cycle — nothing queued")
+    # Only exclude HOLD signals and signals with no direction
+    tradeable_signals = [
+        s for s in signals
+        if s.get("signal") in ("BUY", "SELL", "STRONG_BUY", "STRONG_SELL")
+        and s.get("confidence", 0) > 0
+    ]
+
+    if not tradeable_signals:
+        print("[SCHEDULER] No tradeable signals this cycle — nothing queued")
         return
 
-    print(f"[SCHEDULER] {len(auto_signals)} auto-trade eligible signal(s): "
-          + ", ".join(f"{s['symbol']} {s['signal']} {s['confidence']}%" for s in auto_signals))
+    print(f"[SCHEDULER] {len(tradeable_signals)} candidate signal(s) this cycle")
 
     # ── Step 2: Find all users with an active bot ────────────────────────────
     active_cfgs = db.query(BotConfig).filter(BotConfig.is_active == True).all()
@@ -3516,6 +3521,20 @@ def _run_scheduler_cycle(db):
         user = db.query(User).filter(User.id == cfg.user_id).first()
         if not user:
             continue
+
+        # Filter signals per this user's confidence setting
+        user_min_conf = float(cfg.min_confidence or 73)
+        auto_signals = [
+            s for s in tradeable_signals
+            if float(s.get("confidence", 0)) >= user_min_conf
+        ]
+
+        if not auto_signals:
+            print(f"[SCHEDULER] No signals above {user_min_conf}% for {user.username}")
+            continue
+
+        print(f"[SCHEDULER] {len(auto_signals)} signal(s) >= {user_min_conf}% for {user.username}: "
+              + ", ".join(f"{s['symbol']} {s['confidence']}%" for s in auto_signals))
 
         # Get the user's MT5 account balance (fall back to a safe default)
         account_balance_usd = float(cfg.mt5_account_balance or 1000.0)
