@@ -1,12 +1,10 @@
 # market_data.py — Real live market data + technical indicator engine
-# Free Alpha Vantage endpoints used:
-#   FX_DAILY                   — daily OHLCV for forex pairs
-#   DIGITAL_CURRENCY_DAILY     — daily OHLCV for crypto
-#   CURRENCY_EXCHANGE_RATE     — real-time price overlay
 #
-# FALLBACK: When Alpha Vantage is rate-limited or unavailable,
-#   ARIA uses estimated reference prices + AI pattern reasoning.
-#   The AI will clearly label which mode it's using.
+# PRIMARY:  Twelve Data API (800 req/day free — forex + crypto OHLCV + real-time price)
+# FALLBACK: Alpha Vantage    (25 req/day  free — used only when Twelve Data is rate-limited)
+# LAST:     AI reasoning mode (estimated reference prices when both APIs are unavailable)
+#
+# Both APIs have circuit breakers — one rate-limit response pauses that source for 30 min.
 
 import os
 import time
@@ -17,7 +15,11 @@ from typing import Dict, Optional, Tuple, List
 from datetime import datetime
 
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-BASE_URL = "https://www.alphavantage.co/query"
+AV_BASE_URL = "https://www.alphavantage.co/query"
+BASE_URL = AV_BASE_URL  # keep backward compat
+
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+TD_BASE_URL = "https://api.twelvedata.com"
 
 _DATA_CACHE: Dict[str, dict] = {}
 CACHE_TTL     = 900    # 15 min cache for live data
@@ -50,18 +52,25 @@ def _load_disk_cache() -> None:
         print(f"[CACHE] Disk load error (non-fatal): {e}")
 
 def _save_disk_cache() -> None:
-    """Persist the current in-memory cache to disk."""
+    """
+    Persist analysis results to disk.
+    Only saves entries whose value contains a 'data' dict (analysis results).
+    Skips raw OHLCV DataFrame entries which are not JSON-serialisable.
+    """
     try:
+        saveable = {
+            k: v for k, v in _DATA_CACHE.items()
+            if isinstance(v, dict) and "data" in v and isinstance(v["data"], dict)
+        }
         with open(_DISK_CACHE_PATH, "w") as f:
-            _json.dump(_DATA_CACHE, f)
+            _json.dump(saveable, f)
     except Exception as e:
         print(f"[CACHE] Disk save error (non-fatal): {e}")
 
 _load_disk_cache()   # run on import
 
 # ── AV rate-limit circuit breaker ────────────────────────────────
-# If AV rate-limits us, stop hammering it for 30 min.
-_AV_RATE_LIMITED_UNTIL: float = 0.0   # unix timestamp
+_AV_RATE_LIMITED_UNTIL: float = 0.0
 
 def _av_is_rate_limited() -> bool:
     return time.time() < _AV_RATE_LIMITED_UNTIL
@@ -70,6 +79,36 @@ def _mark_av_rate_limited(minutes: int = 30) -> None:
     global _AV_RATE_LIMITED_UNTIL
     _AV_RATE_LIMITED_UNTIL = time.time() + minutes * 60
     print(f"[AV] Circuit breaker: pausing AV calls for {minutes} min")
+
+# ── Twelve Data circuit breaker ───────────────────────────────────
+_TD_RATE_LIMITED_UNTIL: float = 0.0
+
+def _td_is_rate_limited() -> bool:
+    return time.time() < _TD_RATE_LIMITED_UNTIL
+
+def _mark_td_rate_limited(minutes: int = 30) -> None:
+    global _TD_RATE_LIMITED_UNTIL
+    _TD_RATE_LIMITED_UNTIL = time.time() + minutes * 60
+    print(f"[TD] Circuit breaker: pausing Twelve Data calls for {minutes} min")
+
+# ── Twelve Data per-minute throttle ───────────────────────────────
+# Free tier: 8 requests/minute. We cap at 7 to stay safely under.
+import collections as _collections
+_TD_CALL_TIMES: _collections.deque = _collections.deque(maxlen=7)
+
+def _td_throttle() -> None:
+    """
+    Block until it is safe to make another Twelve Data call.
+    Enforces max 7 calls per 60-second rolling window.
+    """
+    now = time.time()
+    if len(_TD_CALL_TIMES) == 7:
+        oldest = _TD_CALL_TIMES[0]
+        wait = 60.0 - (now - oldest)
+        if wait > 0:
+            print(f"[TD] Per-minute throttle — sleeping {wait:.1f}s")
+            time.sleep(wait)
+    _TD_CALL_TIMES.append(time.time())
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -263,6 +302,128 @@ def fetch_crypto_daily(base_symbol: str, market: str = "USD") -> Optional[pd.Dat
     df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
     _DATA_CACHE[cache_key] = {"df": df, "ts": time.time()}
     return df
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Twelve Data — primary data source (800 req/day free)
+# ─────────────────────────────────────────────────────────────────
+
+def _to_td_symbol(canonical: str) -> str:
+    """
+    Convert canonical symbol to Twelve Data format.
+    EURUSD → EUR/USD | BTCUSDT → BTC/USD
+    """
+    crypto_base = extract_crypto_base(canonical)
+    if crypto_base:
+        return f"{crypto_base}/USD"
+    s = canonical.upper()
+    if len(s) == 6:
+        return f"{s[:3]}/{s[3:]}"
+    return s
+
+
+def _fetch_td(endpoint: str, params: dict, timeout: int = 15) -> dict:
+    """Core Twelve Data request with circuit breaker + per-minute throttle."""
+    if not TWELVE_DATA_API_KEY:
+        return {"_no_key": True}
+    if _td_is_rate_limited():
+        return {"_limited": True}
+    _td_throttle()   # enforce 7 req/min rolling window
+    params = {**params, "apikey": TWELVE_DATA_API_KEY}
+    try:
+        r = requests.get(f"{TD_BASE_URL}{endpoint}", params=params, timeout=timeout)
+        r.raise_for_status()
+        j = r.json()
+        # Twelve Data signals rate limits via status field
+        if j.get("status") == "error":
+            code = j.get("code", 0)
+            msg  = j.get("message", "")
+            if code in (429, 400) or "api" in msg.lower() or "limit" in msg.lower():
+                print(f"[TD] Rate limit detected — circuit breaker 60 min: {msg[:60]}")
+                _mark_td_rate_limited(60)
+                return {"_limited": True}
+            print(f"[TD] API error {code}: {msg[:80]}")
+            return {"_error": True}
+        return j
+    except Exception as e:
+        print(f"[TD] Request failed: {e}")
+        return {"_error": True}
+
+
+def fetch_td_ohlcv(symbol: str, outputsize: int = 200) -> Optional[pd.DataFrame]:
+    """
+    Fetch daily OHLCV from Twelve Data.
+    Works for both forex (EUR/USD) and crypto (BTC/USD).
+    Returns a DataFrame sorted oldest→newest, or None on failure.
+    """
+    td_sym = _to_td_symbol(symbol)
+    cache_key = f"td_ohlcv_{symbol}"
+    if cache_key in _DATA_CACHE and time.time() - _DATA_CACHE[cache_key]["ts"] < CACHE_TTL:
+        return _DATA_CACHE[cache_key]["df"]
+
+    data = _fetch_td("/time_series", {
+        "symbol":     td_sym,
+        "interval":   "1day",
+        "outputsize": outputsize,
+        "type":       "price",
+    })
+
+    if "_limited" in data or "_error" in data or "_no_key" in data:
+        return None
+
+    values = data.get("values")
+    if not values:
+        print(f"[TD] No values for {td_sym}: {str(data)[:120]}")
+        return None
+
+    rows = []
+    for v in values:
+        try:
+            rows.append({
+                "time":   pd.to_datetime(v["datetime"]),
+                "open":   float(v.get("open", 0)),
+                "high":   float(v.get("high", 0)),
+                "low":    float(v.get("low",  0)),
+                "close":  float(v.get("close", 0)),
+                "volume": float(v.get("volume", 0) or 0),
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+    _DATA_CACHE[cache_key] = {"df": df, "ts": time.time()}
+    print(f"[TD] {symbol} — {len(df)} daily candles loaded")
+    return df
+
+
+def fetch_td_price(symbol: str) -> Optional[float]:
+    """
+    Fetch real-time price from Twelve Data.
+    Returns float price or None on failure.
+    """
+    td_sym = _to_td_symbol(symbol)
+    cache_key = f"td_price_{symbol}"
+    if cache_key in _DATA_CACHE and time.time() - _DATA_CACHE[cache_key]["ts"] < 60:
+        return _DATA_CACHE[cache_key]["price"]
+
+    data = _fetch_td("/price", {"symbol": td_sym})
+
+    if "_limited" in data or "_error" in data or "_no_key" in data:
+        return None
+
+    price_str = data.get("price")
+    if price_str is None:
+        return None
+
+    try:
+        price = float(price_str)
+        _DATA_CACHE[cache_key] = {"price": price, "ts": time.time()}
+        return price
+    except (ValueError, TypeError):
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -618,7 +779,7 @@ def _build_fallback_analysis(symbol: str) -> dict:
 # ─────────────────────────────────────────────────────────────────
 #  Main analysis entry point
 # ─────────────────────────────────────────────────────────────────
-def get_symbol_analysis(symbol: str) -> dict:
+def get_symbol_analysis(symbol: str, fetch_realtime_price: bool = True) -> dict:
     """
     Returns full technical analysis.
     Mode 1 (preferred): Real Alpha Vantage OHLCV + computed indicators
@@ -642,20 +803,38 @@ def get_symbol_analysis(symbol: str) -> dict:
     live_price_source = ""
     data_interval = ""
 
-    if crypto_base:
-        df = fetch_crypto_daily(crypto_base, market="USD")
-        quote = fetch_realtime_quote(crypto_base, "USD")
-        live_price = quote.get("price") or (float(df["close"].iloc[-1]) if df is not None else None)
-        live_price_source = "CURRENCY_EXCHANGE_RATE" if quote.get("price") else "DIGITAL_CURRENCY_DAILY"
-        data_interval = "daily candles (DIGITAL_CURRENCY_DAILY)"
-    else:
-        from_sym = symbol[:3]
-        to_sym   = symbol[3:]
-        df = fetch_forex_daily(from_sym, to_sym)
-        quote = fetch_realtime_quote(from_sym, to_sym)
-        live_price = quote.get("price") or (float(df["close"].iloc[-1]) if df is not None else None)
-        live_price_source = "CURRENCY_EXCHANGE_RATE" if quote.get("price") else "FX_DAILY"
-        data_interval = "daily candles (FX_DAILY)"
+    data_provider = "unknown"
+
+    # ── Step 1: Try Twelve Data (primary — 800 req/day) ──────────
+    if TWELVE_DATA_API_KEY and not _td_is_rate_limited():
+        df = fetch_td_ohlcv(symbol)
+        if df is not None and len(df) >= 30:
+            # Only fetch real-time price when explicitly requested (not during batch runs)
+            # to conserve the 8 calls/min rate limit — OHLCV close is sufficient for signals
+            td_price = fetch_td_price(symbol) if fetch_realtime_price else None
+            live_price = td_price or float(df["close"].iloc[-1])
+            live_price_source = "Twelve Data real-time" if td_price else "Twelve Data daily close"
+            data_interval = "200 daily candles"
+            data_provider  = "Twelve Data"
+            print(f"[TD] {symbol} — {len(df)} candles, price={live_price}")
+
+    # ── Step 2: Fall back to Alpha Vantage (25 req/day) ──────────
+    if df is None or len(df) < 30:
+        data_provider = "Alpha Vantage"
+        if crypto_base:
+            df = fetch_crypto_daily(crypto_base, market="USD")
+            quote = fetch_realtime_quote(crypto_base, "USD")
+            live_price = quote.get("price") or (float(df["close"].iloc[-1]) if df is not None else None)
+            live_price_source = "AV real-time rate" if quote.get("price") else "AV daily close"
+            data_interval = "daily candles"
+        else:
+            from_sym = symbol[:3]
+            to_sym   = symbol[3:]
+            df = fetch_forex_daily(from_sym, to_sym)
+            quote = fetch_realtime_quote(from_sym, to_sym)
+            live_price = quote.get("price") or (float(df["close"].iloc[-1]) if df is not None else None)
+            live_price_source = "AV real-time rate" if quote.get("price") else "AV daily close"
+            data_interval = "daily candles"
 
     # ── FALLBACK MODE: no usable candle data ─────────────────────
     if df is None or len(df) < 30:
@@ -752,7 +931,7 @@ def get_symbol_analysis(symbol: str) -> dict:
 
     result = {
         "symbol":             symbol,
-        "data_source":        f"Alpha Vantage ({data_interval})",
+        "data_source":        f"{data_provider} ({data_interval})",
         "live_price_source":  live_price_source,
         "live_price":         price,
         "candles_used":       len(df),
@@ -864,3 +1043,55 @@ def format_for_ai_prompt(symbol_or_analysis, analysis: dict = None) -> str:
         f"SELL → SL: {lv.get('atr_sl_for_sell')} | TP1: {lv.get('atr_tp1_sell')} | TP2: {lv.get('atr_tp2_sell')} | TP3: {lv.get('atr_tp3_sell')}",
     ]
     return "\n".join(lines)
+
+
+def format_for_ai_prompt_compact(analysis: dict) -> str:
+    """
+    Single-line compact format for batch signal generation.
+    Reduces tokens by ~5× vs full format — use in /predictions prompt.
+    Full format is still used for /advice, /chat, /live_data.
+    """
+    sym    = analysis.get("symbol", "?")
+    ai_only = analysis.get("ai_only_mode", False)
+    price  = analysis.get("live_price", "?")
+    ind    = analysis.get("indicators", {})
+    lv     = analysis.get("key_levels", {})
+    conf   = analysis.get("confluence", {})
+
+    if ai_only:
+        atr   = ind.get("atr_14", "?")
+        sl_b  = lv.get("atr_sl_for_buy", "?")
+        tp1_b = lv.get("atr_tp1_buy", "?")
+        tp2_b = lv.get("atr_tp2_buy", "?")
+        sl_s  = lv.get("atr_sl_for_sell", "?")
+        tp1_s = lv.get("atr_tp1_sell", "?")
+        tp2_s = lv.get("atr_tp2_sell", "?")
+        return (
+            f"{sym}[AI] price={price} ATR={atr} | "
+            f"BUY:SL={sl_b},TP1={tp1_b},TP2={tp2_b} | "
+            f"SELL:SL={sl_s},TP1={tp1_s},TP2={tp2_s}"
+        )
+
+    # Pull key values for compact line
+    rsi_raw  = str(ind.get("rsi_14",     "?")).split("—")[0].strip()
+    macd_dir = "BULL" if "BULLISH" in str(ind.get("macd_12_26_9", "")) else "BEAR"
+    adx_raw  = str(ind.get("adx_14",     "?")).split("(")[0].replace("ADX=", "").strip()
+    ema_dir  = "↑" if "BULLISH" in str(ind.get("ema_stack", "")) else "↓"
+    stoch_k  = str(ind.get("stochastic_14", "?")).split(" ")[0].replace("K=", "")
+    cdir     = conf.get("direction", "?")
+    cscore   = conf.get("score", 0)
+    tradeable = "✓" if conf.get("tradeable") else "✗ADX"
+
+    sl_b  = lv.get("atr_sl_for_buy",  "?")
+    tp1_b = lv.get("atr_tp1_buy",  "?")
+    tp2_b = lv.get("atr_tp2_buy",  "?")
+    sl_s  = lv.get("atr_sl_for_sell", "?")
+    tp1_s = lv.get("atr_tp1_sell", "?")
+    tp2_s = lv.get("atr_tp2_sell", "?")
+
+    return (
+        f"{sym}[LIVE] p={price} | conf={cdir}{cscore}/6 {tradeable} | "
+        f"RSI={rsi_raw} MACD={macd_dir} EMA={ema_dir} ADX={adx_raw} StochK={stoch_k} | "
+        f"BUY:SL={sl_b},TP1={tp1_b},TP2={tp2_b} | "
+        f"SELL:SL={sl_s},TP1={tp1_s},TP2={tp2_s}"
+    )

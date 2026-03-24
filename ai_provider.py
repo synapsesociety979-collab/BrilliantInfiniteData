@@ -1,5 +1,6 @@
 # ai_provider.py
 import os
+import time
 from groq import Groq
 
 api_key = os.getenv("GROQ_API_KEY")
@@ -28,25 +29,39 @@ def get_ai_response(prompt: str, temperature: float = 0.2,
                     max_tokens: int = 4096) -> str:
     """
     Send a prompt to Groq (llama-3.3-70b-versatile).
-    Uses a system message for ARIA's identity and a low temperature
-    (0.2) to reduce hallucination and keep numbers consistent.
+    Automatically retries once with a 30-second wait on rate-limit errors.
     """
-    try:
-        completion = client.chat.completions.create(
-            model    = "llama-3.3-70b-versatile",
-            messages = [
-                {"role": "system", "content": ARIA_SYSTEM},
-                {"role": "user",   "content": prompt},
-            ],
-            temperature = temperature,
-            max_tokens  = max_tokens,
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        err = str(e).lower()
-        if "rate_limit" in err or "quota" in err:
-            return "ERROR: AI rate limit reached — please wait a moment and try again."
-        return f"ERROR: {str(e)}"
+    for attempt in range(2):
+        try:
+            completion = client.chat.completions.create(
+                model    = "llama-3.3-70b-versatile",
+                messages = [
+                    {"role": "system", "content": ARIA_SYSTEM},
+                    {"role": "user",   "content": prompt},
+                ],
+                temperature = temperature,
+                max_tokens  = max_tokens,
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            err = str(e).lower()
+            if "rate_limit" in err or "quota" in err or "429" in err:
+                print(f"[GROQ] Rate limit detail: {str(e)[:300]}")
+                err_full = str(e)
+                # Detect daily (TPD) limit — retrying won't help, fail immediately
+                if "per day" in err_full or "tokens per day" in err_full or "tpd" in err_full.lower():
+                    print(f"[GROQ] Daily token limit hit — will not retry.")
+                    return "ERROR: AI rate limit reached — please wait a moment and try again."
+                if attempt == 0:
+                    # Per-minute TPM limit — wait 65 s for window to clear
+                    print(f"[GROQ] Per-minute rate limit — waiting 65 s before retry…")
+                    time.sleep(65)
+                    continue
+                # Second hit — give up
+                return "ERROR: AI rate limit reached — please wait a moment and try again."
+            print(f"[GROQ] Non-rate-limit error: {str(e)[:200]}")
+            return f"ERROR: {str(e)}"
+    return "ERROR: AI rate limit reached — please wait a moment and try again."
 
 
 def get_ai_response_creative(prompt: str, max_tokens: int = 2048) -> str:

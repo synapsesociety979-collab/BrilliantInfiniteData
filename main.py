@@ -31,7 +31,7 @@ from models import (
 )
 from trading_engine import RiskEngine, MarketFilter, TradeManager
 from market_data import (
-    get_symbol_analysis, format_for_ai_prompt, fetch_realtime_quote,
+    get_symbol_analysis, format_for_ai_prompt, format_for_ai_prompt_compact, fetch_realtime_quote,
     FALLBACK_PRICES, FALLBACK_ATR_PCT,
 )
 
@@ -116,7 +116,35 @@ def get_market_context() -> str:
 # ----------------------------
 PREDICTIONS_CACHE: Dict[str, Any] = {}
 ADVICE_CACHE: Dict[str, Any] = {}
-CACHE_TTL = 600
+CACHE_TTL = 3600          # 60 min prediction cache (preserves Groq's 100K TPD free tier)
+PRED_DISK_PATH = "/tmp/aria_pred_cache.json"
+_PRED_GENERATING = False   # lock to prevent simultaneous Groq calls
+
+def _load_pred_disk_cache() -> None:
+    """Load persisted predictions from disk — survives server restarts."""
+    global PREDICTIONS_CACHE
+    try:
+        with open(PRED_DISK_PATH, "r") as f:
+            raw = json.load(f)
+        now = time.time()
+        for k, v in raw.items():
+            age = now - v.get("ts", 0)
+            if age < CACHE_TTL * 6:   # keep up to 1 h stale — better than no signals
+                PREDICTIONS_CACHE[k] = v
+        if PREDICTIONS_CACHE:
+            print(f"[PRED-CACHE] Loaded {len(PREDICTIONS_CACHE)} prediction sets from disk")
+    except (FileNotFoundError, Exception):
+        pass
+
+def _save_pred_disk_cache() -> None:
+    """Persist predictions to disk after every successful generation."""
+    try:
+        with open(PRED_DISK_PATH, "w") as f:
+            json.dump(PREDICTIONS_CACHE, f, default=str)
+    except Exception as e:
+        print(f"[PRED-CACHE] Disk save failed: {e}")
+
+_load_pred_disk_cache()
 
 # ----------------------------
 # Symbol config
@@ -341,13 +369,27 @@ def _get_session_priority_symbols(h: int) -> List[str]:
 def generate_market_predictions(
     investment_amount_ngn: float = 0.0, user_profile: str = ""
 ) -> Dict[str, Any]:
-    global PREDICTIONS_CACHE
+    global PREDICTIONS_CACHE, _PRED_GENERATING
     now = time.time()
     cache_key = f"preds_{int(investment_amount_ngn)}"
     if cache_key in PREDICTIONS_CACHE and (
         now - PREDICTIONS_CACHE[cache_key]["ts"] < CACHE_TTL
     ):
         return PREDICTIONS_CACHE[cache_key]["data"]
+
+    # Thundering-herd guard: if another request is already generating,
+    # wait up to 90 s for it to populate the cache, then serve stale or fail
+    if _PRED_GENERATING:
+        for _ in range(18):          # wait up to 90 s (18 × 5 s polls)
+            time.sleep(5)
+            if cache_key in PREDICTIONS_CACHE:
+                return PREDICTIONS_CACHE[cache_key]["data"]
+        # Timed out waiting — serve stale disk cache if available
+        if cache_key in PREDICTIONS_CACHE:
+            return PREDICTIONS_CACHE[cache_key]["data"]
+        return {"success": False, "error": "Signal generation in progress — please retry shortly."}
+
+    _PRED_GENERATING = True
 
     ngn_rate = get_ngn_rate()
     inv_usd = investment_amount_ngn / ngn_rate if investment_amount_ngn > 0 else 0
@@ -374,8 +416,10 @@ def generate_market_predictions(
     print(f"[ARIA] Fetching real market data for {len(real_data_symbols)} symbols...")
     analyses_by_symbol: Dict[str, Dict] = {}   # ← store for post-AI validation
     for sym in real_data_symbols:
-        analysis = get_symbol_analysis(sym)
-        block = format_for_ai_prompt(analysis)
+        # fetch_realtime_price=False: use OHLCV last close during batch to save TD quota
+        analysis = get_symbol_analysis(sym, fetch_realtime_price=False)
+        # Use compact single-line format to stay well within Groq's 6000 TPM limit
+        block = format_for_ai_prompt_compact(analysis)
         live_data_blocks.append(block)
         analyses_by_symbol[sym] = analysis
         if analysis.get("live_price"):
@@ -402,9 +446,18 @@ def generate_market_predictions(
         )
     remaining_text = "\n".join(remaining_lines)
 
-    live_data_section = "\n\n".join(live_data_blocks)
+    live_data_section = "\n".join(live_data_blocks)   # compact: newline not double
+
+    # Detect which API actually provided data (for honest reporting)
+    _api_used = "Alpha Vantage"
+    for _a in analyses_by_symbol.values():
+        _src = _a.get("data_source", "")
+        if "Twelve Data" in _src or "twelve" in _src.lower():
+            _api_used = "Twelve Data"
+            break
+
     data_source_note = (
-        "LIVE Alpha Vantage data"
+        f"LIVE {_api_used} data ({len(real_data_symbols)} symbols)"
         if has_real_data
         else "AI pattern reasoning (live data unavailable)"
     )
@@ -420,25 +473,25 @@ Target: 5-12 signals. No artificial limit. If a clear setup exists, include it.
 {live_data_section if has_real_data else ""}
 
 SECTION A GATES (apply ONLY to symbols above with live data):
-✗ Confluence score 0-2/6 → exclude
+✗ Confluence score 0-1/6 → exclude (2/6+ is allowed)
 ✗ ADX < 20 → exclude (ranging market)
-✗ MACD histogram and RSI point opposite directions → exclude
-✗ R:R below 1:1.8 → exclude
-Confidence: score 5-6/6→88-97 | 4/6→80-87 | 3/6→73-79
+✗ AI direction opposite to confluence direction → exclude
+✗ R:R below 1:1.5 → exclude
+Confidence: score 5-6/6→88-95 | 4/6→80-87 | 3/6→75-79 | 2/6→73-74
 
 ━━━ SECTION B — AI REASONING (reference prices + ATR provided) ━━━
-For these symbols you do NOT have live candle data. Use your institutional knowledge
-of each asset's recent price action, macro drivers, and intermarket relationships.
-SL/TP levels below are pre-calculated from estimated ATR — use them.
+For these {len(remaining_symbols)} symbols use your institutional knowledge of recent price action,
+macro drivers, inter-market correlations and session behaviour.
+SL/TP levels below are ATR-derived — USE THEM EXACTLY. Expected: 3-6 signals from this section.
 
 {remaining_text if remaining_text else "(all symbols have live data)"}
 
-SECTION B GATES (apply to all Section B symbols + any Section A symbols that lost live data):
-✗ Skip only if RSI, MACD, AND EMA all point different directions (total disagreement)
-✗ R:R below 1:1.5 → exclude
-✓ If at least 2 of (RSI trend, MACD direction, EMA stack, price vs key level) agree → include
-Confidence cap: 78 max for AI reasoning
-Confluence: estimate as "X/3" (out of RSI/MACD/EMA only, since no other indicators)
+SECTION B GATES:
+✗ Only skip if you truly cannot determine any directional bias for the asset
+✓ Lean on session context: {session.split("—")[0].strip()} — favour pairs active now
+✓ Lean on macro: USD strength/weakness, risk-on/off, crypto market structure
+✓ Include if any 2 of: RSI trend, MACD direction, EMA bias, recent S/R level agree
+Confidence cap: 78 (ai_reasoning). Confluence: "X/3" (RSI/MACD/EMA).
 
 ━━━ SIGNAL RULES (both sections) ━━━
 - data_source = "live_data" for Section A, "ai_reasoning" for Section B
@@ -450,7 +503,7 @@ Confluence: estimate as "X/3" (out of RSI/MACD/EMA only, since no other indicato
 POSITION SIZING: 2% risk per trade
 Risk: {investment_amount_ngn * 0.02:,.0f} NGN = ${investment_amount_ngn * 0.02 / ngn_rate:.2f} USD
 
-Return ONLY a valid JSON array. No HOLD signals. No text outside brackets.
+Return ONLY a valid JSON array. No HOLD signals. No text outside the brackets. Keep each object compact — one signal ≈ 15 lines max.
 [
   {{
     "symbol": "SYMBOL",
@@ -459,47 +512,39 @@ Return ONLY a valid JSON array. No HOLD signals. No text outside brackets.
     "confluence_score": "X/6 or X/3",
     "data_source": "live_data|ai_reasoning",
     "category": "forex|crypto",
-    "timeframe": "scalp(5-15m)|intraday(1-4h)|swing(daily)",
+    "timeframe": "scalp|intraday|swing",
     "session_fit": "excellent|good|fair|poor",
-    "live_price": "number",
-    "entry_price": "number",
-    "stop_loss": "number",
-    "take_profit_1": "number",
-    "take_profit_2": "number",
-    "take_profit_3": "number",
+    "live_price": 0.0,
+    "entry_price": 0.0,
+    "stop_loss": 0.0,
+    "take_profit_1": 0.0,
+    "take_profit_2": 0.0,
+    "take_profit_3": 0.0,
     "risk_reward": "1:X.X",
-    "hold_time": "duration",
-    "position_size_ngn": "{investment_amount_ngn * 0.02:,.0f} NGN",
-    "position_size_usd": "${investment_amount_ngn * 0.02 / ngn_rate:.2f}",
-    "back_out_trigger": "invalidation price",
-    "indicators": {{
-      "rsi": "value/estimate + reading",
-      "macd": "direction + histogram",
-      "stochastic": "if available",
-      "adx": "if available",
-      "williams_r": "if available",
-      "ema_bias": "price vs EMAs",
-      "bollinger": "band position",
-      "pattern": "pattern if visible"
-    }},
-    "key_levels": {{
-      "support": "level",
-      "resistance": "level",
-      "pivot": "if available"
-    }},
-    "rationale": "2-3 sentences: cite specific indicators/macro drivers, entry logic, and main risk."
+    "hold_time": "Xh",
+    "back_out_trigger": 0.0,
+    "rationale": "One sentence: key indicator + setup logic."
   }}
 ]"""
 
     try:
-        content = get_ai_response(prompt)
+        content = get_ai_response(prompt, max_tokens=2048)
         if not content or content.startswith("ERROR:"):
-            return {"success": False, "error": content or "Empty response"}
+            # If stale cache exists, serve it rather than failing completely
+            if cache_key in PREDICTIONS_CACHE:
+                stale = PREDICTIONS_CACHE[cache_key]["data"]
+                stale_age_min = int((now - PREDICTIONS_CACHE[cache_key]["ts"]) / 60)
+                stale["_stale_cache"] = True
+                stale["_stale_age_min"] = stale_age_min
+                print(f"[ARIA] Rate limited — serving stale cache ({stale_age_min} min old)")
+                return stale
+            return {"success": False, "error": content or "Empty AI response"}
         content = re.sub(r"```json|```", "", content.strip()).strip()
         m = re.search(r"\[.*\]", content, re.DOTALL)
         if m:
             content = m.group(0)
         data = json.loads(content)
+        print(f"[ARIA] AI returned {len(data)} raw signals before Python gates")
 
         # ── PYTHON-LEVEL QUALITY GATES (hard rules AI cannot override) ──────────
         validated = []
@@ -522,16 +567,17 @@ Return ONLY a valid JSON array. No HOLD signals. No text outside brackets.
             # Gate 3: live-data signals must pass Python confluence check
             if src == "live_data" and sym in analyses_by_symbol:
                 calc = analyses_by_symbol[sym].get("confluence", {})
-                calc_dir    = calc.get("direction", "NEUTRAL")   # BUY/SELL/NEUTRAL
-                calc_score  = int(calc.get("score", 0))
+                calc_dir       = calc.get("direction", "NEUTRAL")
+                calc_score     = int(calc.get("score", 0))
                 calc_tradeable = calc.get("tradeable", True)
 
-                # Must have at least 3 indicators agreeing
-                if calc_score < 3:
-                    print(f"[GATE] Rejected {sym} {sig}: confluence {calc_score}/6 < 3")
+                # Need at least 2 indicators agreeing (was 3 — lowered for real data
+                # where markets are often mixed; auto-trader still requires 3)
+                if calc_score < 2:
+                    print(f"[GATE] Rejected {sym} {sig}: confluence {calc_score}/6 < 2")
                     continue
 
-                # Signal direction must match calculated confluence direction
+                # Direction must not be opposite to what Python calculated
                 is_buy  = sig in ("BUY", "STRONG_BUY")
                 is_sell = sig in ("SELL", "STRONG_SELL")
                 if is_buy  and calc_dir == "SELL":
@@ -540,8 +586,10 @@ Return ONLY a valid JSON array. No HOLD signals. No text outside brackets.
                 if is_sell and calc_dir == "BUY":
                     print(f"[GATE] Rejected {sym} {sig}: AI says SELL but Python says BUY")
                     continue
-                if calc_dir == "NEUTRAL" and calc_score < 3:
-                    print(f"[GATE] Rejected {sym} {sig}: NEUTRAL market (score={calc_score})")
+
+                # Fully neutral market with weak score → reject (was < 3, now < 2)
+                if calc_dir == "NEUTRAL" and calc_score < 2:
+                    print(f"[GATE] Rejected {sym} {sig}: NEUTRAL market, score only {calc_score}/6")
                     continue
 
                 # ADX gate: market must be trending (not ranging)
@@ -549,29 +597,42 @@ Return ONLY a valid JSON array. No HOLD signals. No text outside brackets.
                     print(f"[GATE] Rejected {sym} {sig}: ADX <20 (ranging market)")
                     continue
 
-                # Confidence must match confluence score
-                if calc_score <= 3 and conf > 80:
-                    s["confidence"] = 76   # cap overconfident AI signals
-                elif calc_score == 4 and conf > 87:
-                    s["confidence"] = 85
-                elif calc_score >= 5 and conf > 97:
-                    s["confidence"] = 95
+                # Confidence scaled to confluence score
+                if calc_score >= 5:
+                    if conf > 95: s["confidence"] = 93
+                elif calc_score == 4:
+                    if conf > 87: s["confidence"] = 85
+                elif calc_score == 3:
+                    if conf > 79: s["confidence"] = 77
+                else:  # score == 2
+                    if conf > 73: s["confidence"] = 73
 
-                # Stamp the verified confluence score on the signal
-                s["confluence_score"] = f"{calc_score}/6"
+                # Signal quality label (for UI — auto-trader uses 3+ only)
+                if calc_score >= 4:
+                    s["signal_quality"] = "strong"
+                elif calc_score == 3:
+                    s["signal_quality"] = "moderate"
+                else:
+                    s["signal_quality"] = "weak — monitor only"
+
+                # Stamp the verified confluence data
+                s["confluence_score"]     = f"{calc_score}/6"
                 s["confluence_direction"] = calc_dir
+                s["auto_trade_eligible"]  = calc_score >= 3 and calc_tradeable
 
             elif src == "ai_reasoning":
                 # Cap AI-only signals at 78%
                 if conf > 78:
                     s["confidence"] = 78
+                s["signal_quality"]      = "ai_reasoning"
+                s["auto_trade_eligible"] = False
                 # Normalise confluence_score string (AI sometimes returns "4/3" etc.)
                 raw_cs = str(s.get("confluence_score", "0/3"))
                 try:
                     parts = raw_cs.split("/")
                     num   = int(parts[0])
                     denom = int(parts[1]) if len(parts) > 1 else 3
-                    num   = min(num, denom)          # clamp (4/3 → 3/3)
+                    num   = min(num, denom)
                     s["confluence_score"] = f"{num}/{denom}"
                 except Exception:
                     s["confluence_score"] = raw_cs
@@ -601,12 +662,15 @@ Return ONLY a valid JSON array. No HOLD signals. No text outside brackets.
             "total_signals": len(data),
             "strong_signals_count": len(strong),
             "top_picks": strong[:5],
-            "disclaimer": "Signals are data-driven using live Alpha Vantage feeds. Trading involves substantial risk.",
+            "disclaimer": "Signals are data-driven using live market feeds (Twelve Data / Alpha Vantage). Trading involves substantial risk.",
         }
         PREDICTIONS_CACHE[cache_key] = {"data": result, "ts": now}
+        _save_pred_disk_cache()
         return result
     except Exception as e:
         return {"success": False, "error": f"Prediction failed: {str(e)}"}
+    finally:
+        _PRED_GENERATING = False
 
 
 # ----------------------------
