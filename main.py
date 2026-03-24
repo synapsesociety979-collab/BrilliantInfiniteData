@@ -1089,24 +1089,63 @@ def get_trading_advice(
     if username:
         user = get_or_create_user(username, db)
         log_activity(user, "viewed_advice", symbol=symbol, db=db)
-    live_price = get_live_price(symbol)
-    prompt = f"""Deep institutional analysis for {symbol}. Live price: {live_price}.
+
+    # Fetch full live indicator analysis (not just price)
+    analysis  = get_symbol_analysis(symbol)
+    live_block = format_for_ai_prompt(analysis)
+    live_price = analysis.get("live_price", "unavailable")
+    conf       = analysis.get("confluence", {})
+    has_live   = not analysis.get("ai_only_mode", True)
+
+    prompt = f"""━━━ INSTITUTIONAL DEEP ANALYSIS REQUEST: {symbol} ━━━
+
+{"LIVE INDICATOR DATA (use exact values):" if has_live else "AI reasoning mode — no live candles:"}
+{live_block}
+
+{"CONFLUENCE: " + str(conf.get("direction","?")) + " | Score " + str(conf.get("score",0)) + "/6 | Tradeable: " + str(conf.get("tradeable","?")) if has_live else ""}
+
+Provide a comprehensive institutional-grade analysis. Use the EXACT indicator values above.
+{"Do NOT say you lack real-time data — the live data is shown above." if has_live else "State clearly this is AI pattern reasoning."}
+
 Return ONLY valid JSON:
 {{
-  "symbol": "{symbol}", "live_price": "{live_price}",
-  "recommendation": "BUY|SELL|HOLD", "confidence": 0-99,
+  "symbol": "{symbol}",
+  "live_price": "{live_price}",
+  "data_source": "{"live_data" if has_live else "ai_reasoning"}",
+  "confluence_score": "{conf.get("score",0)}/6",
+  "recommendation": "BUY|SELL|HOLD",
+  "confidence": 0-97,
   "trade_setup": {{
-    "entry": "price", "stop_loss": "ATR-based",
-    "take_profit_1": "1:1", "take_profit_2": "1:2", "take_profit_3": "1:3",
-    "risk_reward": "1:X", "hold_time": "duration"
+    "entry": "exact price",
+    "stop_loss": "ATR-based level from data",
+    "take_profit_1": "1:1.5 target",
+    "take_profit_2": "1:3 target",
+    "take_profit_3": "1:4.5 target",
+    "risk_reward": "1:X",
+    "hold_time": "duration"
   }},
   "technical_analysis": {{
-    "trend": "bullish/bearish/ranging", "rsi": "value + interpretation",
-    "macd": "signal", "ema_stack": "alignment", "volume": "assessment",
-    "key_support": "level", "key_resistance": "level", "pattern": "detected pattern"
+    "trend": "bullish/bearish/ranging",
+    "rsi": "EXACT value from live data + interpretation",
+    "macd": "EXACT histogram value + direction",
+    "stochastic": "K/D values + zone",
+    "adx": "EXACT ADX + trend strength",
+    "williams_r": "value + zone",
+    "ema_stack": "EXACT EMA alignment",
+    "bollinger": "band position",
+    "pivot_points": "P / R1 / S1 from data",
+    "key_support": "exact level from data",
+    "key_resistance": "exact level from data",
+    "pattern": "detected candle pattern"
   }},
-  "risk_assessment": {{"risk_level": "low/medium/high", "max_position_pct": "X%", "invalidation": "condition"}},
-  "rationale": "3 institutional sentences with specific levels"
+  "market_context": "1-2 sentences on macro/session drivers for {symbol} right now",
+  "risk_assessment": {{
+    "risk_level": "low/medium/high",
+    "max_position_pct": "2%",
+    "invalidation": "exact price that kills the thesis",
+    "news_risk": "any upcoming events that could move {symbol}"
+  }},
+  "rationale": "3 sentences using exact indicator values from the live data block"
 }}"""
     try:
         content = get_ai_response(prompt)
@@ -1118,6 +1157,7 @@ Return ONLY valid JSON:
         result = {
             "success": True,
             "generated_at": datetime.utcnow().isoformat(),
+            "live_data_used": has_live,
             "advice": data,
         }
         ADVICE_CACHE[symbol] = {"data": result, "ts": now}
@@ -1432,10 +1472,54 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
     signals = preds.get("signals", [])
     profile = get_user_profile_summary(user, db)
 
+    # ── detect symbols mentioned in the message and fetch live data ──
+    # Map common aliases so users can type "EUR/USD", "bitcoin", "BTC" etc.
+    SYMBOL_ALIASES = {
+        "EUR/USD": "EURUSD", "GBP/USD": "GBPUSD", "USD/JPY": "USDJPY",
+        "AUD/USD": "AUDUSD", "USD/CAD": "USDCAD", "NZD/USD": "NZDUSD",
+        "USD/CHF": "USDCHF", "EUR/GBP": "EURGBP", "EUR/JPY": "EURJPY",
+        "GBP/JPY": "GBPJPY", "AUD/JPY": "AUDJPY", "EUR/CAD": "EURCAD",
+        "AUD/CAD": "AUDCAD", "EUR/AUD": "EURAUD", "GBP/AUD": "GBPAUD",
+        "BITCOIN": "BTCUSDT", "BTC": "BTCUSDT", "ETHEREUM": "ETHUSDT",
+        "ETH": "ETHUSDT", "BNB": "BNBUSDT", "XRP": "XRPUSDT",
+        "SOL": "SOLUSDT", "ADA": "ADAUSDT", "DOGE": "DOGEUSDT",
+        "DOT": "DOTUSDT", "MATIC": "MATICUSDT", "LTC": "LTCUSDT",
+        "SHIB": "SHIBUSDT", "TRX": "TRXUSDT", "AVAX": "AVAXUSDT",
+        "LINK": "LINKUSDT", "UNI": "UNIUSDT",
+    }
+    msg_upper = chat.message.upper()
+    mentioned_symbols = []
+    # Check direct symbol names first
+    for sym in TRADING_SYMBOLS:
+        if sym in msg_upper or sym.replace("USDT","") in msg_upper:
+            mentioned_symbols.append(sym)
+    # Check aliases
+    for alias, sym in SYMBOL_ALIASES.items():
+        if alias in msg_upper and sym not in mentioned_symbols:
+            mentioned_symbols.append(sym)
+    mentioned_symbols = mentioned_symbols[:3]  # max 3 per message to respect rate limits
+
+    # Fetch live indicator data for each mentioned symbol
+    live_data_blocks_chat = []
+    for sym in mentioned_symbols:
+        try:
+            analysis = get_symbol_analysis(sym)
+            block = format_for_ai_prompt(analysis)
+            conf = analysis.get("confluence", {})
+            live_data_blocks_chat.append(
+                f"── {sym} LIVE DATA ──\n{block}\n"
+                f"CONFLUENCE: {conf.get('direction','?')} | Score {conf.get('score',0)}/6 | "
+                f"Tradeable: {conf.get('tradeable','?')}"
+            )
+        except Exception as ex:
+            live_data_blocks_chat.append(f"── {sym}: data fetch error ({ex})")
+
+    live_data_section_chat = "\n\n".join(live_data_blocks_chat) if live_data_blocks_chat else ""
+
     # ── build system prompt ──
     system_prompt = f"""You are ARIA — Advanced Revenue Intelligence Analyst.
 You are a world-class AI trading strategist with a warm, confident personality.
-You remember everything about the people you work with and use that knowledge naturally.
+You have ACCESS TO REAL-TIME LIVE MARKET DATA — use it whenever it is provided below.
 
 ━━━ WHO YOU ARE TALKING TO ━━━
 Name: {name}
@@ -1446,37 +1530,31 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 ━━━ WHAT YOU REMEMBER ABOUT {name.upper()} ━━━
 {memories}
 
-━━━ CURRENT TOP MARKET SIGNALS ━━━
-{
-        json.dumps(
-            [
-                {
-                    "symbol": s.get("symbol"),
-                    "signal": s.get("signal"),
-                    "confidence": s.get("confidence"),
-                    "entry": s.get("entry_price"),
-                    "data_source": s.get("data_source"),
-                }
-                for s in signals[:5]
-            ],
-            indent=2,
-        )
-    }
+{"━━━ LIVE MARKET DATA FOR MENTIONED SYMBOL(S) ━━━" if live_data_section_chat else ""}
+{live_data_section_chat}
+{"IMPORTANT: Use the EXACT indicator values above. Do not say you lack real-time data — you have it." if live_data_section_chat else ""}
 
-━━━ THIS CONVERSATION (recent history) ━━━
-{history_text if history_text else "This is the start of this conversation."}
+━━━ CURRENT TOP SIGNALS (from live analysis engine) ━━━
+{json.dumps([{
+    "symbol": s.get("symbol"), "signal": s.get("signal"),
+    "confidence": s.get("confidence"), "entry": s.get("entry_price"),
+    "sl": s.get("stop_loss"), "tp1": s.get("take_profit_1"),
+    "data_source": s.get("data_source"),
+} for s in signals[:6]], indent=2)}
+
+━━━ THIS CONVERSATION ━━━
+{history_text if history_text else "New conversation."}
 
 ━━━ YOUR RULES ━━━
-1. Address {name} by name naturally — not every sentence, just when it flows
-2. If {name} shares personal info, acknowledge it warmly and remember it
-3. Any NGN amount → instantly show: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD
-4. Recommend 2% risk per trade for {user.trading_style} / {user.risk_tolerance} risk
-5. Show exact maths — never say "roughly" without the actual calculation
-6. If {name} asks for a trade signal: cite confluence score, ADX, and at least 3 indicators
-7. If you don't know a live price or news event, say so clearly — don't invent data
-8. When giving a signal: always state the invalidation level (back-out trigger)
-9. Tone: warm, direct, institutional confidence — never hype, never guaranteed profits
-10. End trade recommendations with a one-line risk note"""
+1. Address {name} by name naturally — not every sentence
+2. If live indicator data is shown above for a symbol, USE IT — state exact RSI, MACD, confluence, ATR levels
+3. NEVER say "I don't have real-time data" when data is shown in this prompt — you do have it
+4. Any NGN amount → instantly show USD: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD
+5. Recommend 2% risk per trade for {user.trading_style} / {user.risk_tolerance} risk
+6. Show exact maths — no approximations without the calculation
+7. Signal format: direction, entry, SL (ATR-based), TP1/TP2/TP3, confluence score, back-out trigger
+8. Tone: warm, direct, institutional — no hype, no guaranteed profit language
+9. End any trade recommendation with a one-line risk disclaimer"""
 
     full_prompt = f"{system_prompt}\n\n{name}: {chat.message}\nARIA:"
     response = get_ai_response_creative(full_prompt)
