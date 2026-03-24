@@ -1473,31 +1473,58 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
     profile = get_user_profile_summary(user, db)
 
     # ── detect symbols mentioned in the message and fetch live data ──
-    # Map common aliases so users can type "EUR/USD", "bitcoin", "BTC" etc.
     SYMBOL_ALIASES = {
+        # Standard slash format
         "EUR/USD": "EURUSD", "GBP/USD": "GBPUSD", "USD/JPY": "USDJPY",
         "AUD/USD": "AUDUSD", "USD/CAD": "USDCAD", "NZD/USD": "NZDUSD",
         "USD/CHF": "USDCHF", "EUR/GBP": "EURGBP", "EUR/JPY": "EURJPY",
         "GBP/JPY": "GBPJPY", "AUD/JPY": "AUDJPY", "EUR/CAD": "EURCAD",
         "AUD/CAD": "AUDCAD", "EUR/AUD": "EURAUD", "GBP/AUD": "GBPAUD",
-        "BITCOIN": "BTCUSDT", "BTC": "BTCUSDT", "ETHEREUM": "ETHUSDT",
-        "ETH": "ETHUSDT", "BNB": "BNBUSDT", "XRP": "XRPUSDT",
-        "SOL": "SOLUSDT", "ADA": "ADAUSDT", "DOGE": "DOGEUSDT",
-        "DOT": "DOTUSDT", "MATIC": "MATICUSDT", "LTC": "LTCUSDT",
-        "SHIB": "SHIBUSDT", "TRX": "TRXUSDT", "AVAX": "AVAXUSDT",
-        "LINK": "LINKUSDT", "UNI": "UNIUSDT",
+        # Reversed slash format (users often type these)
+        "USD/EUR": "EURUSD", "USD/GBP": "GBPUSD", "JPY/USD": "USDJPY",
+        "CAD/USD": "USDCAD", "CHF/USD": "USDCHF", "GBP/EUR": "EURGBP",
+        "JPY/EUR": "EURJPY", "JPY/GBP": "GBPJPY", "JPY/AUD": "AUDJPY",
+        "CAD/EUR": "EURCAD", "CAD/AUD": "AUDCAD", "AUD/EUR": "EURAUD",
+        "AUD/GBP": "GBPAUD",
+        # Dot format
+        "EUR.USD": "EURUSD", "GBP.USD": "GBPUSD", "USD.JPY": "USDJPY",
+        # Short names / natural language
+        "CABLE": "GBPUSD", "FIBER": "EURUSD", "LOONIE": "USDCAD",
+        "SWISSY": "USDCHF", "KIWI": "NZDUSD", "AUSSIE": "AUDUSD",
+        "EURO": "EURUSD",
+        # Crypto names & tickers
+        "BITCOIN": "BTCUSDT", "BTC": "BTCUSDT",
+        "ETHEREUM": "ETHUSDT", "ETH": "ETHUSDT",
+        "BNB": "BNBUSDT", "BINANCE COIN": "BNBUSDT",
+        "XRP": "XRPUSDT", "RIPPLE": "XRPUSDT",
+        "SOL": "SOLUSDT", "SOLANA": "SOLUSDT",
+        "ADA": "ADAUSDT", "CARDANO": "ADAUSDT",
+        "DOGE": "DOGEUSDT", "DOGECOIN": "DOGEUSDT",
+        "DOT": "DOTUSDT", "POLKADOT": "DOTUSDT",
+        "MATIC": "MATICUSDT", "POLYGON": "MATICUSDT",
+        "LTC": "LTCUSDT", "LITECOIN": "LTCUSDT",
+        "SHIB": "SHIBUSDT", "SHIBA": "SHIBUSDT",
+        "TRX": "TRXUSDT", "TRON": "TRXUSDT",
+        "AVAX": "AVAXUSDT", "AVALANCHE": "AVAXUSDT",
+        "LINK": "LINKUSDT", "CHAINLINK": "LINKUSDT",
+        "UNI": "UNIUSDT", "UNISWAP": "UNIUSDT",
     }
     msg_upper = chat.message.upper()
     mentioned_symbols = []
-    # Check direct symbol names first
+    # Check direct symbol names first (exact match or crypto without USDT)
     for sym in TRADING_SYMBOLS:
-        if sym in msg_upper or sym.replace("USDT","") in msg_upper:
+        if sym in msg_upper:
             mentioned_symbols.append(sym)
-    # Check aliases
-    for alias, sym in SYMBOL_ALIASES.items():
+        elif sym.endswith("USDT") and sym[:-4] in msg_upper.split():
+            # Only add ticker-only match if it's a standalone word (avoids "ADA" matching "CANADA")
+            if sym not in mentioned_symbols:
+                mentioned_symbols.append(sym)
+    # Check aliases (longer aliases first to avoid partial clobbers)
+    for alias in sorted(SYMBOL_ALIASES.keys(), key=len, reverse=True):
+        sym = SYMBOL_ALIASES[alias]
         if alias in msg_upper and sym not in mentioned_symbols:
             mentioned_symbols.append(sym)
-    mentioned_symbols = mentioned_symbols[:3]  # max 3 per message to respect rate limits
+    mentioned_symbols = mentioned_symbols[:3]  # max 3 per message
 
     # Fetch live indicator data for each mentioned symbol
     live_data_blocks_chat = []
@@ -1547,14 +1574,25 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 
 ━━━ YOUR RULES ━━━
 1. Address {name} by name naturally — not every sentence
-2. If live indicator data is shown above for a symbol, USE IT — state exact RSI, MACD, confluence, ATR levels
-3. NEVER say "I don't have real-time data" when data is shown in this prompt — you do have it
-4. Any NGN amount → instantly show USD: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD
-5. Recommend 2% risk per trade for {user.trading_style} / {user.risk_tolerance} risk
-6. Show exact maths — no approximations without the calculation
-7. Signal format: direction, entry, SL (ATR-based), TP1/TP2/TP3, confluence score, back-out trigger
-8. Tone: warm, direct, institutional — no hype, no guaranteed profit language
-9. End any trade recommendation with a one-line risk disclaimer"""
+2. If LIVE DATA is shown above for any symbol, YOU MUST derive a signal from it — do NOT say "I don't have a signal for this pair" or "it's not in my top signals". The top-signals list is supplementary. Your primary analysis comes from the live data block.
+3. NEVER say "I don't have real-time data" when data is shown in this prompt — you have it
+4. If a user asks about a pair NOT in the live data block above, pick the closest signal from the top-signals list and note the similarity
+5. Any NGN amount → instantly show USD: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD
+6. Recommend 2% risk per trade for {user.trading_style} / {user.risk_tolerance} risk
+7. Show exact maths — no approximations without the calculation
+8. REQUIRED signal format (use every time you give a signal):
+   • Pair + Direction (BUY/SELL)
+   • Entry: [exact price from data]
+   • Stop Loss: [ATR-based level] ([X pips / X%])
+   • TP1: [level] — [estimated X–Y hours]
+   • TP2: [level] — [estimated X–Y hours/days]
+   • TP3: [level] — [estimated X–Y days]
+   • Confluence: [score]/6 — [2-word strength label]
+   • Exit if: [exact invalidation condition]
+   • Data: [live / AI-reasoning]
+9. Hold time MUST be in real time units: minutes (< 1h), hours (1h–48h), or days (> 48h). Never say "short-term" without a number.
+10. Tone: warm, direct, institutional — no hype, no guaranteed profit language
+11. End every trade recommendation with: ⚠️ Risk: [one-sentence disclaimer]"""
 
     full_prompt = f"{system_prompt}\n\n{name}: {chat.message}\nARIA:"
     response = get_ai_response_creative(full_prompt)

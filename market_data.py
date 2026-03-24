@@ -20,8 +20,56 @@ ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 BASE_URL = "https://www.alphavantage.co/query"
 
 _DATA_CACHE: Dict[str, dict] = {}
-CACHE_TTL     = 900   # 15 min cache for live data
-FALLBACK_TTL  = 120   # 2 min cache for AI-only mode (refresh more often)
+CACHE_TTL     = 900    # 15 min cache for live data
+FALLBACK_TTL  = 300    # 5 min cache for AI-only mode
+
+# ── Disk-backed cache ─────────────────────────────────────────────
+# Survives server restarts so we don't blow through AV rate limits
+# on every redeploy.
+import json as _json
+_DISK_CACHE_PATH = "/tmp/aria_market_cache.json"
+
+def _load_disk_cache() -> None:
+    """Load persisted cache from disk into _DATA_CACHE on startup."""
+    global _DATA_CACHE
+    try:
+        with open(_DISK_CACHE_PATH, "r") as f:
+            raw = _json.load(f)
+        now = time.time()
+        # Only keep entries that haven't fully expired (use 2× TTL so we
+        # still have something to serve while we try to refresh)
+        for k, v in raw.items():
+            age = now - v.get("ts", 0)
+            ttl = FALLBACK_TTL if v["data"].get("ai_only_mode") else CACHE_TTL
+            if age < ttl * 2:
+                _DATA_CACHE[k] = v
+        print(f"[CACHE] Loaded {len(_DATA_CACHE)} entries from disk")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[CACHE] Disk load error (non-fatal): {e}")
+
+def _save_disk_cache() -> None:
+    """Persist the current in-memory cache to disk."""
+    try:
+        with open(_DISK_CACHE_PATH, "w") as f:
+            _json.dump(_DATA_CACHE, f)
+    except Exception as e:
+        print(f"[CACHE] Disk save error (non-fatal): {e}")
+
+_load_disk_cache()   # run on import
+
+# ── AV rate-limit circuit breaker ────────────────────────────────
+# If AV rate-limits us, stop hammering it for 30 min.
+_AV_RATE_LIMITED_UNTIL: float = 0.0   # unix timestamp
+
+def _av_is_rate_limited() -> bool:
+    return time.time() < _AV_RATE_LIMITED_UNTIL
+
+def _mark_av_rate_limited(minutes: int = 30) -> None:
+    global _AV_RATE_LIMITED_UNTIL
+    _AV_RATE_LIMITED_UNTIL = time.time() + minutes * 60
+    print(f"[AV] Circuit breaker: pausing AV calls for {minutes} min")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -95,6 +143,9 @@ def normalize_symbol(symbol: str) -> str:
 def _fetch_av(params: dict, timeout: int = 15) -> dict:
     if not ALPHA_VANTAGE_API_KEY:
         return {"_no_key": True}
+    # Circuit breaker: if we've been rate-limited recently, skip all AV calls
+    if _av_is_rate_limited():
+        return {"_limited": True}
     params["apikey"] = ALPHA_VANTAGE_API_KEY
     try:
         r = requests.get(BASE_URL, params=params, timeout=timeout)
@@ -102,7 +153,8 @@ def _fetch_av(params: dict, timeout: int = 15) -> dict:
         j = r.json()
         if "Note" in j or "Information" in j:
             msg = j.get("Note") or j.get("Information", "")
-            print(f"[AV] Rate limit: {msg[:80]}")
+            print(f"[AV] Rate limit detected — engaging circuit breaker for 30 min: {msg[:60]}")
+            _mark_av_rate_limited(30)
             return {"_limited": True}
         if "Error Message" in j:
             print(f"[AV] Error: {j['Error Message']}")
@@ -615,6 +667,7 @@ def get_symbol_analysis(symbol: str) -> dict:
             result["data_source"] = "Live price only (candle data paused — rate limit)"
             result["ai_only_mode"] = False  # we have a real price, just no candles
         _DATA_CACHE[cache_key] = {"data": result, "ts": time.time()}
+        _save_disk_cache()
         return result
 
     # ── FULL MODE: real OHLCV + indicators ───────────────────────
@@ -743,6 +796,7 @@ def get_symbol_analysis(symbol: str) -> dict:
     }
 
     _DATA_CACHE[cache_key] = {"data": result, "ts": time.time()}
+    _save_disk_cache()
     return result
 
 
