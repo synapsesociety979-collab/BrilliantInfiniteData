@@ -1302,13 +1302,11 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
         json.dumps(
             [
                 {
-                    {
-                        "symbol": s.get("symbol"),
-                        "signal": s.get("signal"),
-                        "confidence": s.get("confidence"),
-                        "entry": s.get("entry_price"),
-                        "data_source": s.get("data_source"),
-                    }
+                    "symbol": s.get("symbol"),
+                    "signal": s.get("signal"),
+                    "confidence": s.get("confidence"),
+                    "entry": s.get("entry_price"),
+                    "data_source": s.get("data_source"),
                 }
                 for s in signals[:5]
             ],

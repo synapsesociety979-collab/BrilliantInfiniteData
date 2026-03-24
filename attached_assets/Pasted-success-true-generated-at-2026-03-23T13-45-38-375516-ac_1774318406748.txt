@@ -1,0 +1,69 @@
+success": true,
+  "generated_at": "2026-03-23T13:45:38.375516",
+  "active_session": "London/NY Overlap — PEAK liquidity, all pairs active",
+  "data_quality": {
+    "source": "LIVE Alpha Vantage data",
+    "live_data_symbols": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY",
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT",
+      "USDCAD",
+      "USDCHF",
+      "EURGBP",
+      "GBPJPY",
+      "EURJPY",
+      "XRPUSDT"
+    ],
+    "signals_from_live_data": 1,
+    "signals_from_ai_reasoning": 0
+  },
+  "investment_context_ngn": 0,
+  "usd_ngn_rate": 1361.22,
+  "model": "llama-3.3-70b-versatile",
+  "signals": [
+    {
+      "symbol": "EURJPY",
+      "signal": "BUY",
+      "confidence": 78,
+      "confluence_score": "2/6",
+      "data_source": "live_data",
+      "category": "forex",
+      "timeframe": "intraday",
+      "session_fit": "good",
+      "live_price": "183.875",
+      "entry_price": "183.875",
+      "stop_loss": "182.129643",
+      "take_profit_1": "185.620357",
+      "take_profit_2": "187.365714",
+      "take_profit_3": "189.111071",
+      "risk_reward": "1:1.9",
+      "hold_time": "4-8 hours",
+      "position_size_ngn": "0 NGN",
+      "position_size_usd": "$0.00",
+      "back_out_trigger": "180.77",
+      "indicators": {
+        "rsi": "49.82 - neutral",
+        "macd": "+0.023294 - bullish",
+        "stochastic": "K=82.27 D=52.86 - overbought zone",
+        "adx": "20.17 - weakening trend",
+        "williams_r": "-17.73 - overbought",
+        "ema_bias": "price above EMA20 and EMA50 - bullish stack",
+        "bollinger": "squeeze - tight bands",
+        "pattern": "bullish candle"
+      },
+      "key_levels": {
+        "support": "180.77",
+        "resistance": "186.86",
+        "pivot": "182.723333"
+      },
+      "rationale": "The EURJPY pair has a confluence score of 2/6, with a bullish MACD histogram and a price above the EMA20 and EMA50, indicating a bullish stack. The stochastic oscillator is in the overbought zone, but the strong bullish candle pattern and the squeeze in the Bollinger bands suggest a potential breakout. The strongest reason for this trade is the bullish MACD histogram, which indicates a potential trend reversal."
+    }
+  ],
+  "total_signals": 1,
+  "strong_signals_count": 0,
+  "top_picks": [],
+  "disclaimer": "Signals are data-driven using live Alpha Vantage feeds. Trading involves substantial risk."
+}
