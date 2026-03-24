@@ -232,10 +232,20 @@ def fetch_queue() -> list:
             params={"bridge_key": BRIDGE_KEY},
             timeout=10,
         )
+        if r.status_code == 403:
+            log.error("❌ BRIDGE KEY REJECTED — update BRIDGE_API_KEY in your .env file")
+            log.error(f"   Current key in .env: {BRIDGE_KEY[:20]}...")
+            return []
+        if r.status_code != 200:
+            log.warning(f"Queue poll returned HTTP {r.status_code}: {r.text[:100]}")
+            return []
         data = r.json()
-        return data.get("orders", [])
+        orders = data.get("orders", [])
+        if orders:
+            log.info(f"📥 {len(orders)} order(s) received from backend")
+        return orders
     except Exception as e:
-        log.debug(f"fetch_queue error: {e}")
+        log.warning(f"fetch_queue error: {e}")
         return []
 
 
@@ -504,7 +514,7 @@ def main():
             # ── Process queued orders ─────────────────────────────────────────
             orders = fetch_queue()
             for order in orders:
-                order_id = order.get("id", "")
+                order_id = order.get("order_id", order.get("id", ""))
                 log.info(f"📋 Order received: {order.get('direction')} {order.get('symbol')} "
                          f"lot={order.get('lot_size')} conf={order.get('signal_confidence')}")
 
