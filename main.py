@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-import os, json, re, time, requests, random, math
+import os, json, re, time, requests, random, math, threading
 from datetime import datetime, timedelta
 from ai_provider import get_ai_response, get_ai_response_creative
 from sqlalchemy.orm import Session
@@ -944,6 +944,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def start_auto_scheduler():
+    """Launch the 24/7 auto-trading scheduler as a background daemon thread."""
+    t = threading.Thread(target=_auto_trade_scheduler, daemon=True)
+    t.start()
+    print("[SCHEDULER] 24/7 auto-trade scheduler started")
 
 
 # ----------------------------
@@ -2552,6 +2560,11 @@ class ClosedRequest(BaseModel):
 class BridgeConnectRequest(BaseModel):
     account_info: Optional[Dict[str, Any]] = None
     bridge_version: Optional[str] = "1.0"
+    bridge_key: Optional[str] = None
+    mt5_account: Optional[int] = None
+    mt5_server: Optional[str] = None
+    balance: Optional[float] = None
+    equity: Optional[float] = None
 
 
 # ── Helper: verify bridge key ─────────────────────────────────────
@@ -2972,15 +2985,24 @@ def bridge_connect(
     db: Session = Depends(get_db),
 ):
     """MT5 bridge calls this on startup to register itself."""
-    from fastapi import Header
-
     user = db.query(User).filter(User.username == username).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Save live balance/equity so the scheduler can use them for lot sizing
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    if cfg:
+        if req.balance is not None:
+            cfg.mt5_account_balance = float(req.balance)
+        if req.equity is not None:
+            cfg.mt5_account_equity = float(req.equity)
+        cfg.bridge_last_seen = datetime.utcnow()
+        db.commit()
+
     return {
         "status": "connected",
         "message": f"Bridge registered for {username}",
-        "account": req.account_info,
+        "balance_saved": cfg.mt5_account_balance if cfg else None,
         "server_time": datetime.utcnow().isoformat(),
     }
 
@@ -3419,9 +3441,148 @@ def emergency_stop(username: str, db: Session = Depends(get_db)):
         if active
         else "✅ All clear. No open positions.",
     }
-    import uvicorn
-    import os
+# ════════════════════════════════════════════════════════════════
+#  24/7 AUTO-TRADE SCHEDULER
+#  Runs as a background daemon thread.
+#  Every 60 min it generates predictions (uses cache — no extra
+#  Groq calls) and queues all auto-trade eligible signals for
+#  every user who has an active bot configured.
+# ════════════════════════════════════════════════════════════════
 
-    if __name__ == "__main__":
-        port = int(os.environ.get("PORT", 8000))
-        uvicorn.run("main:app", host="0.0.0.0", port=port)
+SCHEDULER_INTERVAL = 60 * 60      # 1 hour between full signal runs
+SCHEDULER_WARMUP   = 30           # seconds to wait after server starts
+
+
+def _auto_trade_scheduler():
+    """Background thread: generate signals + queue trades every hour."""
+    from models import SessionLocal
+
+    print(f"[SCHEDULER] Warming up — first run in {SCHEDULER_WARMUP}s")
+    time.sleep(SCHEDULER_WARMUP)
+
+    while True:
+        cycle_start = time.time()
+        print(f"[SCHEDULER] ⏰ Auto-trade cycle starting at {datetime.utcnow().strftime('%H:%M UTC')}")
+
+        try:
+            db = SessionLocal()
+            try:
+                _run_scheduler_cycle(db)
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"[SCHEDULER] ❌ Unhandled error in cycle: {e}")
+
+        elapsed   = time.time() - cycle_start
+        sleep_for = max(60, SCHEDULER_INTERVAL - elapsed)
+        print(f"[SCHEDULER] Cycle done in {elapsed:.0f}s — next run in {sleep_for/60:.0f} min")
+        time.sleep(sleep_for)
+
+
+def _run_scheduler_cycle(db):
+    """
+    Core scheduler logic:
+    1. Generate fresh predictions (uses 60-min cache — usually free)
+    2. For each user with an active bot, queue signals that pass all filters
+    """
+    # ── Step 1: Generate / refresh predictions ──────────────────────────────
+    preds = generate_market_predictions(investment_amount_ngn=0, user_profile="")
+    if not preds.get("success"):
+        print(f"[SCHEDULER] Predictions not available: {preds.get('error', 'unknown error')}")
+        return
+
+    signals = preds.get("signals", [])
+    auto_signals = [s for s in signals if s.get("auto_trade_eligible")]
+
+    if not auto_signals:
+        print("[SCHEDULER] No auto-trade eligible signals this cycle — nothing queued")
+        return
+
+    print(f"[SCHEDULER] {len(auto_signals)} auto-trade eligible signal(s): "
+          + ", ".join(f"{s['symbol']} {s['signal']} {s['confidence']}%" for s in auto_signals))
+
+    # ── Step 2: Find all users with an active bot ────────────────────────────
+    active_cfgs = db.query(BotConfig).filter(BotConfig.is_active == True).all()
+    if not active_cfgs:
+        print("[SCHEDULER] No active bots configured — nothing queued")
+        return
+
+    print(f"[SCHEDULER] {len(active_cfgs)} active bot(s) found")
+
+    queued_total = 0
+    blocked_total = 0
+
+    for cfg in active_cfgs:
+        user = db.query(User).filter(User.id == cfg.user_id).first()
+        if not user:
+            continue
+
+        # Get the user's MT5 account balance (fall back to a safe default)
+        account_balance_usd = float(cfg.mt5_account_balance or 1000.0)
+
+        for sig in auto_signals:
+            symbol     = sig["symbol"]
+            direction  = "BUY"  if "BUY"  in sig["signal"] else "SELL"
+            confidence = float(sig.get("confidence", 75))
+            entry      = float(sig.get("entry_price") or sig.get("live_price") or 0)
+            sl         = float(sig.get("stop_loss")    or 0)
+            tp1        = float(sig.get("take_profit_1") or 0)
+            tp2        = sig.get("take_profit_2")
+
+            # Skip if no price data
+            if not entry or not sl:
+                continue
+
+            # Skip if below this user's configured minimum confidence
+            if confidence < float(cfg.min_confidence or 75):
+                continue
+
+            try:
+                req = ManualSignalRequest(
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=entry,
+                    stop_loss=sl,
+                    take_profit_1=tp1,
+                    take_profit_2=float(tp2) if tp2 else None,
+                    account_balance_usd=account_balance_usd,
+                    signal_confidence=confidence,
+                    timeframe="H1",
+                )
+                result = place_bot_trade(username=user.username, req=req, db=db)
+
+                if result.get("success"):
+                    queued_total += 1
+                    print(f"[SCHEDULER] ✅ Queued: {user.username} | {direction} {symbol} "
+                          f"conf={confidence:.0f}% lot={result.get('lot_size', '?')}")
+                else:
+                    blocked_total += 1
+                    blocks = result.get("blocks", [])
+                    print(f"[SCHEDULER] ⛔ Blocked: {user.username} | {symbol} — {blocks}")
+
+            except Exception as e:
+                print(f"[SCHEDULER] Error queuing {symbol} for {user.username}: {e}")
+
+    print(f"[SCHEDULER] Cycle summary — queued: {queued_total} | blocked/filtered: {blocked_total}")
+
+
+# ── Status endpoint for the scheduler ────────────────────────────────────────
+@app.get("/scheduler/status")
+def scheduler_status():
+    """Check whether the auto-trade scheduler is running and when it last fired."""
+    return {
+        "scheduler": "running",
+        "interval_minutes": SCHEDULER_INTERVAL // 60,
+        "description": (
+            "The scheduler automatically generates signals every hour and queues "
+            "auto-trade eligible ones (confidence >= min_confidence) for all active bots."
+        ),
+    }
+
+
+import uvicorn
+import os
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
