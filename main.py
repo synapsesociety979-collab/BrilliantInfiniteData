@@ -30,7 +30,10 @@ from models import (
     BotOrder,
 )
 from trading_engine import RiskEngine, MarketFilter, TradeManager
-from market_data import get_symbol_analysis, format_for_ai_prompt, fetch_realtime_quote
+from market_data import (
+    get_symbol_analysis, format_for_ai_prompt, fetch_realtime_quote,
+    FALLBACK_PRICES, FALLBACK_ATR_PCT,
+)
 
 # ----------------------------
 # DB init on startup
@@ -378,9 +381,26 @@ def generate_market_predictions(
         if analysis.get("live_price"):
             has_real_data = True
 
-    # Remaining symbols — AI will use pattern reasoning
+    # Remaining symbols — build price + ATR context so AI can do real analysis
     remaining_symbols = [s for s in TRADING_SYMBOLS if s not in real_data_symbols]
-    remaining_text = ", ".join(remaining_symbols)
+    remaining_lines = []
+    for sym in remaining_symbols:
+        ref_price = FALLBACK_PRICES.get(sym, 0)
+        atr_pct   = FALLBACK_ATR_PCT.get(sym, 0.01)
+        atr_abs   = round(ref_price * atr_pct, 6)
+        sl_buy    = round(ref_price - atr_abs * 1.5, 6)
+        tp1_buy   = round(ref_price + atr_abs * 1.5, 6)
+        tp2_buy   = round(ref_price + atr_abs * 3.0, 6)
+        sl_sell   = round(ref_price + atr_abs * 1.5, 6)
+        tp1_sell  = round(ref_price - atr_abs * 1.5, 6)
+        tp2_sell  = round(ref_price - atr_abs * 3.0, 6)
+        cat = "crypto" if "USDT" in sym else "forex"
+        remaining_lines.append(
+            f"{sym} ({cat}) | ref_price={ref_price} | ATR≈{atr_abs} | "
+            f"BUY SL={sl_buy} TP1={tp1_buy} TP2={tp2_buy} | "
+            f"SELL SL={sl_sell} TP1={tp1_sell} TP2={tp2_sell}"
+        )
+    remaining_text = "\n".join(remaining_lines)
 
     live_data_section = "\n\n".join(live_data_blocks)
     data_source_note = (
@@ -392,75 +412,82 @@ def generate_market_predictions(
     prompt = f"""SESSION: {session} | UTC: {utc.strftime("%H:%M")} | Data: {data_source_note}
 Budget: {investment_amount_ngn:,.0f} NGN (~${inv_usd:,.2f} USD @ {ngn_rate:.2f}){personalization}
 
-━━━ LIVE MARKET DATA WITH CONFLUENCE SCORES ━━━
-{live_data_section}
+GOAL: Analyze ALL 30 symbols below and return EVERY symbol that has a tradeable signal.
+Target: 5-12 signals. No artificial limit. If a clear setup exists, include it.
 
-━━━ REMAINING SYMBOLS — use institutional pattern reasoning ━━━
-{remaining_text}
+━━━ SECTION A — LIVE INDICATOR DATA (use exact values shown) ━━━
+{"No live data available this cycle — see Section B for all symbols." if not has_real_data else ""}
+{live_data_section if has_real_data else ""}
 
-━━━ CONFIDENCE CALIBRATION (based on confluence score) ━━━
-Confluence 5-6/6 → confidence 88-97  (STRONG signal — STRONG_BUY/STRONG_SELL)
-Confluence 4/6   → confidence 80-87  (clear signal — BUY/SELL)
-Confluence 3/6   → confidence 73-79  (marginal signal — BUY/SELL only if R:R ≥ 1:2.5)
-Confluence 0-2/6 → DO NOT signal — output HOLD and exclude from JSON
-AI reasoning mode → cap confidence at 78 max
+SECTION A GATES (apply ONLY to symbols above with live data):
+✗ Confluence score 0-2/6 → exclude
+✗ ADX < 20 → exclude (ranging market)
+✗ MACD histogram and RSI point opposite directions → exclude
+✗ R:R below 1:1.8 → exclude
+Confidence: score 5-6/6→88-97 | 4/6→80-87 | 3/6→73-79
 
-━━━ MANDATORY QUALITY GATES — fail ANY = exclude the symbol ━━━
-✗ ADX < 20 → ranging market, skip directional trades
-✗ RSI between 42-58 AND no squeeze → no clear momentum, skip
-✗ MACD histogram and RSI disagree on direction → skip
-✗ Stochastic K and Williams %R disagree on direction → skip
-✗ EMA stack gives no clear direction (price between EMA20/EMA50) → skip
-✗ R:R ratio below 1:1.8 → skip
-✗ Session is poor fit for this symbol → cap confidence at 75
+━━━ SECTION B — AI REASONING (reference prices + ATR provided) ━━━
+For these symbols you do NOT have live candle data. Use your institutional knowledge
+of each asset's recent price action, macro drivers, and intermarket relationships.
+SL/TP levels below are pre-calculated from estimated ATR — use them.
 
-━━━ SIGNAL RULES ━━━
-- Use EXACT ATR-based SL/TP levels from the data block (do not change them significantly)
-- Entry should be current price or a better entry on a pullback to support/pivot
-- back_out_trigger = the price level where the thesis is WRONG (usually previous S/R)
-- For AI reasoning mode: be conservative, justify with intermarket/macro reasoning
+{remaining_text if remaining_text else "(all symbols have live data)"}
+
+SECTION B GATES (apply to all Section B symbols + any Section A symbols that lost live data):
+✗ Skip only if RSI, MACD, AND EMA all point different directions (total disagreement)
+✗ R:R below 1:1.5 → exclude
+✓ If at least 2 of (RSI trend, MACD direction, EMA stack, price vs key level) agree → include
+Confidence cap: 78 max for AI reasoning
+Confluence: estimate as "X/3" (out of RSI/MACD/EMA only, since no other indicators)
+
+━━━ SIGNAL RULES (both sections) ━━━
+- data_source = "live_data" for Section A, "ai_reasoning" for Section B
+- Entry = current/reference price, or a slightly better pullback level
+- Use ATR SL/TP levels provided — do not invent different numbers
+- back_out_trigger = price level that invalidates the thesis
+- Session fit: {session.split('—')[0].strip()}
 
 POSITION SIZING: 2% risk per trade
-Risk amount: {investment_amount_ngn * 0.02:,.0f} NGN = ${investment_amount_ngn * 0.02 / ngn_rate:.2f} USD
+Risk: {investment_amount_ngn * 0.02:,.0f} NGN = ${investment_amount_ngn * 0.02 / ngn_rate:.2f} USD
 
-Return ONLY a valid JSON array. Minimum confidence 73. No HOLD signals. No text outside the array.
+Return ONLY a valid JSON array. No HOLD signals. No text outside brackets.
 [
   {{
     "symbol": "SYMBOL",
     "signal": "STRONG_BUY|BUY|SELL|STRONG_SELL",
     "confidence": 73-97,
-    "confluence_score": "X/6",
+    "confluence_score": "X/6 or X/3",
     "data_source": "live_data|ai_reasoning",
     "category": "forex|crypto",
     "timeframe": "scalp(5-15m)|intraday(1-4h)|swing(daily)",
     "session_fit": "excellent|good|fair|poor",
-    "live_price": "exact number",
-    "entry_price": "exact number",
-    "stop_loss": "exact number from ATR data",
-    "take_profit_1": "exact number",
-    "take_profit_2": "exact number",
-    "take_profit_3": "exact number",
+    "live_price": "number",
+    "entry_price": "number",
+    "stop_loss": "number",
+    "take_profit_1": "number",
+    "take_profit_2": "number",
+    "take_profit_3": "number",
     "risk_reward": "1:X.X",
-    "hold_time": "e.g. 4-8 hours",
+    "hold_time": "duration",
     "position_size_ngn": "{investment_amount_ngn * 0.02:,.0f} NGN",
     "position_size_usd": "${investment_amount_ngn * 0.02 / ngn_rate:.2f}",
-    "back_out_trigger": "exact price that invalidates thesis",
+    "back_out_trigger": "invalidation price",
     "indicators": {{
-      "rsi": "exact value + reading",
-      "macd": "exact histogram value + direction",
-      "stochastic": "K/D values + zone",
-      "adx": "exact ADX value + trend strength",
-      "williams_r": "exact value + zone",
-      "ema_bias": "price vs EMA20/50/200",
+      "rsi": "value/estimate + reading",
+      "macd": "direction + histogram",
+      "stochastic": "if available",
+      "adx": "if available",
+      "williams_r": "if available",
+      "ema_bias": "price vs EMAs",
       "bollinger": "band position",
-      "pattern": "candle pattern"
+      "pattern": "pattern if visible"
     }},
     "key_levels": {{
-      "support": "exact level",
-      "resistance": "exact level",
-      "pivot": "exact pivot level if available"
+      "support": "level",
+      "resistance": "level",
+      "pivot": "if available"
     }},
-    "rationale": "3 sentences. Must cite confluence score, specific indicator values, and the one strongest reason for the trade."
+    "rationale": "2-3 sentences: cite specific indicators/macro drivers, entry logic, and main risk."
   }}
 ]"""
 
@@ -538,6 +565,16 @@ Return ONLY a valid JSON array. Minimum confidence 73. No HOLD signals. No text 
                 # Cap AI-only signals at 78%
                 if conf > 78:
                     s["confidence"] = 78
+                # Normalise confluence_score string (AI sometimes returns "4/3" etc.)
+                raw_cs = str(s.get("confluence_score", "0/3"))
+                try:
+                    parts = raw_cs.split("/")
+                    num   = int(parts[0])
+                    denom = int(parts[1]) if len(parts) > 1 else 3
+                    num   = min(num, denom)          # clamp (4/3 → 3/3)
+                    s["confluence_score"] = f"{num}/{denom}"
+                except Exception:
+                    s["confluence_score"] = raw_cs
 
             validated.append(s)
 
