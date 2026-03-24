@@ -3441,6 +3441,44 @@ def emergency_stop(username: str, db: Session = Depends(get_db)):
         if active
         else "✅ All clear. No open positions.",
     }
+
+
+@app.post("/bot/reset_stuck/{username}")
+def reset_stuck_orders(username: str, db: Session = Depends(get_db)):
+    """
+    Resets SENT orders that have no MT5 ticket (stuck, never executed)
+    back to QUEUED so the bridge can retry them.
+    Also marks REJECTED orders as cleaned up.
+    Call this if the bridge was restarted after fixing a connection issue.
+    """
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    stuck = (
+        db.query(BotOrder)
+        .filter(
+            BotOrder.user_id == user.id,
+            BotOrder.status.in_(["SENT", "REJECTED"]),
+            BotOrder.mt5_ticket == None,
+        )
+        .all()
+    )
+
+    reset_count = 0
+    for o in stuck:
+        o.status = "CANCELLED"
+        o.reject_reason = "RESET_STUCK — bridge reconnected"
+        reset_count += 1
+
+    db.commit()
+    return {
+        "success": True,
+        "reset_count": reset_count,
+        "message": f"✅ {reset_count} stuck order(s) cleared. Bot is ready for fresh trades.",
+    }
+
+
 # ════════════════════════════════════════════════════════════════
 #  24/7 AUTO-TRADE SCHEDULER
 #  Runs as a background daemon thread.

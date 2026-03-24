@@ -141,6 +141,24 @@ def normalize_symbol(symbol: str) -> str:
     return mapping.get(symbol, symbol)
 
 
+def _get_filling_mode(symbol: str) -> int:
+    """
+    Detect which filling mode the broker supports for this symbol.
+    Tries FOK → IOC → RETURN in order.
+    """
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return mt5.ORDER_FILLING_IOC
+
+    filling = info.filling_mode
+    if filling & mt5.SYMBOL_FILLING_FOK:
+        return mt5.ORDER_FILLING_FOK
+    elif filling & mt5.SYMBOL_FILLING_IOC:
+        return mt5.ORDER_FILLING_IOC
+    else:
+        return mt5.ORDER_FILLING_RETURN
+
+
 def place_order(order: dict) -> tuple[bool, str, int]:
     """
     Execute a market order in MT5.
@@ -164,6 +182,9 @@ def place_order(order: dict) -> tuple[bool, str, int]:
     price      = tick.ask if direction == "BUY" else tick.bid
     deviation  = 20   # max slippage in points
 
+    # Auto-detect broker's supported filling mode
+    filling_mode = _get_filling_mode(symbol)
+
     request = {
         "action":       mt5.TRADE_ACTION_DEAL,
         "symbol":       symbol,
@@ -174,9 +195,9 @@ def place_order(order: dict) -> tuple[bool, str, int]:
         "tp":           round(tp1, info.digits)   if tp1 else 0,
         "deviation":    deviation,
         "magic":        MAGIC,
-        "comment":      f"ARIA-{order.get('id', '')[:8]}",
+        "comment":      f"ARIA-{str(order.get('order_id', ''))[:8]}",
         "type_time":    mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": filling_mode,
     }
 
     result = mt5.order_send(request)
@@ -393,7 +414,7 @@ def manage_positions() -> None:
                 "magic":        MAGIC,
                 "comment":      "ARIA-partial",
                 "type_time":    mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
+                "type_filling": _get_filling_mode(symbol),
             }
             res = mt5.order_send(req)
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
@@ -417,7 +438,7 @@ def manage_positions() -> None:
                 "magic":        MAGIC,
                 "comment":      f"ARIA-{instructions.get('close_reason','exit')}",
                 "type_time":    mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
+                "type_filling": _get_filling_mode(symbol),
             }
             res = mt5.order_send(req)
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
@@ -459,7 +480,7 @@ def emergency_close_all() -> None:
             "magic":        MAGIC,
             "comment":      "ARIA-emergency",
             "type_time":    mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": _get_filling_mode(pos.symbol),
         }
         mt5.order_send(req)
         log.warning(f"  Closed {pos.symbol} #{pos.ticket}")
