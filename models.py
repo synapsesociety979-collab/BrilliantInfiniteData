@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     Text,
     JSON,
+    text,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
@@ -339,6 +340,19 @@ class BotOrder(Base):
 # ─────────────────────────────────────────────
 def init_db():
     Base.metadata.create_all(bind=engine)
+    # Safe column migrations — add new columns if they don't exist yet
+    migrations = [
+        "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_account_balance FLOAT",
+        "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_account_equity FLOAT",
+        "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS bridge_last_seen TIMESTAMP",
+    ]
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception:
+                conn.rollback()
 
 
 def get_db():
