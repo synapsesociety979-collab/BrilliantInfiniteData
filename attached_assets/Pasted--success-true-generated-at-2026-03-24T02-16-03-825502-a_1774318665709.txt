@@ -1,0 +1,70 @@
+{
+  "success": true,
+  "generated_at": "2026-03-24T02:16:03.825502",
+  "active_session": "Asian Session — JPY pairs: USDJPY, GBPJPY, AUDJPY most active",
+  "data_quality": {
+    "source": "LIVE Alpha Vantage data",
+    "live_data_symbols": [
+      "USDJPY",
+      "GBPJPY",
+      "AUDJPY",
+      "EURJPY",
+      "AUDCAD",
+      "AUDUSD",
+      "NZDUSD",
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT",
+      "DOTUSDT",
+      "LTCUSDT"
+    ],
+    "signals_from_live_data": 1,
+    "signals_from_ai_reasoning": 0
+  },
+  "investment_context_ngn": 0,
+  "usd_ngn_rate": 1600,
+  "model": "llama-3.3-70b-versatile",
+  "signals": [
+    {
+      "symbol": "AUDJPY",
+      "signal": "BUY",
+      "confidence": 78,
+      "confluence_score": "1/6",
+      "data_source": "live_data",
+      "category": "forex",
+      "timeframe": "intraday",
+      "session_fit": "fair",
+      "live_price": 111.02774,
+      "entry_price": 111.02774,
+      "stop_loss": 107.278107,
+      "take_profit_1": 114.777372,
+      "take_profit_2": 118.527005,
+      "take_profit_3": 122.276637,
+      "risk_reward": "1:2.5",
+      "hold_time": "4-8 hours",
+      "position_size_ngn": "0 NGN",
+      "position_size_usd": "$0.00",
+      "back_out_trigger": 107.278107,
+      "indicators": {
+        "rsi": "50.57 - neutral",
+        "macd": "-0.206642 - bearish",
+        "stochastic": "K=37.63 D=47.37 - bearish crossover",
+        "adx": "44.36 - strong trend",
+        "williams_r": "-62.37 - neutral",
+        "ema_bias": "price above EMA50 and EMA200 - bullish",
+        "bollinger": "34% of band - lower",
+        "pattern": "bearish candle"
+      },
+      "key_levels": {
+        "support": 103.97155,
+        "resistance": 114.28353,
+        "pivot": 111.761823
+      },
+      "rationale": "The AUDJPY is a buy due to its confluence score of 1/6, with a strong trend confirmed by the ADX at 44.36. The MACD histogram is bearish, but the EMA stack is bullish, with the price above the EMA50 and EMA200. The strongest reason for this trade is the bullish EMA stack, which suggests a potential upside movement."
+    }
+  ],
+  "total_signals": 1,
+  "strong_signals_count": 0,
+  "top_picks": [],
+  "disclaimer": "Signals are data-driven using live Alpha Vantage feeds. Trading involves substantial risk."
+}

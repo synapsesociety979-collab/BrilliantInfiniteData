@@ -369,10 +369,12 @@ def generate_market_predictions(
     has_real_data = False
 
     print(f"[ARIA] Fetching real market data for {len(real_data_symbols)} symbols...")
+    analyses_by_symbol: Dict[str, Dict] = {}   # ← store for post-AI validation
     for sym in real_data_symbols:
         analysis = get_symbol_analysis(sym)
         block = format_for_ai_prompt(analysis)
         live_data_blocks.append(block)
+        analyses_by_symbol[sym] = analysis
         if analysis.get("live_price"):
             has_real_data = True
 
@@ -471,9 +473,77 @@ Return ONLY a valid JSON array. Minimum confidence 73. No HOLD signals. No text 
         if m:
             content = m.group(0)
         data = json.loads(content)
-        data = [
-            s for s in data if isinstance(s, dict) and int(s.get("confidence", 0)) >= 73
-        ]
+
+        # ── PYTHON-LEVEL QUALITY GATES (hard rules AI cannot override) ──────────
+        validated = []
+        for s in data:
+            if not isinstance(s, dict):
+                continue
+            sym = s.get("symbol", "")
+            sig = s.get("signal", "")
+            conf = int(s.get("confidence", 0))
+            src  = s.get("data_source", "ai_reasoning")
+
+            # Gate 1: minimum confidence
+            if conf < 73:
+                continue
+
+            # Gate 2: HOLD signals excluded
+            if sig == "HOLD":
+                continue
+
+            # Gate 3: live-data signals must pass Python confluence check
+            if src == "live_data" and sym in analyses_by_symbol:
+                calc = analyses_by_symbol[sym].get("confluence", {})
+                calc_dir    = calc.get("direction", "NEUTRAL")   # BUY/SELL/NEUTRAL
+                calc_score  = int(calc.get("score", 0))
+                calc_tradeable = calc.get("tradeable", True)
+
+                # Must have at least 3 indicators agreeing
+                if calc_score < 3:
+                    print(f"[GATE] Rejected {sym} {sig}: confluence {calc_score}/6 < 3")
+                    continue
+
+                # Signal direction must match calculated confluence direction
+                is_buy  = sig in ("BUY", "STRONG_BUY")
+                is_sell = sig in ("SELL", "STRONG_SELL")
+                if is_buy  and calc_dir == "SELL":
+                    print(f"[GATE] Rejected {sym} {sig}: AI says BUY but Python says SELL")
+                    continue
+                if is_sell and calc_dir == "BUY":
+                    print(f"[GATE] Rejected {sym} {sig}: AI says SELL but Python says BUY")
+                    continue
+                if calc_dir == "NEUTRAL" and calc_score < 3:
+                    print(f"[GATE] Rejected {sym} {sig}: NEUTRAL market (score={calc_score})")
+                    continue
+
+                # ADX gate: market must be trending (not ranging)
+                if not calc_tradeable:
+                    print(f"[GATE] Rejected {sym} {sig}: ADX <20 (ranging market)")
+                    continue
+
+                # Confidence must match confluence score
+                if calc_score <= 3 and conf > 80:
+                    s["confidence"] = 76   # cap overconfident AI signals
+                elif calc_score == 4 and conf > 87:
+                    s["confidence"] = 85
+                elif calc_score >= 5 and conf > 97:
+                    s["confidence"] = 95
+
+                # Stamp the verified confluence score on the signal
+                s["confluence_score"] = f"{calc_score}/6"
+                s["confluence_direction"] = calc_dir
+
+            elif src == "ai_reasoning":
+                # Cap AI-only signals at 78%
+                if conf > 78:
+                    s["confidence"] = 78
+
+            validated.append(s)
+
+        data = validated
+        # ── END PYTHON GATES ────────────────────────────────────────────────────
+
         strong = [s for s in data if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]]
         live_count = len([s for s in data if s.get("data_source") == "live_data"])
 
@@ -596,6 +666,48 @@ Return ONLY valid JSON:
         if m:
             content = m.group(0)
         data = json.loads(content)
+
+        # ── Python-level quality gate for single-symbol ──────────────────────
+        if has_live:
+            calc   = analysis.get("confluence", {})
+            c_dir  = calc.get("direction", "NEUTRAL")
+            c_score = int(calc.get("score", 0))
+            c_trade = calc.get("tradeable", True)
+            sig    = data.get("signal", "HOLD")
+            is_buy  = sig in ("BUY", "STRONG_BUY")
+            is_sell = sig in ("SELL", "STRONG_SELL")
+
+            gate_fail = None
+            if c_score < 3:
+                gate_fail = f"confluence {c_score}/6 below minimum (need ≥3)"
+            elif is_buy and c_dir == "SELL":
+                gate_fail = "AI BUY conflicts with calculated SELL confluence"
+            elif is_sell and c_dir == "BUY":
+                gate_fail = "AI SELL conflicts with calculated BUY confluence"
+            elif not c_trade:
+                gate_fail = "ADX <20 — ranging market, no directional trade"
+
+            if gate_fail:
+                data["signal"]     = "HOLD"
+                data["confidence"] = 0
+                data["gate_rejection"] = gate_fail
+                data["confluence_score"] = f"{c_score}/6"
+                data["note"] = "Overridden to HOLD by Python quality gate. Wait for clearer setup."
+            else:
+                # Stamp verified confluence data
+                data["confluence_score"]     = f"{c_score}/6"
+                data["confluence_direction"] = c_dir
+                # Cap confidence to match confluence score
+                conf = int(data.get("confidence", 0))
+                if c_score <= 3 and conf > 80:   data["confidence"] = 76
+                elif c_score == 4 and conf > 87: data["confidence"] = 85
+                elif c_score >= 5 and conf > 97: data["confidence"] = 95
+        else:
+            # AI-only mode — cap at 78
+            if int(data.get("confidence", 0)) > 78:
+                data["confidence"] = 78
+        # ── End gate ──────────────────────────────────────────────────────────
+
         data["personalized"] = True
         data["raw_live_analysis"] = analysis
         return data
