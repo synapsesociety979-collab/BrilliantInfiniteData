@@ -54,3 +54,4 @@ waitForPort = 5000
 [userenv]
 
 [userenv.shared]
+EXCHANGE_RATE_API_KEY = "958b36cefc4f5be763d8a458"
