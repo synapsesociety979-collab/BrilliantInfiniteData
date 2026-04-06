@@ -93,9 +93,86 @@ def get_live_price(symbol: str) -> float:
     return float(d.get("price") or 0)
 
 
+_RATES_CACHE: Dict[str, Any] = {}
+_RATES_CACHE_TIME: float = 0
+_RATES_CACHE_TTL: int = 3600  # refresh every 60 min
+
+def get_all_exchange_rates(base: str = "USD") -> Dict[str, float]:
+    """
+    Fetch live exchange rates from ExchangeRate-API (free, no key needed).
+    Returns a dict like {"NGN": 1610.5, "EUR": 0.918, "GBP": 0.785, ...}
+    Cached for 1 hour.
+    """
+    global _RATES_CACHE, _RATES_CACHE_TIME
+    now = time.time()
+    cache_key = f"rates_{base}"
+
+    if _RATES_CACHE.get(cache_key) and (now - _RATES_CACHE_TIME) < _RATES_CACHE_TTL:
+        return _RATES_CACHE[cache_key]
+
+    try:
+        r = requests.get(
+            f"https://open.er-api.com/v6/latest/{base}",
+            timeout=8
+        )
+        data = r.json()
+        if data.get("result") == "success":
+            rates = data.get("rates", {})
+            _RATES_CACHE[cache_key] = rates
+            _RATES_CACHE_TIME = now
+            return rates
+    except Exception:
+        pass
+
+    # Fallback: try Alpha Vantage for NGN at least
+    try:
+        d = fetch_alpha_vantage_forex("USD", "NGN")
+        return {"NGN": float(d.get("rate") or 1610.0)}
+    except Exception:
+        return {"NGN": 1610.0}
+
+
 def get_ngn_rate() -> float:
-    d = fetch_alpha_vantage_forex("USD", "NGN")
-    return float(d.get("rate") or 1600.0)
+    rates = get_all_exchange_rates("USD")
+    return float(rates.get("NGN", 1610.0))
+
+
+def convert_currency(amount: float, from_cur: str, to_cur: str) -> dict:
+    """Convert any amount between any two currencies using live rates."""
+    from_cur = from_cur.upper()
+    to_cur   = to_cur.upper()
+
+    # Get rates based on USD as base
+    usd_rates = get_all_exchange_rates("USD")
+
+    if not usd_rates:
+        return {"error": "Rate data unavailable"}
+
+    # Convert: amount in from_cur → USD → to_cur
+    if from_cur == "USD":
+        usd_amount = amount
+    elif from_cur in usd_rates:
+        usd_amount = amount / usd_rates[from_cur]
+    else:
+        return {"error": f"Currency {from_cur} not supported"}
+
+    if to_cur == "USD":
+        result = usd_amount
+    elif to_cur in usd_rates:
+        result = usd_amount * usd_rates[to_cur]
+    else:
+        return {"error": f"Currency {to_cur} not supported"}
+
+    rate = usd_rates.get(to_cur, 1) / usd_rates.get(from_cur, 1) if from_cur != "USD" else usd_rates.get(to_cur, 1)
+
+    return {
+        "from": from_cur,
+        "to": to_cur,
+        "amount": amount,
+        "result": round(result, 6),
+        "rate": round(rate, 6),
+        "display": f"{amount:,.2f} {from_cur} = {result:,.2f} {to_cur}",
+    }
 
 
 def get_market_context() -> str:
@@ -1629,6 +1706,32 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
     # Which symbols have injected data (for ARIA's instructions)
     covered_syms = [sym for sym, _ in mentioned_pairs]
 
+    # ── detect currency conversion questions and inject live rates ──
+    CONVERSION_KEYWORDS = ["convert", "rate", "exchange", "how much", "worth",
+                           "equals", "ngn", "naira", "dollar", "pound", "euro",
+                           "yen", "usd", "gbp", "eur", "jpy", "cad", "aud",
+                           "zar", "ghs", "kes", "egp", "aed", "inr", "cny"]
+    is_conversion_question = any(kw in msg_upper for kw in [k.upper() for k in CONVERSION_KEYWORDS])
+
+    exchange_rates_section = ""
+    if is_conversion_question:
+        try:
+            all_rates = get_all_exchange_rates("USD")
+            key_currencies = ["NGN", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF",
+                              "NZD", "ZAR", "GHS", "KES", "EGP", "AED", "INR",
+                              "CNY", "XAF", "XOF", "MAD", "TZS", "UGX"]
+            rate_lines = [f"  1 USD = {all_rates[c]:,.4f} {c}"
+                         for c in key_currencies if c in all_rates]
+            if rate_lines:
+                exchange_rates_section = (
+                    "━━━ LIVE EXCHANGE RATES (fetched now) ━━━\n"
+                    + "\n".join(rate_lines)
+                    + "\n• Use these exact rates for any conversions the user asks about."
+                    + "\n• All rates are live and update every hour."
+                )
+        except Exception:
+            pass
+
     # ── build system prompt ──
     system_prompt = f"""You are ARIA — Advanced Revenue Intelligence Analyst.
 You are a world-class AI trading strategist with a warm, confident personality.
@@ -1648,6 +1751,8 @@ Name: {name}
 {profile}
 Live USD/NGN Rate: {ngn_rate:.2f}
 Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
+
+{exchange_rates_section}
 
 ━━━ WHAT YOU REMEMBER ABOUT {name.upper()} ━━━
 {memories}
@@ -1842,6 +1947,46 @@ def clear_all_memory(username: str, db: Session = Depends(get_db)):
 # ----------------------------
 # Risk Calculator
 # ----------------------------
+@app.get("/exchange_rates")
+def exchange_rates_endpoint(base: str = "USD"):
+    """
+    Get live exchange rates for any base currency.
+    Example: /exchange_rates?base=USD  → returns all currencies vs USD
+    Example: /exchange_rates?base=EUR  → returns all currencies vs EUR
+    Free, no API key, updates every hour.
+    """
+    rates = get_all_exchange_rates(base.upper())
+    if not rates:
+        raise HTTPException(status_code=503, detail="Exchange rate data unavailable")
+
+    # Return the most useful currencies prominently
+    highlight = ["NGN", "USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF",
+                 "NZD", "ZAR", "GHS", "KES", "EGP", "INR", "CNY", "AED"]
+    highlighted = {k: rates[k] for k in highlight if k in rates}
+
+    return {
+        "base": base.upper(),
+        "rates": rates,
+        "highlighted": highlighted,
+        "total_currencies": len(rates),
+        "note": "Rates update every hour. 1 {base} = X of each currency."
+    }
+
+
+@app.get("/convert")
+def convert_endpoint(amount: float, from_currency: str, to_currency: str):
+    """
+    Convert any amount between any two currencies using live rates.
+    Example: /convert?amount=100&from_currency=USD&to_currency=NGN
+    Example: /convert?amount=50000&from_currency=NGN&to_currency=EUR
+    Supports 160+ currencies worldwide.
+    """
+    result = convert_currency(amount, from_currency, to_currency)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
 @app.post("/risk_calculator")
 def calculate_risk(req: RiskCalcRequest):
     ngn_rate = get_ngn_rate()
