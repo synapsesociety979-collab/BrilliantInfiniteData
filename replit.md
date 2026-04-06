@@ -1,7 +1,7 @@
-# AI Multi-User Trading Bot Backend — ARIA v4.0
+# AI Multi-User Trading Bot Backend — CLEO v4.0
 
 ## Project Overview
-FastAPI backend for ARIA — an AI-powered institutional-grade trading bot analyzing 30 Forex and crypto markets. Provides real-time signal generation from live Alpha Vantage OHLCV data, NGN/USD conversion, demo trading, persistent PostgreSQL user data, personalized advice, a visual trading simulator, and a full MT5 auto-execution engine with Risk Engine, Market Filter, and Trade Manager.
+FastAPI backend for CLEO — an AI-powered institutional-grade trading bot analyzing 30 Forex and crypto markets. Provides real-time signal generation from live Alpha Vantage OHLCV data, NGN/USD conversion, demo trading, persistent PostgreSQL user data, personalized advice, a visual trading simulator, and a full MT5 auto-execution engine with Risk Engine, Market Filter, and Trade Manager.
 
 ## Current Status (March 2026)
 - **Backend**: Running on port 5000
@@ -25,7 +25,7 @@ FastAPI backend for ARIA — an AI-powered institutional-grade trading bot analy
 
 ### Tech Stack
 - Python 3 with FastAPI, Uvicorn
-- Groq AI (llama-3.3-70b-versatile) — ARIA persona
+- Groq AI (llama-3.3-70b-versatile) — CLEO persona
 - Alpha Vantage API — live OHLCV candles + exchange rates
 - PostgreSQL — full persistent storage
 - SQLAlchemy ORM
@@ -105,7 +105,7 @@ PENDING → QUEUED → SENT → ACTIVE → CLOSED
 - `GET /account/monitor/{username}` — Account overview
 
 ### AI Chat (Persistent with Memory)
-- `POST /chat` — Chat with ARIA
+- `POST /chat` — Chat with CLEO
 - `GET /chat/history/{username}` — Full history
 - `DELETE /chat/history/{username}` — Clear history
 - `POST /conversations/{username}` — Start new conversation thread
@@ -113,7 +113,7 @@ PENDING → QUEUED → SENT → ACTIVE → CLOSED
 - `GET /conversations/{username}/{id}` — Open specific thread
 - `PATCH /conversations/{username}/{id}/rename` — Rename thread
 - `DELETE /conversations/{username}/{id}` — Delete thread
-- `GET /memory/{username}` — What ARIA remembers
+- `GET /memory/{username}` — What CLEO remembers
 - `POST /memory/{username}` — Add memory
 - `DELETE /memory/{username}/{key}` — Forget one thing
 - `DELETE /memory/{username}` — Wipe all memories
@@ -124,7 +124,7 @@ PENDING → QUEUED → SENT → ACTIVE → CLOSED
 - `POST /bot/stop/{username}` — Pause bot
 - `GET /bot/status/{username}` — Full status + active orders + today's P&L
 - `POST /bot/trade/{username}` — Queue a manual signal (passes all filters)
-- `POST /bot/auto_signal/{username}` — ARIA generates + queues signal automatically
+- `POST /bot/auto_signal/{username}` — CLEO generates + queues signal automatically
 - `GET /bot/history/{username}` — Closed trade history
 - `GET /bot/performance/{username}` — Stats: all-time, monthly, weekly, by symbol
 - `POST /bot/emergency_stop/{username}` — Immediately halt + cancel all queued orders
@@ -171,8 +171,8 @@ PENDING → QUEUED → SENT → ACTIVE → CLOSED
 | `demo_accounts` | Demo balance per user |
 | `demo_trades` | Active and closed demo trades |
 | `conversations` | Named chat threads (like ChatGPT sidebar) |
-| `chat_messages` | Full ARIA conversation history |
-| `user_memories` | Facts ARIA remembers about each user |
+| `chat_messages` | Full CLEO conversation history |
+| `user_memories` | Facts CLEO remembers about each user |
 | `trade_journal` | Logged trades (also auto-populated from bot closes) |
 | `watchlist` | User watchlist items |
 | `user_activity` | Every action logged for AI personalization |
@@ -202,7 +202,7 @@ PENDING → QUEUED → SENT → ACTIVE → CLOSED
 - Run `mt5_bridge.py` on a Windows VPS for 24/7 MT5 execution
 
 ## User Preferences
-- ARIA persona for all AI chat interactions
+- CLEO persona for all AI chat interactions
 - NGN-first amounts (always convert to USD alongside)
 - 2% risk per trade as default position sizing
 - Only signals with confidence >= 73% are returned to frontend

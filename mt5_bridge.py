@@ -1,8 +1,8 @@
 """
-ARIA MT5 Bridge — Windows-side script
+CLEO MT5 Bridge — Windows-side script
 ======================================
 Runs on your Windows PC/VPS alongside MetaTrader 5.
-Polls the ARIA backend for queued orders, executes them in MT5,
+Polls the CLEO backend for queued orders, executes them in MT5,
 and manages open positions (break-even, trailing stop, partial close).
 
 SETUP:
@@ -59,7 +59,7 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-log = logging.getLogger("ARIA-Bridge")
+log = logging.getLogger("CLEO-Bridge")
 
 # ── Validate config ───────────────────────────────────────────────────────────
 missing = [k for k, v in {
@@ -116,8 +116,8 @@ def get_pip_value(symbol: str) -> float:
 
 def normalize_symbol(symbol: str) -> str:
     """
-    Convert ARIA symbol format to MT5 format.
-    ARIA uses:  EURUSD, BTCUSDT
+    Convert CLEO symbol format to MT5 format.
+    CLEO uses:  EURUSD, BTCUSDT
     HFM uses:   EURUSD, BTCUSD (no T) or XAUUSD etc.
     Adjust the mapping below to match your HFM account.
     """
@@ -196,7 +196,7 @@ def place_order(order: dict) -> tuple[bool, str, int]:
         "tp":           round(tp1, info.digits)   if tp1 else 0,
         "deviation":    deviation,
         "magic":        MAGIC,
-        "comment":      f"ARIA-{str(order.get('order_id', ''))[:8]}",
+        "comment":      f"CLEO-{str(order.get('order_id', ''))[:8]}",
         "type_time":    mt5.ORDER_TIME_GTC,
         "type_filling": filling_mode,
     }
@@ -237,7 +237,7 @@ def register_bridge() -> bool:
         )
         data = r.json()
         if data.get("success"):
-            log.info("✅ Bridge registered with ARIA backend")
+            log.info("✅ Bridge registered with CLEO backend")
             return True
         log.warning(f"Bridge register: {data.get('message', data)}")
         return False
@@ -342,7 +342,7 @@ def report_closed(order_id: str, close_price: float, pnl: float, reason: str) ->
 
 def manage_positions() -> None:
     """
-    For every open position with ARIA's magic number:
+    For every open position with CLEO's magic number:
     1. Send state to backend Trade Manager
     2. Apply any instructions received (move SL, partial close, full close)
     """
@@ -413,7 +413,7 @@ def manage_positions() -> None:
                 "price":        close_price,
                 "deviation":    20,
                 "magic":        MAGIC,
-                "comment":      "ARIA-partial",
+                "comment":      "CLEO-partial",
                 "type_time":    mt5.ORDER_TIME_GTC,
                 "type_filling": _get_filling_mode(symbol),
             }
@@ -437,7 +437,7 @@ def manage_positions() -> None:
                 "price":        close_price,
                 "deviation":    20,
                 "magic":        MAGIC,
-                "comment":      f"ARIA-{instructions.get('close_reason','exit')}",
+                "comment":      f"CLEO-{instructions.get('close_reason','exit')}",
                 "type_time":    mt5.ORDER_TIME_GTC,
                 "type_filling": _get_filling_mode(symbol),
             }
@@ -457,11 +457,11 @@ def manage_positions() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def emergency_close_all() -> None:
-    """Close all ARIA-managed positions immediately."""
+    """Close all CLEO-managed positions immediately."""
     positions = mt5.positions_get()
     if not positions:
         return
-    log.warning("⚠️  EMERGENCY STOP — closing all ARIA positions")
+    log.warning("⚠️  EMERGENCY STOP — closing all CLEO positions")
     for pos in positions:
         if pos.magic != MAGIC:
             continue
@@ -479,7 +479,7 @@ def emergency_close_all() -> None:
             "price":        close_price,
             "deviation":    20,
             "magic":        MAGIC,
-            "comment":      "ARIA-emergency",
+            "comment":      "CLEO-emergency",
             "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": _get_filling_mode(pos.symbol),
         }
@@ -493,7 +493,7 @@ def emergency_close_all() -> None:
 
 def main():
     log.info("=" * 60)
-    log.info("  ARIA MT5 Bridge  —  Starting up")
+    log.info("  CLEO MT5 Bridge  —  Starting up")
     log.info(f"  Backend : {API_URL}")
     log.info(f"  Username: {USERNAME}")
     log.info(f"  MT5     : {MT5_SERVER}  account {MT5_LOGIN}")

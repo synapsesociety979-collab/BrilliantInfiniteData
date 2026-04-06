@@ -124,10 +124,10 @@ def get_all_exchange_rates(base: str = "USD") -> Dict[str, float]:
             rates = data.get("conversion_rates", {})
             _RATES_CACHE[cache_key] = rates
             _RATES_CACHE_TIMES[cache_key] = now
-            logger.info(f"✅ Exchange rates updated from ExchangeRate-API v6 ({len(rates)} currencies)")
+            print(f"[RATES] ✅ Updated from ExchangeRate-API v6 ({len(rates)} currencies)")
             return rates
     except Exception as e:
-        logger.warning(f"ExchangeRate-API v6 failed: {e}")
+        print(f"[RATES] ExchangeRate-API v6 failed: {e}")
 
     # Fallback: free open.er-api.com (no key, 1500 req/month)
     try:
@@ -511,7 +511,7 @@ def generate_market_predictions(
     live_data_blocks = []
     has_real_data = False
 
-    print(f"[ARIA] Fetching real market data for {len(real_data_symbols)} symbols...")
+    print(f"[CLEO] Fetching real market data for {len(real_data_symbols)} symbols...")
     analyses_by_symbol: Dict[str, Dict] = {}   # ← store for post-AI validation
     for sym in real_data_symbols:
         # fetch_realtime_price=False: use OHLCV last close during batch to save TD quota
@@ -634,7 +634,7 @@ Return ONLY a valid JSON array. No HOLD signals. No text outside the brackets. K
                 stale_age_min = int((now - PREDICTIONS_CACHE[cache_key]["ts"]) / 60)
                 stale["_stale_cache"] = True
                 stale["_stale_age_min"] = stale_age_min
-                print(f"[ARIA] Rate limited — serving stale cache ({stale_age_min} min old)")
+                print(f"[CLEO] Rate limited — serving stale cache ({stale_age_min} min old)")
                 return stale
             return {"success": False, "error": content or "Empty AI response"}
         content = re.sub(r"```json|```", "", content.strip()).strip()
@@ -642,7 +642,7 @@ Return ONLY a valid JSON array. No HOLD signals. No text outside the brackets. K
         if m:
             content = m.group(0)
         data = json.loads(content)
-        print(f"[ARIA] AI returned {len(data)} raw signals before Python gates")
+        print(f"[CLEO] AI returned {len(data)} raw signals before Python gates")
 
         # ── PYTHON-LEVEL QUALITY GATES (hard rules AI cannot override) ──────────
         validated = []
@@ -1033,7 +1033,7 @@ def run_strategy_on_candles(
 # ----------------------------
 # FastAPI App
 # ----------------------------
-app = FastAPI(title="AI Trading Bot — ARIA v3.1")
+app = FastAPI(title="AI Trading Bot — CLEO v3.1")
 app.include_router(backtest_router, prefix="/api")
 app.add_middleware(
     CORSMiddleware,
@@ -1116,7 +1116,7 @@ class UserAccountRequest(BaseModel):
 def health_check():
     return {
         "status": "healthy",
-        "service": "ARIA — AI Trading Bot",
+        "service": "CLEO — AI Trading Bot",
         "version": "3.1",
         "pairs_monitored": len(TRADING_SYMBOLS),
         "persistence": "PostgreSQL",
@@ -1337,12 +1337,12 @@ Return ONLY valid JSON:
 
 
 # ═══════════════════════════════════════════════════
-#  MEMORY HELPERS — ARIA remembers facts about users
+#  MEMORY HELPERS — CLEO remembers facts about users
 # ═══════════════════════════════════════════════════
 
 
 def get_user_memories(user: User, db: Session) -> str:
-    """Return a formatted block of everything ARIA remembers about this user."""
+    """Return a formatted block of everything CLEO remembers about this user."""
     memories = db.query(UserMemory).filter(UserMemory.user_id == user.id).all()
     if not memories:
         return "No memories yet — learn about the user from this conversation."
@@ -1380,7 +1380,7 @@ def extract_and_save_memories(
 Extract ONLY clear personal facts the user stated about themselves.
 
 USER MESSAGE: {user_message}
-ARIA RESPONSE: {aria_response}
+CLEO RESPONSE: {aria_response}
 ALREADY KNOWN: {existing}
 
 Return a JSON array of new or updated facts ONLY (skip anything already known):
@@ -1592,10 +1592,10 @@ def delete_all_conversations(username: str, db: Session = Depends(get_db)):
 @app.post("/chat")
 def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
     """
-    Send a message to ARIA.
+    Send a message to CLEO.
     - Pass conversation_id to continue an existing thread.
     - Omit conversation_id to auto-create a new thread.
-    ARIA remembers facts about the user across ALL conversations.
+    CLEO remembers facts about the user across ALL conversations.
     """
     user = get_or_create_user(chat.username, db)
     log_activity(user, "sent_chat", db=db)
@@ -1710,7 +1710,7 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
             block = format_for_ai_prompt(analysis)
             conf = analysis.get("confluence", {})
             mode = "AI-reasoning — no live candles" if analysis.get("ai_only_mode") else "LIVE candle data"
-            # Header clarifies the notation mapping so ARIA never confuses them
+            # Header clarifies the notation mapping so CLEO never confuses them
             alias_note = f" [user typed: '{alias_used}' — same instrument]" if alias_used != sym else ""
             live_data_blocks_chat.append(
                 f"── DATA FOR {sym}{alias_note} ({mode}) ──\n"
@@ -1724,7 +1724,7 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
 
     live_data_section_chat = "\n\n".join(live_data_blocks_chat) if live_data_blocks_chat else ""
 
-    # Which symbols have injected data (for ARIA's instructions)
+    # Which symbols have injected data (for CLEO's instructions)
     covered_syms = [sym for sym, _ in mentioned_pairs]
 
     # ── detect currency conversion questions and inject live rates ──
@@ -1754,7 +1754,7 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
             pass
 
     # ── build system prompt ──
-    system_prompt = f"""You are ARIA — Advanced Revenue Intelligence Analyst.
+    system_prompt = f"""You are CLEO — Creative Loop Expert Optimizer.
 You are a world-class AI trading strategist with a warm, confident personality.
 
 ━━━ FOREX NOTATION GUIDE (READ FIRST) ━━━
@@ -1817,7 +1817,7 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 10. Tone: warm, direct, institutional — no hype, no guaranteed profit language
 11. End every trade recommendation with: ⚠️ Risk: [one-sentence disclaimer]"""
 
-    full_prompt = f"{system_prompt}\n\n{name}: {chat.message}\nARIA:"
+    full_prompt = f"{system_prompt}\n\n{name}: {chat.message}\nCLEO:"
     response = get_ai_response_creative(full_prompt)
 
     # ── save messages to DB ──
@@ -1893,13 +1893,13 @@ def clear_chat_history(username: str, db: Session = Depends(get_db)):
 
 
 # ═══════════════════════════════════════════════════
-#  MEMORY ENDPOINTS — See / manage what ARIA remembers
+#  MEMORY ENDPOINTS — See / manage what CLEO remembers
 # ═══════════════════════════════════════════════════
 
 
 @app.get("/memory/{username}")
 def get_memory(username: str, db: Session = Depends(get_db)):
-    """See everything ARIA currently remembers about you."""
+    """See everything CLEO currently remembers about you."""
     user = get_or_create_user(username, db)
     memories = db.query(UserMemory).filter(UserMemory.user_id == user.id).all()
     return {
@@ -1915,13 +1915,13 @@ def get_memory(username: str, db: Session = Depends(get_db)):
             }
             for m in memories
         ],
-        "note": "ARIA uses these facts to personalise every conversation.",
+        "note": "CLEO uses these facts to personalise every conversation.",
     }
 
 
 @app.post("/memory/{username}")
 def add_memory(username: str, key: str, value: str, db: Session = Depends(get_db)):
-    """Manually tell ARIA something to remember about you."""
+    """Manually tell CLEO something to remember about you."""
     user = get_or_create_user(username, db)
     key = key.strip().lower().replace(" ", "_")
     existing = (
@@ -1942,7 +1942,7 @@ def add_memory(username: str, key: str, value: str, db: Session = Depends(get_db
 
 @app.delete("/memory/{username}/{key}")
 def delete_memory(username: str, key: str, db: Session = Depends(get_db)):
-    """Tell ARIA to forget a specific fact."""
+    """Tell CLEO to forget a specific fact."""
     user = get_or_create_user(username, db)
     deleted = (
         db.query(UserMemory)
@@ -1957,7 +1957,7 @@ def delete_memory(username: str, key: str, db: Session = Depends(get_db)):
 
 @app.delete("/memory/{username}")
 def clear_all_memory(username: str, db: Session = Depends(get_db)):
-    """Clear ALL of ARIA's memories about this user."""
+    """Clear ALL of CLEO's memories about this user."""
     user = get_or_create_user(username, db)
     db.query(UserMemory).filter(UserMemory.user_id == user.id).delete()
     user.display_name = None
@@ -2641,7 +2641,7 @@ def connect_account(req: UserAccountRequest, db: Session = Depends(get_db)):
 
 
 # ════════════════════════════════════════════════════════════════
-#  ARIA AUTO-TRADER  —  Bot Config · Risk Engine · Market Filter
+#  CLEO AUTO-TRADER  —  Bot Config · Risk Engine · Market Filter
 #                        Trade Manager · MT5 Bridge endpoints
 # ════════════════════════════════════════════════════════════════
 
@@ -2826,7 +2826,7 @@ def start_bot(username: str, db: Session = Depends(get_db)):
     db.commit()
     return {
         "success": True,
-        "message": "ARIA bot is now ACTIVE — monitoring markets 24/7",
+        "message": "CLEO bot is now ACTIVE — monitoring markets 24/7",
     }
 
 
@@ -2844,7 +2844,7 @@ def stop_bot(username: str, db: Session = Depends(get_db)):
     db.commit()
     return {
         "success": True,
-        "message": "ARIA bot PAUSED — no new orders will be placed",
+        "message": "CLEO bot PAUSED — no new orders will be placed",
     }
 
 
@@ -3097,9 +3097,9 @@ def auto_signal(
     db: Session = Depends(get_db),
 ):
     """
-    ARIA generates a signal for the symbol, runs it through all filters,
+    CLEO generates a signal for the symbol, runs it through all filters,
     and queues it automatically if it passes.  No manual entry/SL/TP needed —
-    ARIA calculates everything from live indicator data.
+    CLEO calculates everything from live indicator data.
     """
     user = db.query(User).filter(User.username == username).first()
     if not user:
@@ -3115,7 +3115,7 @@ def auto_signal(
 
     indicators = analysis.get("indicators", {})
     prompt = (
-        f"You are ARIA. Give an auto-trade signal for {sym}.\n"
+        f"You are CLEO. Give an auto-trade signal for {sym}.\n"
         f"Live data: {format_for_ai_prompt(sym, analysis)}\n\n"
         f"Reply ONLY with this JSON (no text before/after):\n"
         f'{{"direction":"BUY or SELL","confidence":0-100,"entry":{analysis["live_price"]},'
