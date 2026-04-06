@@ -196,6 +196,280 @@ def convert_currency(amount: float, from_cur: str, to_cur: str) -> dict:
     }
 
 
+# ─── Economic Calendar (ForexFactory free public feed) ───────────────────────
+_CALENDAR_CACHE: list = []
+_CALENDAR_CACHE_TIME: float = 0
+_CALENDAR_CACHE_TTL: int = 1800  # 30-min cache
+
+# Title keywords → currency inference (for when ForexFactory omits the currency field)
+_NEWS_TITLE_CURRENCY_MAP = {
+    # USD events
+    "nfp": "USD", "non-farm": "USD", "non farm": "USD", "fomc": "USD",
+    "federal reserve": "USD", "fed ": "USD", "cpi": "USD", "pce": "USD",
+    "gdp": "USD", "ism": "USD", "unemployment": "USD", "payroll": "USD",
+    "core pce": "USD", "retail sales": "USD", "ppi": "USD",
+    "consumer price": "USD", "core cpi": "USD", "employment change": "USD",
+    # GBP events
+    "boe": "GBP", "bank of england": "GBP", "mpc": "GBP",
+    # EUR events
+    "ecb": "EUR", "european central": "EUR",
+    # JPY events
+    "boj": "JPY", "bank of japan": "JPY",
+    # CAD events
+    "boc": "CAD", "bank of canada": "CAD",
+    # AUD events
+    "rba": "AUD", "reserve bank of australia": "AUD",
+    # NZD events
+    "rbnz": "NZD", "reserve bank of new zealand": "NZD",
+    "official cash rate": "NZD",
+    # CHF events
+    "snb": "CHF", "swiss national": "CHF",
+    # Oil/global
+    "opec": "USD",
+}
+
+
+def _infer_currency(title: str, raw_currency: str) -> str:
+    """Return the currency for a news event, inferring from title if raw_currency is empty."""
+    if raw_currency and raw_currency.upper() not in ("NONE", ""):
+        return raw_currency.upper()
+    title_lower = title.lower()
+    for keyword, cur in _NEWS_TITLE_CURRENCY_MAP.items():
+        if keyword in title_lower:
+            return cur
+    return ""
+
+
+SYMBOL_CURRENCIES = {
+    "EURUSD": ["EUR","USD"], "GBPUSD": ["GBP","USD"], "USDJPY": ["USD","JPY"],
+    "AUDUSD": ["AUD","USD"], "USDCAD": ["USD","CAD"], "NZDUSD": ["NZD","USD"],
+    "USDCHF": ["USD","CHF"], "EURGBP": ["EUR","GBP"], "EURJPY": ["EUR","JPY"],
+    "GBPJPY": ["GBP","JPY"], "AUDJPY": ["AUD","JPY"], "EURCAD": ["EUR","CAD"],
+    "AUDCAD": ["AUD","CAD"], "EURAUD": ["EUR","AUD"], "GBPAUD": ["GBP","AUD"],
+    # Crypto: USD-denominated, block on high-impact USD events
+    "BTCUSDT": ["USD"], "ETHUSDT": ["USD"], "BNBUSDT": ["USD"],
+    "XRPUSDT": ["USD"], "SOLUSDT": ["USD"], "ADAUSDT": ["USD"],
+    "DOGEUSDT": ["USD"], "DOTUSDT": ["USD"], "MATICUSDT": ["USD"],
+    "LTCUSDT": ["USD"], "SHIBUSDT": ["USD"], "TRXUSDT": ["USD"],
+    "AVAXUSDT": ["USD"], "LINKUSDT": ["USD"], "UNIUSDT": ["USD"],
+}
+
+
+def _build_static_calendar() -> list:
+    """
+    Fallback: a rolling set of known recurring high-impact events for the current week.
+    Used when the live feed is rate-limited or unavailable.
+    """
+    from datetime import timezone as _tz
+    now = datetime.utcnow()
+    # Use this week's Mon 00:00 UTC as the anchor
+    monday = now - timedelta(days=now.weekday())
+    monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Known weekly schedule (day_offset from Monday, hour UTC, title, currency, impact)
+    SCHEDULE = [
+        # Monday
+        (0, 14, 0,  "ISM Manufacturing PMI",      "USD", "High"),
+        # Tuesday
+        (1,  9, 0,  "RBA Interest Rate Decision",  "AUD", "High"),
+        # Wednesday
+        (2, 14, 0,  "ISM Services PMI",             "USD", "High"),
+        (2, 18, 0,  "FOMC Meeting Minutes",          "USD", "High"),
+        (2, 14, 30, "ADP Non-Farm Employment",       "USD", "High"),
+        # Thursday
+        (3, 12, 0,  "ECB Monetary Policy Decision", "EUR", "High"),
+        (3, 12, 30, "Initial Jobless Claims",        "USD", "Medium"),
+        (3,  7, 0,  "BOE Interest Rate Decision",   "GBP", "High"),
+        # Friday
+        (4, 12, 30, "Non-Farm Payrolls (NFP)",       "USD", "High"),
+        (4, 12, 30, "Unemployment Rate",              "USD", "High"),
+        (4, 12, 30, "Average Hourly Earnings",        "USD", "Medium"),
+        (4, 14, 0,  "Consumer Sentiment",             "USD", "Medium"),
+        # These happen monthly but we show every week as placeholders
+        (2, 12, 30, "CPI m/m",                       "USD", "High"),
+        (3, 12, 30, "Core PPI m/m",                  "USD", "Medium"),
+    ]
+
+    events = []
+    for day_off, hour, minute, title, cur, impact in SCHEDULE:
+        ev_time = monday + timedelta(days=day_off, hours=hour, minutes=minute)
+        events.append({
+            "title":    title,
+            "currency": cur,
+            "impact":   impact,
+            "date":     ev_time.isoformat(),
+            "forecast": "",
+            "previous": "",
+            "actual":   "",
+            "_source":  "static_fallback",
+        })
+    return events
+
+
+def get_economic_calendar() -> list:
+    """
+    Fetch this week's economic events from ForexFactory free feed.
+    30-min cache prevents rate limiting. Falls back to static schedule if unavailable.
+    """
+    global _CALENDAR_CACHE, _CALENDAR_CACHE_TIME
+    now = time.time()
+
+    # Serve from cache if fresh enough
+    if _CALENDAR_CACHE and (now - _CALENDAR_CACHE_TIME) < _CALENDAR_CACHE_TTL:
+        return _CALENDAR_CACHE
+
+    try:
+        r = requests.get(
+            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+            timeout=8,
+            headers={"User-Agent": "CLEO-TradingBot/4.0"},
+        )
+        if r.status_code == 200:
+            text = r.text.strip()
+            if text and text.startswith("["):
+                data = r.json()
+                if data:
+                    _CALENDAR_CACHE = data
+                    _CALENDAR_CACHE_TIME = now
+                    print(f"[CALENDAR] ✅ Live feed: {len(data)} events this week")
+                    return data
+        elif r.status_code == 429:
+            print("[CALENDAR] ⚠️ Rate-limited by ForexFactory — using cache/fallback")
+        else:
+            print(f"[CALENDAR] HTTP {r.status_code} from ForexFactory")
+    except Exception as e:
+        print(f"[CALENDAR] Fetch failed: {e}")
+
+    # Return stale cache if available
+    if _CALENDAR_CACHE:
+        print("[CALENDAR] Serving stale cache")
+        return _CALENDAR_CACHE
+
+    # Last resort: static fallback
+    print("[CALENDAR] Using static fallback schedule")
+    fallback = _build_static_calendar()
+    _CALENDAR_CACHE = fallback
+    _CALENDAR_CACHE_TIME = now - (_CALENDAR_CACHE_TTL - 120)  # re-try in 2 min
+    return fallback
+
+
+def check_news_blackout(symbol: str, hours_before: float = 2.0, hours_after: float = 1.0) -> dict:
+    """
+    Check if a high-impact news event is within hours_before/after for the symbol's currencies.
+    Returns: {blocked, warning, events, message}
+    """
+    from datetime import timezone as _tz
+    symbol = symbol.upper()
+    currencies = SYMBOL_CURRENCIES.get(symbol, [])
+    if not currencies and "USD" in symbol:
+        currencies = ["USD"]
+
+    events = get_economic_calendar()
+    now_utc = datetime.utcnow()
+    relevant_high = []
+    relevant_medium = []
+
+    for event in events:
+        raw_cur  = (event.get("currency") or "")
+        impact   = (event.get("impact")   or "").lower()
+        date_str = (event.get("date")     or "")
+        title    = (event.get("title")    or "")
+        currency = _infer_currency(title, raw_cur)
+
+        if currency not in [c.upper() for c in currencies]:
+            continue
+        if impact not in ("high", "medium"):
+            continue
+
+        try:
+            event_dt = datetime.fromisoformat(date_str)
+            if event_dt.tzinfo is not None:
+                event_utc = event_dt.astimezone(_tz.utc).replace(tzinfo=None)
+            else:
+                event_utc = event_dt
+
+            mins_until = (event_utc - now_utc).total_seconds() / 60
+
+            if impact == "high" and (-hours_after * 60) <= mins_until <= (hours_before * 60):
+                relevant_high.append({
+                    "title": title, "currency": currency, "impact": "High",
+                    "time_utc": event_utc.strftime("%Y-%m-%d %H:%M UTC"),
+                    "mins_until": round(mins_until),
+                    "status": "upcoming" if mins_until > 0 else "just released"
+                })
+            elif impact == "medium" and 0 < mins_until <= 60:
+                relevant_medium.append({
+                    "title": title, "currency": currency, "impact": "Medium",
+                    "time_utc": event_utc.strftime("%Y-%m-%d %H:%M UTC"),
+                    "mins_until": round(mins_until),
+                    "status": "upcoming"
+                })
+        except Exception:
+            continue
+
+    if relevant_high:
+        parts = []
+        for e in relevant_high:
+            if e["mins_until"] > 0:
+                parts.append(f"{e['title']} ({e['currency']}) in {e['mins_until']} mins")
+            else:
+                parts.append(f"{e['title']} ({e['currency']}) released {abs(e['mins_until'])} mins ago")
+        return {
+            "blocked": True, "warning": False, "events": relevant_high,
+            "message": f"🚫 News blackout: {'; '.join(parts)} — holding off to protect capital"
+        }
+
+    if relevant_medium:
+        parts = [f"{e['title']} ({e['currency']}) in {e['mins_until']}m" for e in relevant_medium[:2]]
+        return {
+            "blocked": False, "warning": True, "events": relevant_medium,
+            "message": f"⚠️ Medium-impact news soon: {'; '.join(parts)} — trade with caution"
+        }
+
+    return {"blocked": False, "warning": False, "events": [], "message": ""}
+
+
+def get_upcoming_events_text(currencies: list = None, hours_ahead: float = 6) -> str:
+    """Return a readable summary of upcoming high/medium events for CLEO's chat context."""
+    from datetime import timezone as _tz
+    events = get_economic_calendar()
+    now_utc = datetime.utcnow()
+    upcoming = []
+    for event in events:
+        raw_cur  = (event.get("currency") or "")
+        impact   = (event.get("impact")   or "").lower()
+        date_str = (event.get("date")     or "")
+        title    = (event.get("title")    or "")
+        currency = _infer_currency(title, raw_cur)
+        if impact not in ("high", "medium"):
+            continue
+        if currencies and currency not in [c.upper() for c in currencies]:
+            continue
+        try:
+            event_dt = datetime.fromisoformat(date_str)
+            if event_dt.tzinfo is not None:
+                event_utc = event_dt.astimezone(_tz.utc).replace(tzinfo=None)
+            else:
+                event_utc = event_dt
+            mins_until = (event_utc - now_utc).total_seconds() / 60
+            if 0 < mins_until <= hours_ahead * 60:
+                upcoming.append((mins_until, currency, impact, title, event_utc))
+        except Exception:
+            continue
+
+    if not upcoming:
+        return ""
+    upcoming.sort(key=lambda x: x[0])
+    lines = []
+    for mins, cur, imp, title, dt in upcoming[:8]:
+        h = int(mins // 60)
+        m = int(mins % 60)
+        time_str = f"{h}h {m}m" if h else f"{m}m"
+        imp_icon = "🔴" if imp == "high" else "🟡"
+        lines.append(f"  {imp_icon} {title} ({cur}) — in {time_str}")
+    return "━━━ UPCOMING ECONOMIC EVENTS (next 6 hours) ━━━\n" + "\n".join(lines)
+
+
 def get_market_context() -> str:
     context = []
     for f in ["EUR", "GBP", "JPY", "AUD", "CAD"]:
@@ -1753,6 +2027,12 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
         except Exception:
             pass
 
+    # ── upcoming economic events context ──
+    try:
+        news_section = get_upcoming_events_text(hours_ahead=6)
+    except Exception:
+        news_section = ""
+
     # ── build system prompt ──
     system_prompt = f"""You are CLEO — Creative Loop Expert Optimizer.
 You are a world-class AI trading strategist with a warm, confident personality.
@@ -1774,6 +2054,8 @@ Live USD/NGN Rate: {ngn_rate:.2f}
 Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 
 {exchange_rates_section}
+
+{news_section}
 
 ━━━ WHAT YOU REMEMBER ABOUT {name.upper()} ━━━
 {memories}
@@ -1815,7 +2097,8 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
    • Data: [live / AI-reasoning]
 9. Hold time MUST be in real time units: minutes (< 1h), hours (1h–48h), or days (> 48h). Never say "short-term" without a number.
 10. Tone: warm, direct, institutional — no hype, no guaranteed profit language
-11. End every trade recommendation with: ⚠️ Risk: [one-sentence disclaimer]"""
+11. NEWS AWARENESS: If the UPCOMING ECONOMIC EVENTS section above shows any 🔴 High-impact event for the user's pair within 2 hours, proactively warn them: "⚠️ [Event] drops in X minutes — I'd wait until after the release before entering." Do not block the user, just clearly flag it.
+12. End every trade recommendation with: ⚠️ Risk: [one-sentence disclaimer]"""
 
     full_prompt = f"{system_prompt}\n\n{name}: {chat.message}\nCLEO:"
     response = get_ai_response_creative(full_prompt)
@@ -2015,6 +2298,92 @@ def convert_endpoint(amount: float, from_currency: str, to_currency: str):
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
+
+
+@app.get("/economic_calendar")
+def economic_calendar_endpoint(
+    impact: str = "all",
+    symbol: str = None,
+    hours_ahead: float = 24,
+):
+    """
+    Return upcoming economic events from ForexFactory (free feed, updated every 30 min).
+    - impact: 'high', 'medium', 'low', or 'all' (default: all)
+    - symbol: optional — filter to events relevant to this trading pair (e.g. GBPUSD)
+    - hours_ahead: how many hours ahead to look (default 24)
+
+    Example: /economic_calendar?impact=high&symbol=GBPUSD&hours_ahead=6
+    """
+    from datetime import timezone as _tz
+    events = get_economic_calendar()
+    now_utc = datetime.utcnow()
+
+    currencies_filter = None
+    if symbol:
+        currencies_filter = [c.upper() for c in SYMBOL_CURRENCIES.get(symbol.upper(), [])]
+
+    result = []
+    for event in events:
+        ev_raw_cur  = (event.get("currency") or "")
+        ev_impact   = (event.get("impact")   or "").lower()
+        ev_date     = (event.get("date")     or "")
+        ev_title    = (event.get("title")    or "")
+        ev_forecast = event.get("forecast", "")
+        ev_previous = event.get("previous", "")
+        ev_actual   = event.get("actual", "")
+        ev_currency = _infer_currency(ev_title, ev_raw_cur)
+
+        if impact != "all" and ev_impact != impact.lower():
+            continue
+        if currencies_filter and ev_currency not in currencies_filter:
+            continue
+
+        try:
+            event_dt = datetime.fromisoformat(ev_date)
+            if event_dt.tzinfo is not None:
+                event_utc = event_dt.astimezone(_tz.utc).replace(tzinfo=None)
+            else:
+                event_utc = event_dt
+
+            mins_until = (event_utc - now_utc).total_seconds() / 60
+            if mins_until < -(60 * 24):  # skip events more than 24h in the past
+                continue
+            if mins_until > hours_ahead * 60:
+                continue
+
+            result.append({
+                "title":    ev_title,
+                "currency": ev_currency,
+                "impact":   ev_impact.capitalize(),
+                "time_utc": event_utc.strftime("%Y-%m-%d %H:%M UTC"),
+                "mins_until": round(mins_until),
+                "status": (
+                    "upcoming" if mins_until > 0
+                    else "in_progress" if mins_until > -30
+                    else "released"
+                ),
+                "forecast": ev_forecast,
+                "previous": ev_previous,
+                "actual":   ev_actual,
+            })
+        except Exception:
+            continue
+
+    result.sort(key=lambda x: x["mins_until"])
+
+    high_count   = sum(1 for e in result if e["impact"] == "High")
+    medium_count = sum(1 for e in result if e["impact"] == "Medium")
+
+    return {
+        "events": result,
+        "total": len(result),
+        "high_impact": high_count,
+        "medium_impact": medium_count,
+        "symbol_filter": symbol,
+        "hours_ahead": hours_ahead,
+        "source": "ForexFactory (free feed)",
+        "cache_age_mins": round((time.time() - _CALENDAR_CACHE_TIME) / 60, 1) if _CALENDAR_CACHE_TIME else None,
+    }
 
 
 @app.post("/risk_calculator")
@@ -2996,6 +3365,21 @@ def place_bot_trade(
             "warnings": filter_result.get("warnings", []),
             "message": "Trade BLOCKED by Market Filter — no order queued",
         }
+
+    # ── 1b. News Blackout Filter ──────────────────────────────────
+    news_check = check_news_blackout(symbol)
+    if news_check["blocked"]:
+        print(f"[NEWS-FILTER] {symbol} BLOCKED — {news_check['message']}")
+        return {
+            "success": False,
+            "approved": False,
+            "blocks": [news_check["message"]],
+            "news_events": news_check["events"],
+            "message": f"Trade BLOCKED by News Filter — {news_check['message']}",
+        }
+    warnings = filter_result.get("warnings", [])
+    if news_check["warning"]:
+        warnings.append(news_check["message"])
 
     # ── 2. Risk Engine — daily loss check ───────────────────────
     loss_check = RiskEngine.check_daily_loss(user.id, cfg, db)

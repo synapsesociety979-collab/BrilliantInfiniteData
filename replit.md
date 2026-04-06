@@ -3,14 +3,15 @@
 ## Project Overview
 FastAPI backend for CLEO — an AI-powered institutional-grade trading bot analyzing 30 Forex and crypto markets. Provides real-time signal generation from live Alpha Vantage OHLCV data, NGN/USD conversion, demo trading, persistent PostgreSQL user data, personalized advice, a visual trading simulator, and a full MT5 auto-execution engine with Risk Engine, Market Filter, and Trade Manager.
 
-## Current Status (March 2026)
+## Current Status (April 2026)
 - **Backend**: Running on port 5000
 - **Data Source**: Twelve Data (primary, 800 req/day) → Alpha Vantage (fallback, 25/day) → AI reasoning
 - **AI Model**: llama-3.3-70b-versatile via Groq (100,000 TPD free tier)
 - **Persistence**: Full PostgreSQL (users, trades, chat, journal, watchlist, activity, bot orders)
 - **Accuracy Target**: 70%+ via real indicator data fed to AI
-- **Auto-Trading**: Full MT5 bridge system with Risk Engine, Market Filter, Trade Manager
+- **Auto-Trading**: Full MT5 bridge system with Risk Engine, Market Filter, Trade Manager, News Blackout
 - **Prediction Cache**: 60-minute disk-backed cache (survives restarts; keeps daily Groq usage ~84K/100K TPD)
+- **Economic Calendar**: ForexFactory free feed (30-min cache) + static fallback; 88+ events/week; currency inference for null fields
 
 ## Architecture
 
