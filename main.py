@@ -470,6 +470,90 @@ def get_upcoming_events_text(currencies: list = None, hours_ahead: float = 6) ->
     return "━━━ UPCOMING ECONOMIC EVENTS (next 6 hours) ━━━\n" + "\n".join(lines)
 
 
+def get_budget_trading_plan(balance_ngn: float, ngn_rate: float) -> str:
+    """
+    Given any NGN balance, return a concrete, actionable trading plan
+    with exact position sizes, risk amounts, and realistic expectations.
+    Never says 'too small' — always gives a plan.
+    """
+    balance_usd = balance_ngn / ngn_rate
+    risk_ngn    = balance_ngn * 0.02
+    risk_usd    = balance_usd * 0.02
+
+    if balance_usd < 1:
+        tier = "nano"
+        recommendation = "demo"
+        account_type   = "Demo Account (practice with virtual funds)"
+        min_lots       = "N/A"
+        crypto_units   = "practice only"
+    elif balance_usd < 10:
+        tier = "micro"
+        recommendation = "demo + crypto spot"
+        account_type   = "Demo Account or Crypto Spot (buy fractional crypto)"
+        min_lots       = "N/A for forex — too small for MT5 micro-lot (min $50)"
+        crypto_units   = f"~{risk_usd:.4f} USD worth of BTC/ETH/SOL"
+    elif balance_usd < 100:
+        tier = "mini"
+        recommendation = "crypto micro or demo forex"
+        account_type   = "Micro Account (some brokers accept $10+ min deposit)"
+        min_lots       = "0.01 lots (micro) on low-margin pairs"
+        crypto_units   = f"~{risk_usd:.4f} USD worth per trade"
+    elif balance_usd < 500:
+        tier = "standard_micro"
+        recommendation = "forex micro lots"
+        account_type   = "Standard Account — trade 0.01-0.05 lots"
+        min_lots       = f"0.01 lots (${balance_usd * 0.001:.2f} per pip on EUR/USD)"
+        crypto_units   = f"${risk_usd:.2f} per position"
+    else:
+        tier = "standard"
+        recommendation = "full forex trading"
+        account_type   = "Standard Account — full access to all 30 pairs"
+        min_lots       = f"0.01-{balance_usd/10000:.2f} lots (scaled to 2% risk)"
+        crypto_units   = f"${risk_usd:.2f} per position"
+
+    plan = f"""━━━ YOUR PERSONALISED TRADING PLAN ━━━
+Balance: ₦{balance_ngn:,.0f} NGN = ${balance_usd:.2f} USD
+Risk per trade (2%): ₦{risk_ngn:,.0f} NGN = ${risk_usd:.4f} USD
+Account type: {account_type}
+Position size: {min_lots}
+Strategy: {recommendation.title()}
+
+"""
+    if tier == "nano":
+        plan += """PLAN: Start on Demo to build skill and track record.
+• Use the /demo/open_account endpoint to practice with virtual ₦50,000
+• Target 70%+ win rate on demo before depositing any real money
+• Minimum real deposit to trade forex: ~₦50,000 (~$30)
+• While saving: study CLEO's signals daily and track which ones hit TP1"""
+
+    elif tier == "micro":
+        plan += f"""PLAN: Demo + Crypto Spot micro-trading.
+• Open a free demo account (CLEO's demo system) to practice risk management
+• For real trading: platforms like Binance/Bybit allow crypto with just ${balance_usd:.2f}
+• Buy ${risk_usd:.4f} worth of BTC or ETH per signal — fractional amounts allowed
+• Target: grow to ₦50,000 (~$30) before opening a forex account
+• Expected growth at 70% accuracy: +20-40% per month on demo"""
+
+    elif tier == "mini":
+        plan += f"""PLAN: Crypto micro-trading + saving for forex.
+• Your ${balance_usd:.2f} can trade crypto on Binance/Bybit/Kraken spot
+• Risk ${risk_usd:.4f} per signal (2% of balance)
+• Best pairs for your size: BTCUSDT, ETHUSDT, SOLUSDT (high liquidity, tight spread)
+• For forex: brokers like FBS, Exness, XM accept deposits from $10
+• Target: 3-5 trades per week, aim for TP1 each time"""
+
+    else:
+        plan += f"""PLAN: Live forex + crypto trading.
+• Your ${balance_usd:.2f} qualifies for micro-lot forex trading
+• Risk ₦{risk_ngn:,.0f} / ${risk_usd:.2f} per trade (2% rule — never break this)
+• Lot size guideline: 0.01 lots per ~$100 in account (conservative)
+• Recommended pairs: EURUSD, GBPUSD (tightest spreads save you money)
+• Max 3 trades open at once — protects against correlated losses
+• Target monthly return: 8-15% (conservative), up to 25% (aggressive)"""
+
+    return plan
+
+
 def get_market_context() -> str:
     context = []
     for f in ["EUR", "GBP", "JPY", "AUD", "CAD"]:
@@ -834,48 +918,65 @@ def generate_market_predictions(
         else "AI pattern reasoning (live data unavailable)"
     )
 
-    prompt = f"""SESSION: {session} | UTC: {utc.strftime("%H:%M")} | Data: {data_source_note}
-Budget: {investment_amount_ngn:,.0f} NGN (~${inv_usd:,.2f} USD @ {ngn_rate:.2f}){personalization}
+    prompt = f"""━━━ CLEO MARKET ANALYSIS ENGINE ━━━
+SESSION: {session} | UTC: {utc.strftime("%H:%M")} | Data: {data_source_note}
+Budget: {investment_amount_ngn:,.0f} NGN (~${inv_usd:,.2f} USD) | Risk/trade: {investment_amount_ngn*0.02:,.0f} NGN (~${investment_amount_ngn*0.02/ngn_rate:.2f} USD){personalization}
 
-GOAL: Analyze ALL 30 symbols below and return EVERY symbol that has a tradeable signal.
-Target: 5-12 signals. No artificial limit. If a clear setup exists, include it.
+GOAL: Analyze ALL 30 symbols and return every symbol with a genuine tradeable edge.
+Target: 5-12 signals. Quality over quantity — only include setups with real conviction.
 
-━━━ SECTION A — LIVE INDICATOR DATA (use exact values shown) ━━━
-{"No live data available this cycle — see Section B for all symbols." if not has_real_data else ""}
+━━━ YOUR REASONING PROCESS (apply to EVERY symbol) ━━━
+Before assigning any signal, mentally work through these 6 steps:
+
+1. TREND: Is price making HH+HL (uptrend), LH+LL (downtrend), or choppy range?
+2. MOMENTUM: Do RSI, MACD histogram, and Stochastic all agree on direction?
+3. CONFIRMATION: Is EMA stack aligned? Does ADX confirm a trending market (>20)?
+4. VOLATILITY: Is ATR healthy (not compressed)? Is this the right session for this pair?
+5. RISK: Can I place a stop at 1.5×ATR with at least 1:1.5 R:R to TP1?
+6. CONVICTION: How many of steps 1-5 agree? 5-6 = STRONG. 3-4 = BUY/SELL. 1-2 = skip.
+
+━━━ SECTION A — LIVE INDICATOR DATA (12 symbols with full OHLCV + indicators) ━━━
+{"No live data this cycle — see Section B." if not has_real_data else ""}
 {live_data_section if has_real_data else ""}
 
-SECTION A GATES (apply ONLY to symbols above with live data):
-✗ Confluence score 0-1/6 → exclude (2/6+ is allowed)
-✗ ADX < 20 → exclude (ranging market)
-✗ AI direction opposite to confluence direction → exclude
-✗ R:R below 1:1.5 → exclude
-Confidence: score 5-6/6→88-95 | 4/6→80-87 | 3/6→75-79 | 2/6→73-74
+SECTION A RULES:
+✓ For each symbol above: run all 6 reasoning steps explicitly in your head
+✓ Use the EXACT indicator values shown — never invent or adjust them
+✓ Confluence score 2/6+ required. ADX must be > 20. R:R must be ≥ 1:1.5
+✓ Confidence mapping: 6/6→92-97 | 5/6→86-91 | 4/6→80-85 | 3/6→75-79 | 2/6→73-74
+✗ Skip if: confluence 0-1/6, ADX<20, R:R<1:1.5, or AI direction ≠ confluence direction
 
-━━━ SECTION B — AI REASONING (reference prices + ATR provided) ━━━
-For these {len(remaining_symbols)} symbols use your institutional knowledge of recent price action,
-macro drivers, inter-market correlations and session behaviour.
-SL/TP levels below are ATR-derived — USE THEM EXACTLY. Expected: 3-6 signals from this section.
+━━━ SECTION B — AI PATTERN REASONING ({len(remaining_symbols)} symbols, ATR-derived levels provided) ━━━
+For these symbols: use intermarket correlations, macro drivers, session behaviour,
+and your knowledge of current USD strength/weakness and global risk appetite.
+The ATR-derived SL/TP levels below are pre-calculated — USE THEM EXACTLY.
 
-{remaining_text if remaining_text else "(all symbols have live data)"}
+{remaining_text if remaining_text else "(all symbols covered in Section A)"}
 
-SECTION B GATES:
-✗ Only skip if you truly cannot determine any directional bias for the asset
-✓ Lean on session context: {session.split("—")[0].strip()} — favour pairs active now
-✓ Lean on macro: USD strength/weakness, risk-on/off, crypto market structure
-✓ Include if any 2 of: RSI trend, MACD direction, EMA bias, recent S/R level agree
-Confidence cap: 78 (ai_reasoning). Confluence: "X/3" (RSI/MACD/EMA).
+SECTION B RULES:
+✓ Run your 6-step reasoning even without live indicators
+✓ Use macro context: Is USD strong or weak right now? Risk-on or risk-off?
+✓ Use session context: {session.split("—")[0].strip()} session — which pairs have liquidity NOW?
+✓ Use correlations: EURUSD ↑ often means GBPUSD ↑, USDCHF ↓
+✓ Include if 3+ of: macro bias, EMA estimate, RSI estimate, session activity, S/R level agree
+✗ Confidence cap: 78 for ai_reasoning. Confluence format: "X/3"
 
-━━━ SIGNAL RULES (both sections) ━━━
-- data_source = "live_data" for Section A, "ai_reasoning" for Section B
-- Entry = current/reference price, or a slightly better pullback level
-- Use ATR SL/TP levels provided — do not invent different numbers
-- back_out_trigger = price level that invalidates the thesis
-- Session fit: {session.split('—')[0].strip()}
+━━━ SIGNAL CONSTRUCTION RULES ━━━
+- entry_price: current live price or best pullback entry (within 0.1% of live price)
+- stop_loss: entry ± (1.5 × ATR). Never tighter than 0.5 ATR.
+- take_profit_1: 1.5R from entry. take_profit_2: 2.5R. take_profit_3: 4.0R.
+- back_out_trigger: the price level that COMPLETELY invalidates the trade thesis
+- hold_time: based on ATR and timeframe — scalp=15min-2h, intraday=2-24h, swing=1-5 days
+- rationale: 1 crisp sentence — name the 2 strongest indicator signals + the setup logic
+- data_source: "live_data" for Section A symbols, "ai_reasoning" for Section B
 
-POSITION SIZING: 2% risk per trade
-Risk: {investment_amount_ngn * 0.02:,.0f} NGN = ${investment_amount_ngn * 0.02 / ngn_rate:.2f} USD
+━━━ WHAT NOT TO DO ━━━
+✗ Do NOT output HOLD signals — only output actual trade signals
+✗ Do NOT adjust ATR-derived SL/TP numbers (they are pre-calculated for correct R:R)
+✗ Do NOT give a signal if indicators conflict — skip that symbol
+✗ Do NOT output any text outside the JSON array
 
-Return ONLY a valid JSON array. No HOLD signals. No text outside the brackets. Keep each object compact — one signal ≈ 15 lines max.
+Return ONLY a valid JSON array:
 [
   {{
     "symbol": "SYMBOL",
@@ -893,9 +994,9 @@ Return ONLY a valid JSON array. No HOLD signals. No text outside the brackets. K
     "take_profit_2": 0.0,
     "take_profit_3": 0.0,
     "risk_reward": "1:X.X",
-    "hold_time": "Xh",
+    "hold_time": "Xh or Xd",
     "back_out_trigger": 0.0,
-    "rationale": "One sentence: key indicator + setup logic."
+    "rationale": "2 indicators + setup in one sentence."
   }}
 ]"""
 
@@ -2033,6 +2134,42 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
     except Exception:
         news_section = ""
 
+    # ── detect balance/budget mentions → inject personalised trading plan ──
+    import re as _re
+    budget_plan_section = ""
+    BUDGET_KEYWORDS = ["have", "naira", "ngn", "₦", "budget", "capital",
+                       "balance", "invest", "deposit", "start with", "money",
+                       "fund", "save", "dollar", "usd", "$"]
+    msg_lower = chat.message.lower()
+    has_budget_keyword = any(kw in msg_lower for kw in BUDGET_KEYWORDS)
+    if has_budget_keyword:
+        # Try to extract a number from the message (could be NGN or USD)
+        nums = _re.findall(r"[\d,]+\.?\d*", chat.message.replace(",", ""))
+        nums = [float(n) for n in nums if float(n) > 0] if nums else []
+        if nums:
+            raw_amount = max(nums)   # take the largest number as the balance
+            # Heuristic: if amount > 500 and no "$" sign, assume NGN
+            if "$" in chat.message or "usd" in msg_lower or "dollar" in msg_lower:
+                detected_ngn = raw_amount * ngn_rate
+            elif raw_amount > 500 or "ngn" in msg_lower or "naira" in msg_lower or "₦" in msg_lower:
+                detected_ngn = raw_amount
+            else:
+                detected_ngn = raw_amount * ngn_rate  # assume USD for small numbers
+            try:
+                budget_plan_section = get_budget_trading_plan(detected_ngn, ngn_rate)
+            except Exception:
+                pass
+        elif any(kw in msg_lower for kw in ["what can i do", "how to start",
+                                             "how much do i need", "can i trade",
+                                             "how do i start", "where do i start"]):
+            # General "how do I start" question — use their stored balance if any
+            try:
+                stored_bal = float(user.balance_ngn or 0)
+                if stored_bal > 0:
+                    budget_plan_section = get_budget_trading_plan(stored_bal, ngn_rate)
+            except Exception:
+                pass
+
     # ── build system prompt ──
     system_prompt = f"""You are CLEO — Creative Loop Expert Optimizer.
 You are a world-class AI trading strategist with a warm, confident personality.
@@ -2057,16 +2194,18 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 
 {news_section}
 
+{budget_plan_section}
+
 ━━━ WHAT YOU REMEMBER ABOUT {name.upper()} ━━━
 {memories}
 
-{"━━━ MARKET DATA FOR: " + ", ".join(covered_syms) + " ━━━" if live_data_section_chat else ""}
+{"━━━ LIVE MARKET DATA FOR: " + ", ".join(covered_syms) + " ━━━" if live_data_section_chat else ""}
 {live_data_section_chat}
-{("CRITICAL: Data is shown above for " + ", ".join(covered_syms) + ". "
-  "Use it NOW to generate a signal — do NOT say you lack data for these pairs. "
-  "State the data mode (AI-reasoning / live candles) transparently.") if live_data_section_chat else ""}
+{("CRITICAL — Data is shown above for " + ", ".join(covered_syms) + ". "
+  "Apply your 6-step reasoning framework to this data NOW. "
+  "Generate a precise signal. State the data mode (AI-reasoning / live candles).") if live_data_section_chat else ""}
 
-━━━ CURRENT TOP SIGNALS (from live analysis engine) ━━━
+━━━ CURRENT TOP SIGNALS ━━━
 {json.dumps([{
     "symbol": s.get("symbol"), "signal": s.get("signal"),
     "confidence": s.get("confidence"), "entry": s.get("entry_price"),
@@ -2077,28 +2216,33 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 ━━━ THIS CONVERSATION ━━━
 {history_text if history_text else "New conversation."}
 
-━━━ YOUR RULES ━━━
-1. Address {name} by name naturally — not every sentence
-2. If LIVE DATA is shown above for any symbol, YOU MUST derive a signal from it — do NOT say "I don't have a signal for this pair" or "it's not in my top signals". The top-signals list is supplementary. Your primary analysis comes from the live data block.
-3. NEVER say "I don't have real-time data" when data is shown in this prompt — you have it
-4. If a user asks about a pair NOT in the live data block above, pick the closest signal from the top-signals list and note the similarity
-5. Any NGN amount → instantly show USD: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD
-6. Recommend 2% risk per trade for {user.trading_style} / {user.risk_tolerance} risk
-7. Show exact maths — no approximations without the calculation
-8. REQUIRED signal format (use every time you give a signal):
-   • Pair + Direction (BUY/SELL)
-   • Entry: [exact price from data]
-   • Stop Loss: [ATR-based level] ([X pips / X%])
-   • TP1: [level] — [estimated X–Y hours]
-   • TP2: [level] — [estimated X–Y hours/days]
-   • TP3: [level] — [estimated X–Y days]
-   • Confluence: [score]/6 — [2-word strength label]
-   • Exit if: [exact invalidation condition]
-   • Data: [live / AI-reasoning]
-9. Hold time MUST be in real time units: minutes (< 1h), hours (1h–48h), or days (> 48h). Never say "short-term" without a number.
-10. Tone: warm, direct, institutional — no hype, no guaranteed profit language
-11. NEWS AWARENESS: If the UPCOMING ECONOMIC EVENTS section above shows any 🔴 High-impact event for the user's pair within 2 hours, proactively warn them: "⚠️ [Event] drops in X minutes — I'd wait until after the release before entering." Do not block the user, just clearly flag it.
-12. End every trade recommendation with: ⚠️ Risk: [one-sentence disclaimer]"""
+━━━ YOUR OPERATING RULES ━━━
+1. REASONING FIRST — before answering any market question, silently apply the 6-step framework:
+   Trend → Momentum → Confirmation → Volatility → Risk → Conviction.
+   Then give your answer with that reasoning embedded naturally in your response.
+2. LIVE DATA — if live data is shown above, USE it. Never say "I don't have data" when data is shown.
+3. NO EXCUSES ON BUDGET — if {name} mentions ANY amount (even ₦500), give a concrete plan.
+   Use the budget plan above. Never say "this is too small." Always say "here's what you can do."
+4. NGN ↔ USD — convert instantly: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD. Always show both.
+5. RISK DISCIPLINE — recommend 2% risk per trade always. For {user.trading_style} / {user.risk_tolerance} risk.
+6. MATHS — show exact calculations. Entry ± ATR×1.5 = SL. R×1.5 = TP1. R×2.5 = TP2. R×4 = TP3.
+7. SIGNAL FORMAT — every signal must include:
+   • Pair + Direction (BUY/SELL/STRONG BUY/STRONG SELL)
+   • Entry: [exact price]
+   • Stop Loss: [level] ([pips / %])
+   • TP1: [level] — [time estimate]
+   • TP2: [level] — [time estimate]
+   • TP3: [level] — [time estimate]
+   • Confluence: [X/6] — [strength label]
+   • Exit if: [invalidation level]
+   • Data: [live candles / AI-reasoning]
+8. HOLD TIMES — always in real units: "45 minutes", "4 hours", "3 days". Never "short-term" alone.
+9. NEWS AWARENESS — if upcoming events above show 🔴 High-impact news within 2 hours for the pair,
+   warn: "⚠️ [Event] in X minutes — I'd wait for the dust to settle before entering."
+10. CONTINUOUS IMPROVEMENT — reference the user's trade history, risk tolerance, and past wins/losses
+    when giving advice. Tailor every recommendation to {name}'s specific situation.
+11. TONE — warm, institutional, direct. Like a senior trader mentoring a student. No hype.
+12. NEVER guarantee profits. End every trade recommendation with ⚠️ Risk: [one-sentence disclaimer]."""
 
     full_prompt = f"{system_prompt}\n\n{name}: {chat.message}\nCLEO:"
     response = get_ai_response_creative(full_prompt)

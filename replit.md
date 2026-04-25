@@ -12,6 +12,8 @@ FastAPI backend for CLEO — an AI-powered institutional-grade trading bot analy
 - **Auto-Trading**: Full MT5 bridge system with Risk Engine, Market Filter, Trade Manager, News Blackout
 - **Prediction Cache**: 60-minute disk-backed cache (survives restarts; keeps daily Groq usage ~84K/100K TPD)
 - **Economic Calendar**: ForexFactory free feed (30-min cache) + static fallback; 88+ events/week; currency inference for null fields
+- **AI Reasoning**: Upgraded to 6-step framework (Trend→Momentum→Confirmation→Volatility→Risk→Conviction) in both signal generation and chat
+- **Budget-Aware Planning**: Any NGN amount triggers a personalised trading plan — CLEO never says "too small", always gives a concrete plan
 
 ## Architecture
 
