@@ -575,6 +575,120 @@ def calc_williams_r(df: pd.DataFrame, period=14) -> float:
     return round(float(wr.iloc[-1]), 2)
 
 
+def calc_fibonacci_levels(df: pd.DataFrame, lookback: int = 50) -> dict:
+    """
+    Fibonacci retracement levels based on the most recent swing high/low
+    over the last `lookback` candles.
+    Key levels: 23.6%, 38.2%, 50%, 61.8%, 78.6%
+    """
+    if len(df) < lookback:
+        lookback = len(df)
+    recent = df.tail(lookback)
+    swing_high = float(recent["high"].max())
+    swing_low  = float(recent["low"].min())
+    diff = swing_high - swing_low
+    if diff <= 0:
+        return {}
+    dp = 6
+    return {
+        "swing_high": round(swing_high, dp),
+        "swing_low":  round(swing_low, dp),
+        "fib_236":    round(swing_high - diff * 0.236, dp),
+        "fib_382":    round(swing_high - diff * 0.382, dp),
+        "fib_500":    round(swing_high - diff * 0.500, dp),
+        "fib_618":    round(swing_high - diff * 0.618, dp),
+        "fib_786":    round(swing_high - diff * 0.786, dp),
+    }
+
+
+def calc_market_structure(close: pd.Series, lookback: int = 20) -> str:
+    """
+    Detect market structure: uptrend (HH+HL), downtrend (LH+LL), or ranging.
+    Compares the last 3 swing points in the close series.
+    """
+    if len(close) < lookback:
+        return "insufficient data"
+    prices = close.tail(lookback).values
+    # Split into 4 segments and take the high/low of each
+    n = len(prices) // 4
+    if n < 1:
+        return "insufficient data"
+    segs = [prices[i*n:(i+1)*n] for i in range(4)]
+    highs = [s.max() for s in segs]
+    lows  = [s.min() for s in segs]
+    # Higher highs + higher lows = uptrend
+    hh = highs[-1] > highs[-2] > highs[-3]
+    hl = lows[-1]  > lows[-2]  > lows[-3]
+    # Lower highs + lower lows = downtrend
+    lh = highs[-1] < highs[-2] < highs[-3]
+    ll = lows[-1]  < lows[-2]  < lows[-3]
+    if hh and hl:
+        return "UPTREND — Higher Highs + Higher Lows (bullish structure)"
+    elif lh and ll:
+        return "DOWNTREND — Lower Highs + Lower Lows (bearish structure)"
+    elif hh and not hl:
+        return "BULLISH BIAS — Higher Highs but lows consolidating"
+    elif ll and not lh:
+        return "BEARISH BIAS — Lower Lows but highs consolidating"
+    else:
+        return "RANGING — No clear directional structure"
+
+
+def calc_momentum_score(
+    rsi: float, macd_hist: float, adx: float,
+    price: float, ema20: Optional[float], ema50: Optional[float],
+    stoch_k: float, williams_r: float
+) -> dict:
+    """
+    Combines all momentum indicators into a single -10 to +10 score.
+    Positive = bullish momentum. Negative = bearish. Near 0 = neutral.
+    """
+    score = 0.0
+
+    # RSI contribution (-2 to +2)
+    if rsi < 30:   score += 2.0
+    elif rsi < 45: score += 1.0
+    elif rsi > 70: score -= 2.0
+    elif rsi > 55: score -= 1.0
+
+    # MACD histogram contribution (-2 to +2)
+    if macd_hist > 0:   score += 2.0
+    elif macd_hist < 0: score -= 2.0
+
+    # EMA stack contribution (-2 to +2)
+    if ema20 and ema50:
+        if price > ema20 > ema50:   score += 2.0
+        elif price < ema20 < ema50: score -= 2.0
+        elif price > ema20:         score += 1.0
+        elif price < ema20:         score -= 1.0
+
+    # Stochastic contribution (-1 to +1)
+    if stoch_k < 25:   score += 1.0
+    elif stoch_k > 75: score -= 1.0
+
+    # Williams %R contribution (-1 to +1)
+    if williams_r < -80:  score += 1.0
+    elif williams_r > -20: score -= 1.0
+
+    # ADX modifier — weak trend dampens signal
+    if adx < 20:
+        score *= 0.5   # range market — reduce confidence
+    elif adx > 40:
+        score *= 1.2   # strong trend — amplify signal
+
+    score = max(-10, min(10, round(score, 1)))
+
+    if score >= 6:      label = "STRONG BULLISH"
+    elif score >= 3:    label = "BULLISH"
+    elif score >= 1:    label = "MILD BULLISH"
+    elif score <= -6:   label = "STRONG BEARISH"
+    elif score <= -3:   label = "BEARISH"
+    elif score <= -1:   label = "MILD BEARISH"
+    else:               label = "NEUTRAL"
+
+    return {"score": score, "label": label, "out_of": 10}
+
+
 def calc_pivot_points(df: pd.DataFrame) -> dict:
     """Classic pivot points from the most recent completed candle."""
     if len(df) < 2:
@@ -697,30 +811,107 @@ def calc_confluence_score(
 def detect_candle_pattern(df: pd.DataFrame) -> str:
     if len(df) < 3:
         return "insufficient data"
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2]
+    prev2 = df.iloc[-3]
+
     body        = abs(last["close"] - last["open"])
     upper_wick  = last["high"]  - max(last["close"], last["open"])
     lower_wick  = min(last["close"], last["open"]) - last["low"]
     total_range = last["high"]  - last["low"]
+
+    prev_body  = abs(prev["close"] - prev["open"])
+    prev2_body = abs(prev2["close"] - prev2["open"])
+
     if total_range == 0:
-        return "doji"
+        return "doji (perfect indecision)"
+
     ratio = body / total_range
-    if ratio < 0.1:
-        return "doji (indecision — watch for breakout)"
-    if lower_wick > 2 * body and upper_wick < body * 0.5:
-        return "hammer / pin bar (bullish reversal)"
-    if upper_wick > 2 * body and lower_wick < body * 0.5:
-        return "shooting star (bearish reversal)"
-    if (last["close"] > last["open"] and prev["close"] < prev["open"]
-            and last["close"] > prev["open"] and last["open"] < prev["close"]):
-        return "bullish engulfing"
-    if (last["close"] < last["open"] and prev["close"] > prev["open"]
-            and last["close"] < prev["open"] and last["open"] > prev["close"]):
-        return "bearish engulfing"
+
+    # ── Single-candle patterns ────────────────────────────────────
+    if ratio < 0.08:
+        return "doji (indecision — breakout imminent, watch next candle)"
+
+    if lower_wick > 2.5 * body and upper_wick < body and body > 0:
+        if prev["close"] < prev["open"]:  # confirmed after bearish candle
+            return "hammer (bullish reversal — confirmed)"
+        return "hammer / pin bar (potential bullish reversal)"
+
+    if upper_wick > 2.5 * body and lower_wick < body and body > 0:
+        if prev["close"] > prev["open"]:  # confirmed after bullish candle
+            return "shooting star (bearish reversal — confirmed)"
+        return "shooting star (potential bearish reversal)"
+
+    if lower_wick > 2.5 * body and upper_wick < body * 0.5 and prev["close"] > prev["open"]:
+        return "inverted hammer (bullish reversal signal)"
+
+    if upper_wick > 2.5 * body and lower_wick < body * 0.5 and prev["close"] < prev["open"]:
+        return "hanging man (bearish reversal signal)"
+
+    if ratio > 0.75 and last["close"] > last["open"]:
+        return "strong bullish marubozu (momentum candle — buyers fully in control)"
+
+    if ratio > 0.75 and last["close"] < last["open"]:
+        return "strong bearish marubozu (momentum candle — sellers fully in control)"
+
+    # ── Two-candle patterns ───────────────────────────────────────
+    if (last["close"] > last["open"]
+            and prev["close"] < prev["open"]
+            and last["close"] > prev["open"]
+            and last["open"] < prev["close"]):
+        return "bullish engulfing (strong reversal signal — high confidence)"
+
+    if (last["close"] < last["open"]
+            and prev["close"] > prev["open"]
+            and last["close"] < prev["open"]
+            and last["open"] > prev["close"]):
+        return "bearish engulfing (strong reversal signal — high confidence)"
+
+    if (prev["close"] < prev["open"]
+            and last["close"] > last["open"]
+            and last["open"] > prev["close"]
+            and last["close"] < prev["open"]):
+        return "bullish harami (reversal — wait for confirmation)"
+
+    if (prev["close"] > prev["open"]
+            and last["close"] < last["open"]
+            and last["open"] < prev["close"]
+            and last["close"] > prev["open"]):
+        return "bearish harami (reversal — wait for confirmation)"
+
+    # ── Three-candle patterns ─────────────────────────────────────
+    # Morning star (bullish reversal)
+    if (prev2["close"] < prev2["open"]
+            and prev2_body > prev_body * 1.5
+            and last["close"] > last["open"]
+            and last["close"] > (prev2["open"] + prev2["close"]) / 2):
+        return "morning star (3-candle bullish reversal — strong signal)"
+
+    # Evening star (bearish reversal)
+    if (prev2["close"] > prev2["open"]
+            and prev2_body > prev_body * 1.5
+            and last["close"] < last["open"]
+            and last["close"] < (prev2["open"] + prev2["close"]) / 2):
+        return "evening star (3-candle bearish reversal — strong signal)"
+
+    # Three white soldiers (strong uptrend continuation)
+    if (last["close"] > last["open"]
+            and prev["close"] > prev["open"]
+            and prev2["close"] > prev2["open"]
+            and last["close"] > prev["close"] > prev2["close"]):
+        return "three white soldiers (strong bullish continuation)"
+
+    # Three black crows (strong downtrend continuation)
+    if (last["close"] < last["open"]
+            and prev["close"] < prev["open"]
+            and prev2["close"] < prev2["open"]
+            and last["close"] < prev["close"] < prev2["close"]):
+        return "three black crows (strong bearish continuation)"
+
+    # ── Generic ───────────────────────────────────────────────────
     if last["close"] > last["open"]:
-        return "bullish candle"
-    return "bearish candle"
+        return "bullish candle (no strong pattern — check confluence)"
+    return "bearish candle (no strong pattern — check confluence)"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -873,10 +1064,13 @@ def get_symbol_analysis(symbol: str, fetch_realtime_price: bool = True) -> dict:
     pattern                    = detect_candle_pattern(df)
 
     # ── Extra indicators ─────────────────────────────────────────
-    stoch_k, stoch_d = calc_stochastic(df)
+    ema9               = calc_ema(close, 9)
+    stoch_k, stoch_d   = calc_stochastic(df)
     adx, plus_di, minus_di = calc_adx(df)
-    williams_r = calc_williams_r(df)
-    pivots     = calc_pivot_points(df)
+    williams_r         = calc_williams_r(df)
+    pivots             = calc_pivot_points(df)
+    fibs               = calc_fibonacci_levels(df)
+    mkt_structure      = calc_market_structure(close)
 
     # ── Confluence score ─────────────────────────────────────────
     bb_width = bb_upper - bb_lower
@@ -886,6 +1080,13 @@ def get_symbol_analysis(symbol: str, fetch_realtime_price: bool = True) -> dict:
         rsi=rsi, macd_hist=hist, ema20=ema20, ema50=ema50,
         price=price, stoch_k=stoch_k, stoch_d=stoch_d,
         adx=adx, williams_r=williams_r, bb_pct=bb_pct,
+    )
+
+    # ── Momentum score ───────────────────────────────────────────
+    momentum = calc_momentum_score(
+        rsi=rsi, macd_hist=hist, adx=adx,
+        price=price, ema20=ema20, ema50=ema50,
+        stoch_k=stoch_k, williams_r=williams_r,
     )
 
     # ── Human-readable readings ──────────────────────────────────
@@ -919,6 +1120,45 @@ def get_symbol_analysis(symbol: str, fetch_realtime_price: bool = True) -> dict:
     elif williams_r < -80: wr_reading = f"{williams_r} — OVERSOLD"
     else:                  wr_reading = f"{williams_r} — neutral"
 
+    # EMA 9 reading
+    if ema9:
+        if price > ema9 and ema9 > ema20:
+            ema9_reading = f"EMA9={round(ema9,6)} — Price above EMA9 > EMA20 (short-term bullish)"
+        elif price < ema9 and ema9 < ema20:
+            ema9_reading = f"EMA9={round(ema9,6)} — Price below EMA9 < EMA20 (short-term bearish)"
+        elif price > ema9:
+            ema9_reading = f"EMA9={round(ema9,6)} — Price above EMA9 (mild bullish)"
+        else:
+            ema9_reading = f"EMA9={round(ema9,6)} — Price below EMA9 (mild bearish)"
+    else:
+        ema9_reading = "EMA9 — insufficient data"
+
+    # Fibonacci proximity reading
+    fib_reading = "no data"
+    if fibs:
+        closest_name  = None
+        closest_dist  = float("inf")
+        fib_map = {
+            "23.6%": fibs.get("fib_236"),
+            "38.2%": fibs.get("fib_382"),
+            "50.0%": fibs.get("fib_500"),
+            "61.8%": fibs.get("fib_618"),
+            "78.6%": fibs.get("fib_786"),
+        }
+        for name, level in fib_map.items():
+            if level:
+                dist = abs(price - level)
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest_name = name
+                    closest_level = level
+        if closest_name:
+            pct_away = (closest_dist / price) * 100
+            fib_reading = (
+                f"Nearest Fibonacci: {closest_name} at {closest_level} "
+                f"({pct_away:.2f}% away) | Range: {fibs.get('swing_low')}–{fibs.get('swing_high')}"
+            )
+
     # ── ATR-based SL/TP (1.5R / 3R / 4.5R) ──────────────────────
     sl_buy   = round(price - atr * 1.5, 6)
     sl_sell  = round(price + atr * 1.5, 6)
@@ -946,22 +1186,27 @@ def get_symbol_analysis(symbol: str, fetch_realtime_price: bool = True) -> dict:
             "tradeable":    adx >= 20,
             "adx_note":     adx_reading,
         },
+        "momentum": momentum,
+        "market_structure": mkt_structure,
         "indicators": {
             "rsi_14":          rsi_reading,
             "macd_12_26_9":    macd_reading,
             "stochastic_14":   stoch_reading,
             "adx_14":          adx_reading,
             "williams_r_14":   wr_reading,
+            "ema9":            ema9_reading,
             "ema_stack":       trend,
             "bollinger_bands": bb_reading,
             "volume":          volume_sig,
             "atr_14":          atr,
             "candle_pattern":  pattern,
+            "fibonacci":       fib_reading,
         },
         "key_levels": {
             "support":          support,
             "resistance":       resistance,
             "pivot_points":     pivots,
+            "fibonacci_levels": fibs,
             "atr_sl_for_buy":   sl_buy,
             "atr_sl_for_sell":  sl_sell,
             "atr_tp1_buy":      tp1_buy,
@@ -1018,27 +1263,39 @@ def format_for_ai_prompt(symbol_or_analysis, analysis: dict = None) -> str:
     conf = analysis.get("confluence", {})
     piv  = lv.get("pivot_points", {})
 
+    mom  = analysis.get("momentum", {})
+    mstr = analysis.get("market_structure", "unknown")
+
     lines = [
         f"=== {sym} | Live Price: {price} ({source}) ===",
         f"Data: {analysis.get('data_source')} | Candles: {analysis.get('candles_used')} | Last: {analysis.get('last_candle_time','')}",
         f"",
+        f"── MARKET STRUCTURE: {mstr}",
+        f"── MOMENTUM SCORE: {mom.get('score',0):+.1f}/10 → {mom.get('label','?')}",
         f"── CONFLUENCE: {conf.get('direction','?')} | Score {conf.get('score',0)}/{conf.get('out_of',6)} ({conf.get('strength','?')}) | Tradeable: {conf.get('tradeable','?')}",
         f"   Reasons: {' | '.join(conf.get('reasons', ['insufficient data']))}",
         f"",
-        f"── INDICATORS",
-        f"RSI(14):        {ind.get('rsi_14')}",
+        f"── TREND & MOMENTUM INDICATORS",
+        f"EMA9 (short):   {ind.get('ema9')}",
+        f"EMA Stack:      {ind.get('ema_stack')}",
+        f"ADX(14):        {ind.get('adx_14')}",
         f"MACD(12,26,9):  {ind.get('macd_12_26_9')}",
+        f"",
+        f"── OSCILLATORS",
+        f"RSI(14):        {ind.get('rsi_14')}",
         f"Stochastic(14): {ind.get('stochastic_14')}",
         f"Williams %R:    {ind.get('williams_r_14')}",
-        f"ADX(14):        {ind.get('adx_14')}",
-        f"EMA Stack:      {ind.get('ema_stack')}",
+        f"",
+        f"── VOLATILITY & PRICE ACTION",
         f"Bollinger(20):  {ind.get('bollinger_bands')}",
-        f"ATR(14):        {ind.get('atr_14')} | Pattern: {ind.get('candle_pattern')}",
+        f"ATR(14):        {ind.get('atr_14')}",
+        f"Pattern:        {ind.get('candle_pattern')}",
         f"Volume:         {ind.get('volume')}",
+        f"Fibonacci:      {ind.get('fibonacci')}",
         f"",
         f"── KEY LEVELS",
         f"Support: {lv.get('support')} | Resistance: {lv.get('resistance')}",
-        f"Pivots: P={piv.get('pivot')} R1={piv.get('R1')} R2={piv.get('R2')} S1={piv.get('S1')} S2={piv.get('S2')}",
+        f"Pivots: P={piv.get('pivot')} R1={piv.get('R1')} R2={piv.get('R2')} R3={piv.get('R3')} S1={piv.get('S1')} S2={piv.get('S2')} S3={piv.get('S3')}",
         f"BUY  → SL: {lv.get('atr_sl_for_buy')} | TP1: {lv.get('atr_tp1_buy')} | TP2: {lv.get('atr_tp2_buy')} | TP3: {lv.get('atr_tp3_buy')}",
         f"SELL → SL: {lv.get('atr_sl_for_sell')} | TP1: {lv.get('atr_tp1_sell')} | TP2: {lv.get('atr_tp2_sell')} | TP3: {lv.get('atr_tp3_sell')}",
     ]
@@ -1089,9 +1346,16 @@ def format_for_ai_prompt_compact(analysis: dict) -> str:
     tp1_s = lv.get("atr_tp1_sell", "?")
     tp2_s = lv.get("atr_tp2_sell", "?")
 
+    wr_raw   = str(ind.get("williams_r_14", "?")).split("—")[0].strip()
+    pattern  = str(ind.get("candle_pattern", "?")).split("(")[0].strip()
+    mom      = analysis.get("momentum", {})
+    mscore   = mom.get("score", 0)
+    mstr     = str(analysis.get("market_structure", "?")).split("—")[0].strip()
+
     return (
-        f"{sym}[LIVE] p={price} | conf={cdir}{cscore}/6 {tradeable} | "
-        f"RSI={rsi_raw} MACD={macd_dir} EMA={ema_dir} ADX={adx_raw} StochK={stoch_k} | "
+        f"{sym}[LIVE] p={price} | conf={cdir}{cscore}/6 {tradeable} | mom={mscore:+.0f}/10 | struct={mstr} | "
+        f"RSI={rsi_raw} MACD={macd_dir} EMA={ema_dir} ADX={adx_raw} StochK={stoch_k} WR={wr_raw} | "
+        f"pat={pattern} | "
         f"BUY:SL={sl_b},TP1={tp1_b},TP2={tp2_b} | "
         f"SELL:SL={sl_s},TP1={tp1_s},TP2={tp2_s}"
     )

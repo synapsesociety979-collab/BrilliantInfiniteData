@@ -1642,55 +1642,85 @@ def get_trading_advice(
     conf       = analysis.get("confluence", {})
     has_live   = not analysis.get("ai_only_mode", True)
 
-    prompt = f"""━━━ INSTITUTIONAL DEEP ANALYSIS REQUEST: {symbol} ━━━
+    mom   = analysis.get("momentum", {})
+    mstr  = analysis.get("market_structure", "unknown")
 
-{"LIVE INDICATOR DATA (use exact values):" if has_live else "AI reasoning mode — no live candles:"}
+    prompt = f"""━━━ CLEO INSTITUTIONAL DEEP ANALYSIS: {symbol} ━━━
+
+{"LIVE MARKET DATA — use EXACT values below, do NOT invent numbers:" if has_live else "AI REASONING MODE — no live candle feed:"}
 {live_block}
 
-{"CONFLUENCE: " + str(conf.get("direction","?")) + " | Score " + str(conf.get("score",0)) + "/6 | Tradeable: " + str(conf.get("tradeable","?")) if has_live else ""}
+You are CLEO, an institutional-grade AI trading analyst. Apply the full 6-step framework:
 
-Provide a comprehensive institutional-grade analysis. Use the EXACT indicator values above.
-{"Do NOT say you lack real-time data — the live data is shown above." if has_live else "State clearly this is AI pattern reasoning."}
+STEP 1 — TREND: What is the primary trend? Use EMA stack (9/20/50/200), ADX, and market structure ({mstr}).
+STEP 2 — MOMENTUM: Score = {mom.get("score", "?")}/10 ({mom.get("label", "?")}). Analyse RSI, MACD histogram, Stochastic crossover.
+STEP 3 — CONFIRMATION: Do oscillators confirm the trend? Check Williams %R, Stochastic zone, RSI divergence.
+STEP 4 — VOLATILITY: ATR tells you trade size. Bollinger squeeze = breakout pending. Pattern = {analysis.get("indicators", {}).get("candle_pattern", "unknown")}.
+STEP 5 — RISK: Use pivot points and Fibonacci levels for precise SL/TP placement. Confluence score = {conf.get("score", 0)}/6.
+STEP 6 — CONVICTION: Only if Steps 1–5 align give BUY or SELL. If conflicting, give HOLD with clear reason.
 
-Return ONLY valid JSON:
+Rules:
+- Use EXACT numbers from the live data block above — never round or estimate
+- {"Do NOT say you lack data — the full live data is above" if has_live else "State clearly this is AI pattern reasoning without live candles"}
+- SL must be beyond the nearest pivot/Fibonacci level, not just ATR-based
+- TP1 = 1:1.5 R, TP2 = 1:3 R, TP3 = 1:4.5 R
+- Confidence max 95 — never 100
+
+Return ONLY valid JSON (no markdown, no explanation outside the JSON):
 {{
   "symbol": "{symbol}",
   "live_price": "{live_price}",
   "data_source": "{"live_data" if has_live else "ai_reasoning"}",
-  "confluence_score": "{conf.get("score",0)}/6",
-  "recommendation": "BUY|SELL|HOLD",
-  "confidence": 0-97,
+  "momentum_score": "{mom.get("score", "?")} / 10 — {mom.get("label", "?")}",
+  "market_structure": "{mstr}",
+  "confluence_score": "{conf.get("score", 0)}/6 — {conf.get("strength", "?")}",
+  "recommendation": "BUY or SELL or HOLD",
+  "confidence": 73,
+  "reasoning_summary": {{
+    "step1_trend": "What EMA9/20/50/200 and ADX say about trend direction",
+    "step2_momentum": "RSI + MACD + Stochastic reading with exact values",
+    "step3_confirmation": "Williams %R + oscillator confluence verdict",
+    "step4_volatility": "ATR size, Bollinger state, candle pattern signal",
+    "step5_risk": "Best SL and TP based on pivots + Fibonacci levels",
+    "step6_conviction": "Final verdict — why BUY/SELL/HOLD and confidence level"
+  }},
   "trade_setup": {{
-    "entry": "exact price",
-    "stop_loss": "ATR-based level from data",
-    "take_profit_1": "1:1.5 target",
-    "take_profit_2": "1:3 target",
-    "take_profit_3": "1:4.5 target",
-    "risk_reward": "1:X",
-    "hold_time": "duration"
+    "entry": "exact current price",
+    "stop_loss": "level beyond nearest pivot/Fibonacci support or resistance",
+    "take_profit_1": "1:1.5 R target",
+    "take_profit_2": "1:3 R target",
+    "take_profit_3": "1:4.5 R target",
+    "risk_reward": "1:3",
+    "hold_time": "estimated hours or days",
+    "position_size_note": "2% risk per trade recommended"
   }},
   "technical_analysis": {{
-    "trend": "bullish/bearish/ranging",
-    "rsi": "EXACT value from live data + interpretation",
-    "macd": "EXACT histogram value + direction",
-    "stochastic": "K/D values + zone",
-    "adx": "EXACT ADX + trend strength",
-    "williams_r": "value + zone",
-    "ema_stack": "EXACT EMA alignment",
-    "bollinger": "band position",
-    "pivot_points": "P / R1 / S1 from data",
-    "key_support": "exact level from data",
-    "key_resistance": "exact level from data",
-    "pattern": "detected candle pattern"
+    "trend": "bullish / bearish / ranging",
+    "market_structure": "HH+HL / LH+LL / ranging",
+    "ema9": "exact EMA9 value and relationship to price",
+    "ema_stack": "exact EMA20/50/200 alignment",
+    "rsi": "exact RSI value and zone (oversold/neutral/overbought)",
+    "macd": "exact histogram value and direction",
+    "stochastic": "exact K/D values and crossover signal",
+    "adx": "exact ADX value and trend strength classification",
+    "williams_r": "exact value and zone",
+    "bollinger": "band position and squeeze status",
+    "fibonacci": "nearest Fibonacci level and its significance",
+    "pivot_points": "P / R1 / R2 / S1 / S2 from live data",
+    "key_support": "exact support level from data",
+    "key_resistance": "exact resistance level from data",
+    "candle_pattern": "detected pattern and what it signals",
+    "volume": "volume reading and what it confirms"
   }},
-  "market_context": "1-2 sentences on macro/session drivers for {symbol} right now",
+  "market_context": "2 sentences: what macro/session/news factors are driving {symbol} right now and what the smart money positioning looks like",
   "risk_assessment": {{
-    "risk_level": "low/medium/high",
+    "risk_level": "low / medium / high",
     "max_position_pct": "2%",
-    "invalidation": "exact price that kills the thesis",
-    "news_risk": "any upcoming events that could move {symbol}"
+    "invalidation_price": "exact price where thesis is dead",
+    "news_risk": "upcoming high-impact events for {symbol} currencies/assets",
+    "session_note": "which trading session is active and how it affects liquidity"
   }},
-  "rationale": "3 sentences using exact indicator values from the live data block"
+  "rationale": "3 detailed sentences: cite exact indicator values, explain why they align or conflict, state the final edge that justifies this signal"
 }}"""
     try:
         content = get_ai_response(prompt)
@@ -2229,11 +2259,14 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 7. SIGNAL FORMAT — every signal must include:
    • Pair + Direction (BUY/SELL/STRONG BUY/STRONG SELL)
    • Entry: [exact price]
-   • Stop Loss: [level] ([pips / %])
+   • Stop Loss: [level] ([pips / %]) — beyond nearest Fibonacci or pivot
    • TP1: [level] — [time estimate]
    • TP2: [level] — [time estimate]
    • TP3: [level] — [time estimate]
+   • Momentum Score: [X/10] — [label]
    • Confluence: [X/6] — [strength label]
+   • Market Structure: [UPTREND / DOWNTREND / RANGING]
+   • Key Fibonacci level: [nearest level and its significance]
    • Exit if: [invalidation level]
    • Data: [live candles / AI-reasoning]
 8. HOLD TIMES — always in real units: "45 minutes", "4 hours", "3 days". Never "short-term" alone.
