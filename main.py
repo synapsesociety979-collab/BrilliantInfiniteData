@@ -470,6 +470,143 @@ def get_upcoming_events_text(currencies: list = None, hours_ahead: float = 6) ->
     return "━━━ UPCOMING ECONOMIC EVENTS (next 6 hours) ━━━\n" + "\n".join(lines)
 
 
+def calc_ngn_trade_details(
+    symbol: str,
+    entry: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+    tp3: float,
+    balance_ngn: float,
+    ngn_rate: float,
+) -> dict:
+    """
+    Given a signal's price levels and the user's NGN balance, calculate:
+    - Recommended lot size (forex) or units (crypto) for exactly 2% risk
+    - SL and TP values expressed in Naira (NGN)
+    - NGN per pip (forex) so the user knows the exact cost of each pip move
+    Returns an empty dict if inputs are invalid.
+    """
+    try:
+        if not all([entry > 0, stop_loss > 0, balance_ngn > 0, ngn_rate > 0]):
+            return {}
+        sl_distance = abs(entry - stop_loss)
+        if sl_distance <= 0:
+            return {}
+
+        balance_usd = balance_ngn / ngn_rate
+        risk_usd    = balance_usd * 0.02          # 2% of account
+        risk_ngn    = balance_ngn * 0.02
+
+        is_crypto = "USDT" in symbol.upper()
+
+        if is_crypto:
+            # ── Crypto: position in coin units ────────────────────────────
+            units = risk_usd / sl_distance
+            position_value_usd = units * entry
+
+            def _crypto_pnl(tp):
+                return units * abs(tp - entry) if tp and tp > 0 else 0
+
+            tp1_usd = _crypto_pnl(tp1)
+            tp2_usd = _crypto_pnl(tp2)
+            tp3_usd = _crypto_pnl(tp3)
+
+            # Round units sensibly depending on price
+            if entry >= 1000:
+                units_rounded = round(units, 6)
+            elif entry >= 1:
+                units_rounded = round(units, 4)
+            else:
+                units_rounded = round(units, 2)
+
+            return {
+                "type":                "crypto",
+                "account_balance_ngn": f"₦{balance_ngn:,.0f}",
+                "risk_per_trade_ngn":  f"₦{risk_ngn:,.0f}",
+                "risk_per_trade_usd":  f"${risk_usd:.2f}",
+                "recommended_units":   units_rounded,
+                "unit_label":          f"{units_rounded} units of {symbol.replace('USDT','')}",
+                "position_value_ngn":  f"₦{position_value_usd * ngn_rate:,.0f}",
+                "position_value_usd":  f"${position_value_usd:,.2f}",
+                "sl_loss_ngn":         f"₦{risk_ngn:,.0f}",
+                "sl_loss_usd":         f"${risk_usd:.2f}",
+                "tp1_profit_ngn":      f"₦{tp1_usd * ngn_rate:,.0f}" if tp1_usd else "N/A",
+                "tp2_profit_ngn":      f"₦{tp2_usd * ngn_rate:,.0f}" if tp2_usd else "N/A",
+                "tp3_profit_ngn":      f"₦{tp3_usd * ngn_rate:,.0f}" if tp3_usd else "N/A",
+                "tp1_profit_usd":      f"${tp1_usd:.2f}" if tp1_usd else "N/A",
+                "tp2_profit_usd":      f"${tp2_usd:.2f}" if tp2_usd else "N/A",
+                "tp3_profit_usd":      f"${tp3_usd:.2f}" if tp3_usd else "N/A",
+            }
+
+        else:
+            # ── Forex: position in standard lots ──────────────────────────
+            # Pip size: JPY pairs use 0.01, all others 0.0001
+            pip_size = 0.01 if "JPY" in symbol.upper() else 0.0001
+
+            # Pip value per standard lot (100,000 units) in USD
+            # For pairs quoted vs USD (EUR/USD, GBP/USD, AUD/USD, NZD/USD): $10/pip exactly
+            # For USD-base pairs (USD/JPY, USD/CAD, USD/CHF): $10 / entry (approx)
+            # For cross pairs (EUR/GBP, EUR/JPY etc.): approximate with $10
+            usd_quoted_pairs = ("EURUSD","GBPUSD","AUDUSD","NZDUSD","XAUUSD","XAGUSD")
+            usd_base_pairs   = ("USDJPY","USDCAD","USDCHF","USDSGD","USDHKD")
+
+            sym_upper = symbol.upper()
+            if sym_upper in usd_quoted_pairs or sym_upper.endswith("USD"):
+                pip_value_per_lot = 10.0
+            elif sym_upper in usd_base_pairs or sym_upper.startswith("USD"):
+                pip_value_per_lot = round(pip_size * 100_000 / entry, 4)
+            else:
+                # Cross pairs — approximate as $10 (close enough for retail sizing)
+                pip_value_per_lot = 10.0
+
+            sl_pips    = sl_distance / pip_size
+            lot_size   = risk_usd / (sl_pips * pip_value_per_lot)
+            lot_size   = max(0.01, round(lot_size, 2))   # minimum micro lot
+
+            # Lot size label for readability
+            if lot_size >= 1.0:
+                lot_label = f"{lot_size} standard lot{'s' if lot_size != 1 else ''}"
+            elif lot_size >= 0.1:
+                lot_label = f"{lot_size} mini lot{'s' if lot_size != 0.1 else ''}"
+            else:
+                lot_label = f"{lot_size} micro lot{'s' if lot_size != 0.01 else ''}"
+
+            pnl_per_pip = lot_size * pip_value_per_lot   # USD per pip with this lot size
+            ngn_per_pip = pnl_per_pip * ngn_rate
+
+            def _forex_pnl_usd(tp):
+                return (abs(tp - entry) / pip_size) * pnl_per_pip if tp and tp > 0 else 0
+
+            tp1_usd = _forex_pnl_usd(tp1)
+            tp2_usd = _forex_pnl_usd(tp2)
+            tp3_usd = _forex_pnl_usd(tp3)
+
+            return {
+                "type":                "forex",
+                "account_balance_ngn": f"₦{balance_ngn:,.0f}",
+                "risk_per_trade_ngn":  f"₦{risk_ngn:,.0f}",
+                "risk_per_trade_usd":  f"${risk_usd:.2f}",
+                "recommended_lot_size": lot_size,
+                "lot_size_label":      lot_label,
+                "sl_pips":             round(sl_pips, 1),
+                "ngn_per_pip":         f"₦{ngn_per_pip:,.2f}",
+                "usd_per_pip":         f"${pnl_per_pip:.2f}",
+                "position_value_ngn":  f"₦{lot_size * 100_000 * entry * ngn_rate:,.0f}",
+                "position_value_usd":  f"${lot_size * 100_000 * entry:,.2f}",
+                "sl_loss_ngn":         f"₦{risk_ngn:,.0f}",
+                "sl_loss_usd":         f"${risk_usd:.2f}",
+                "tp1_profit_ngn":      f"₦{tp1_usd * ngn_rate:,.0f}" if tp1_usd else "N/A",
+                "tp2_profit_ngn":      f"₦{tp2_usd * ngn_rate:,.0f}" if tp2_usd else "N/A",
+                "tp3_profit_ngn":      f"₦{tp3_usd * ngn_rate:,.0f}" if tp3_usd else "N/A",
+                "tp1_profit_usd":      f"${tp1_usd:.2f}" if tp1_usd else "N/A",
+                "tp2_profit_usd":      f"${tp2_usd:.2f}" if tp2_usd else "N/A",
+                "tp3_profit_usd":      f"${tp3_usd:.2f}" if tp3_usd else "N/A",
+            }
+    except Exception:
+        return {}
+
+
 def get_budget_trading_plan(balance_ngn: float, ngn_rate: float) -> str:
     """
     Given any NGN balance, return a concrete, actionable trading plan
@@ -1093,7 +1230,23 @@ Return ONLY a valid JSON array:
                 s["confluence_direction"] = calc_dir
                 s["auto_trade_eligible"]  = calc_score >= 3 and calc_tradeable
 
-            elif src == "ai_reasoning":
+            # ── NGN trade details (injected for every validated signal) ──────
+            if investment_amount_ngn > 0:
+                try:
+                    s["ngn_trade"] = calc_ngn_trade_details(
+                        symbol      = s.get("symbol", sym),
+                        entry       = float(s.get("entry_price", 0) or 0),
+                        stop_loss   = float(s.get("stop_loss", 0) or 0),
+                        tp1         = float(s.get("take_profit_1", 0) or 0),
+                        tp2         = float(s.get("take_profit_2", 0) or 0),
+                        tp3         = float(s.get("take_profit_3", 0) or 0),
+                        balance_ngn = investment_amount_ngn,
+                        ngn_rate    = ngn_rate,
+                    )
+                except Exception:
+                    pass
+
+            if src == "ai_reasoning":
                 # Cap AI-only signals at 78%
                 if conf > 78:
                     s["confidence"] = 78
@@ -1284,6 +1437,23 @@ Return ONLY valid JSON:
 
         data["personalized"] = True
         data["raw_live_analysis"] = analysis
+
+        # ── Inject NGN trade details ──────────────────────────────────────
+        if user.balance_ngn and user.balance_ngn > 0 and data.get("signal") != "HOLD":
+            try:
+                data["ngn_trade"] = calc_ngn_trade_details(
+                    symbol      = symbol,
+                    entry       = float(data.get("entry_price", 0) or 0),
+                    stop_loss   = float(data.get("stop_loss", 0) or 0),
+                    tp1         = float(data.get("take_profit_1", 0) or 0),
+                    tp2         = float(data.get("take_profit_2", 0) or 0),
+                    tp3         = float(data.get("take_profit_3", 0) or 0),
+                    balance_ngn = user.balance_ngn,
+                    ngn_rate    = ngn_rate,
+                )
+            except Exception:
+                pass
+
         return data
     except Exception as e:
         return {
@@ -2201,6 +2371,10 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
                 pass
 
     # ── build system prompt ──
+    balance_usd  = (user.balance_ngn or 0) / ngn_rate
+    risk_ngn_2pct = (user.balance_ngn or 0) * 0.02
+    risk_usd_2pct = balance_usd * 0.02
+
     system_prompt = f"""You are CLEO — Creative Loop Expert Optimizer.
 You are a world-class AI trading strategist with a warm, confident personality.
 
@@ -2256,19 +2430,23 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 4. NGN ↔ USD — convert instantly: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD. Always show both.
 5. RISK DISCIPLINE — recommend 2% risk per trade always. For {user.trading_style} / {user.risk_tolerance} risk.
 6. MATHS — show exact calculations. Entry ± ATR×1.5 = SL. R×1.5 = TP1. R×2.5 = TP2. R×4 = TP3.
-7. SIGNAL FORMAT — every signal must include:
-   • Pair + Direction (BUY/SELL/STRONG BUY/STRONG SELL)
-   • Entry: [exact price]
-   • Stop Loss: [level] ([pips / %]) — beyond nearest Fibonacci or pivot
-   • TP1: [level] — [time estimate]
-   • TP2: [level] — [time estimate]
-   • TP3: [level] — [time estimate]
-   • Momentum Score: [X/10] — [label]
-   • Confluence: [X/6] — [strength label]
-   • Market Structure: [UPTREND / DOWNTREND / RANGING]
-   • Key Fibonacci level: [nearest level and its significance]
-   • Exit if: [invalidation level]
-   • Data: [live candles / AI-reasoning]
+7. NGN-FIRST SIGNALS — every signal you give in chat MUST include these NGN fields.
+   Calculate them from {name}'s balance of ₦{user.balance_ngn:,.0f} and the live rate of ₦{ngn_rate:.2f}/$:
+   ━━━ SIGNAL: [PAIR] — [STRONG BUY / BUY / SELL / STRONG SELL] ━━━
+   Entry:          [exact price]
+   Stop Loss:      [level] — [X pips] | If SL hits → you lose ₦{risk_ngn_2pct:,.0f} (${risk_usd_2pct:.2f})
+   TP1:            [level] — [time] | Profit if reached → ₦[calculate NGN profit] (~$[USD profit])
+   TP2:            [level] — [time] | Profit if reached → ₦[calculate NGN profit] (~$[USD profit])
+   TP3:            [level] — [time] | Profit if reached → ₦[calculate NGN profit] (~$[USD profit])
+   Lot Size:       [calculate lot size for 2% risk] lots (forex) OR [units] (crypto)
+   NGN/pip:        ₦[calculate from lot size × pip value × NGN rate] per pip (forex only)
+   Risk:           ₦{risk_ngn_2pct:,.0f} = ${risk_usd_2pct:.2f} USD (always 2% of account)
+   Momentum Score: [X/10] — [label]
+   Confluence:     [X/6] — [strength]
+   Market Struct:  [UPTREND / DOWNTREND / RANGING]
+   Exit if:        [invalidation price]
+   Data:           [live candles / AI-reasoning]
+   ⚠️ Risk: [one-sentence disclaimer]
 8. HOLD TIMES — always in real units: "45 minutes", "4 hours", "3 days". Never "short-term" alone.
 9. NEWS AWARENESS — if upcoming events above show 🔴 High-impact news within 2 hours for the pair,
    warn: "⚠️ [Event] in X minutes — I'd wait for the dust to settle before entering."
