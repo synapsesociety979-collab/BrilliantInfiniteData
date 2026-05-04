@@ -16,8 +16,26 @@ from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
 import os
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+# Neon / Render / Supabase return "postgresql://" or "postgres://"
+# SQLAlchemy needs "postgresql+psycopg2://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+# SSL: required for external cloud DBs (Neon, Supabase, Render)
+#       not supported on Replit's local DB (host = helium / localhost)
+_local_hosts = ("localhost", "127.0.0.1", "helium", "/var/run")
+_is_local_db = any(h in DATABASE_URL for h in _local_hosts)
+_connect_args = {} if _is_local_db else {"sslmode": "require"}
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,     # auto-reconnect if connection drops
+    pool_recycle=300,       # recycle connections every 5 min (prevents timeouts)
+    connect_args=_connect_args,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
