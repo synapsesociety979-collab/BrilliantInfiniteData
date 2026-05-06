@@ -492,6 +492,7 @@ def calc_ngn_trade_details(
     - Recommended lot size (forex) or units (crypto) for exactly 2% risk
     - SL and TP values expressed in Naira (NGN)
     - NGN per pip (forex) so the user knows the exact cost of each pip move
+    - Viability check: flags if the account is too small to trade this market
     Returns an empty dict if inputs are invalid.
     """
     try:
@@ -509,7 +510,11 @@ def calc_ngn_trade_details(
 
         if is_crypto:
             # ── Crypto: position in coin units ────────────────────────────
-            units = risk_usd / sl_distance
+            # Minimum viable: risk_usd must be at least $1 (most exchanges min ~$1-5 order)
+            MIN_CRYPTO_RISK_USD = 1.0
+            viable = risk_usd >= MIN_CRYPTO_RISK_USD
+
+            units = risk_usd / sl_distance if sl_distance > 0 else 0
             position_value_usd = units * entry
 
             def _crypto_pnl(tp):
@@ -527,24 +532,37 @@ def calc_ngn_trade_details(
             else:
                 units_rounded = round(units, 2)
 
-            return {
+            min_balance_for_crypto_ngn = (MIN_CRYPTO_RISK_USD / 0.02) * ngn_rate
+
+            result = {
                 "type":                "crypto",
+                "viable":              viable,
                 "account_balance_ngn": f"₦{balance_ngn:,.0f}",
                 "risk_per_trade_ngn":  f"₦{risk_ngn:,.0f}",
-                "risk_per_trade_usd":  f"${risk_usd:.2f}",
+                "risk_per_trade_usd":  f"${risk_usd:.4f}",
                 "recommended_units":   units_rounded,
                 "unit_label":          f"{units_rounded} units of {symbol.replace('USDT','')}",
                 "position_value_ngn":  f"₦{position_value_usd * ngn_rate:,.0f}",
-                "position_value_usd":  f"${position_value_usd:,.2f}",
+                "position_value_usd":  f"${position_value_usd:,.4f}",
                 "sl_loss_ngn":         f"₦{risk_ngn:,.0f}",
-                "sl_loss_usd":         f"${risk_usd:.2f}",
+                "sl_loss_usd":         f"${risk_usd:.4f}",
                 "tp1_profit_ngn":      f"₦{tp1_usd * ngn_rate:,.0f}" if tp1_usd else "N/A",
                 "tp2_profit_ngn":      f"₦{tp2_usd * ngn_rate:,.0f}" if tp2_usd else "N/A",
                 "tp3_profit_ngn":      f"₦{tp3_usd * ngn_rate:,.0f}" if tp3_usd else "N/A",
-                "tp1_profit_usd":      f"${tp1_usd:.2f}" if tp1_usd else "N/A",
-                "tp2_profit_usd":      f"${tp2_usd:.2f}" if tp2_usd else "N/A",
-                "tp3_profit_usd":      f"${tp3_usd:.2f}" if tp3_usd else "N/A",
+                "tp1_profit_usd":      f"${tp1_usd:.4f}" if tp1_usd else "N/A",
+                "tp2_profit_usd":      f"${tp2_usd:.4f}" if tp2_usd else "N/A",
+                "tp3_profit_usd":      f"${tp3_usd:.4f}" if tp3_usd else "N/A",
             }
+            if not viable:
+                result["warning"] = (
+                    f"Account too small for real crypto trading. "
+                    f"Your 2% risk = ${risk_usd:.4f} which is below the typical $1 minimum order. "
+                    f"Use the demo account to practice. "
+                    f"Minimum recommended balance for real crypto: "
+                    f"₦{min_balance_for_crypto_ngn:,.0f} (~${MIN_CRYPTO_RISK_USD / 0.02:.0f})"
+                )
+                result["recommendation"] = "demo_only"
+            return result
 
         else:
             # ── Forex: position in standard lots ──────────────────────────
@@ -553,8 +571,8 @@ def calc_ngn_trade_details(
 
             # Pip value per standard lot (100,000 units) in USD
             # For pairs quoted vs USD (EUR/USD, GBP/USD, AUD/USD, NZD/USD): $10/pip exactly
-            # For USD-base pairs (USD/JPY, USD/CAD, USD/CHF): $10 / entry (approx)
-            # For cross pairs (EUR/GBP, EUR/JPY etc.): approximate with $10
+            # For USD-base pairs (USD/JPY, USD/CAD, USD/CHF): ~$10 / entry
+            # For cross pairs: approximate with $10
             usd_quoted_pairs = ("EURUSD","GBPUSD","AUDUSD","NZDUSD","XAUUSD","XAGUSD")
             usd_base_pairs   = ("USDJPY","USDCAD","USDCHF","USDSGD","USDHKD")
 
@@ -564,14 +582,24 @@ def calc_ngn_trade_details(
             elif sym_upper in usd_base_pairs or sym_upper.startswith("USD"):
                 pip_value_per_lot = round(pip_size * 100_000 / entry, 4)
             else:
-                # Cross pairs — approximate as $10 (close enough for retail sizing)
                 pip_value_per_lot = 10.0
 
-            sl_pips    = sl_distance / pip_size
-            lot_size   = risk_usd / (sl_pips * pip_value_per_lot)
-            lot_size   = max(0.01, round(lot_size, 2))   # minimum micro lot
+            sl_pips       = sl_distance / pip_size
+            ideal_lot     = risk_usd / (sl_pips * pip_value_per_lot)
+            MIN_FOREX_LOT = 0.01   # smallest micro lot most brokers offer
 
-            # Lot size label for readability
+            viable = ideal_lot >= MIN_FOREX_LOT
+
+            # If not viable, show what 0.01 lots would ACTUALLY cost so user sees the danger
+            lot_size       = round(ideal_lot, 2) if viable else MIN_FOREX_LOT
+            actual_risk_usd = sl_pips * pip_value_per_lot * MIN_FOREX_LOT
+            actual_risk_pct = (actual_risk_usd / balance_usd * 100) if balance_usd > 0 else 999
+
+            # Minimum account balance to trade this pair safely at 2%
+            min_balance_usd = actual_risk_usd / 0.02
+            min_balance_ngn = min_balance_usd * ngn_rate
+
+            # Lot size label
             if lot_size >= 1.0:
                 lot_label = f"{lot_size} standard lot{'s' if lot_size != 1 else ''}"
             elif lot_size >= 0.1:
@@ -579,7 +607,7 @@ def calc_ngn_trade_details(
             else:
                 lot_label = f"{lot_size} micro lot{'s' if lot_size != 0.01 else ''}"
 
-            pnl_per_pip = lot_size * pip_value_per_lot   # USD per pip with this lot size
+            pnl_per_pip = lot_size * pip_value_per_lot
             ngn_per_pip = pnl_per_pip * ngn_rate
 
             def _forex_pnl_usd(tp):
@@ -589,111 +617,211 @@ def calc_ngn_trade_details(
             tp2_usd = _forex_pnl_usd(tp2)
             tp3_usd = _forex_pnl_usd(tp3)
 
-            return {
-                "type":                "forex",
-                "account_balance_ngn": f"₦{balance_ngn:,.0f}",
-                "risk_per_trade_ngn":  f"₦{risk_ngn:,.0f}",
-                "risk_per_trade_usd":  f"${risk_usd:.2f}",
+            result = {
+                "type":                 "forex",
+                "viable":               viable,
+                "account_balance_ngn":  f"₦{balance_ngn:,.0f}",
+                "risk_per_trade_ngn":   f"₦{risk_ngn:,.0f}",
+                "risk_per_trade_usd":   f"${risk_usd:.4f}",
+                "ideal_lot_size":       round(ideal_lot, 4),
                 "recommended_lot_size": lot_size,
-                "lot_size_label":      lot_label,
-                "sl_pips":             round(sl_pips, 1),
-                "ngn_per_pip":         f"₦{ngn_per_pip:,.2f}",
-                "usd_per_pip":         f"${pnl_per_pip:.2f}",
-                "position_value_ngn":  f"₦{lot_size * 100_000 * entry * ngn_rate:,.0f}",
-                "position_value_usd":  f"${lot_size * 100_000 * entry:,.2f}",
-                "sl_loss_ngn":         f"₦{risk_ngn:,.0f}",
-                "sl_loss_usd":         f"${risk_usd:.2f}",
-                "tp1_profit_ngn":      f"₦{tp1_usd * ngn_rate:,.0f}" if tp1_usd else "N/A",
-                "tp2_profit_ngn":      f"₦{tp2_usd * ngn_rate:,.0f}" if tp2_usd else "N/A",
-                "tp3_profit_ngn":      f"₦{tp3_usd * ngn_rate:,.0f}" if tp3_usd else "N/A",
-                "tp1_profit_usd":      f"${tp1_usd:.2f}" if tp1_usd else "N/A",
-                "tp2_profit_usd":      f"${tp2_usd:.2f}" if tp2_usd else "N/A",
-                "tp3_profit_usd":      f"${tp3_usd:.2f}" if tp3_usd else "N/A",
+                "lot_size_label":       lot_label,
+                "sl_pips":              round(sl_pips, 1),
+                "ngn_per_pip":          f"₦{ngn_per_pip:,.2f}",
+                "usd_per_pip":          f"${pnl_per_pip:.2f}",
+                "position_value_ngn":   f"₦{lot_size * 100_000 * entry * ngn_rate:,.0f}",
+                "position_value_usd":   f"${lot_size * 100_000 * entry:,.2f}",
+                "sl_loss_ngn":          f"₦{risk_ngn:,.0f}" if viable else f"₦{actual_risk_usd * ngn_rate:,.0f}",
+                "sl_loss_usd":          f"${risk_usd:.4f}" if viable else f"${actual_risk_usd:.2f}",
+                "tp1_profit_ngn":       f"₦{tp1_usd * ngn_rate:,.0f}" if tp1_usd else "N/A",
+                "tp2_profit_ngn":       f"₦{tp2_usd * ngn_rate:,.0f}" if tp2_usd else "N/A",
+                "tp3_profit_ngn":       f"₦{tp3_usd * ngn_rate:,.0f}" if tp3_usd else "N/A",
+                "tp1_profit_usd":       f"${tp1_usd:.2f}" if tp1_usd else "N/A",
+                "tp2_profit_usd":       f"${tp2_usd:.2f}" if tp2_usd else "N/A",
+                "tp3_profit_usd":       f"${tp3_usd:.2f}" if tp3_usd else "N/A",
+                "minimum_balance_for_forex_ngn": f"₦{min_balance_ngn:,.0f}",
+                "minimum_balance_for_forex_usd": f"${min_balance_usd:.0f}",
             }
+
+            if not viable:
+                result["warning"] = (
+                    f"⚠️ Account too small for live forex trading. "
+                    f"Your 2% risk = ${risk_usd:.4f} but the smallest forex lot (0.01 micro) "
+                    f"would risk ${actual_risk_usd:.2f} ({actual_risk_pct:.0f}% of your account) "
+                    f"on this {sl_pips:.0f}-pip stop — that is {actual_risk_pct:.0f}x your intended risk. "
+                    f"Minimum account needed for this trade at 2% risk: "
+                    f"₦{min_balance_ngn:,.0f} (${min_balance_usd:.0f}). "
+                    f"Use the demo account until you reach this balance."
+                )
+                result["actual_risk_if_forced_pct"] = round(actual_risk_pct, 1)
+                result["recommendation"] = "demo_only"
+
+            return result
     except Exception:
         return {}
 
 
 def get_budget_trading_plan(balance_ngn: float, ngn_rate: float) -> str:
     """
-    Given any NGN balance, return a concrete, actionable trading plan
-    with exact position sizes, risk amounts, and realistic expectations.
-    Never says 'too small' — always gives a plan.
+    Given any NGN balance, return a realistic, honest trading plan.
+    Uses accurate minimum account sizes based on real lot-size mathematics.
+
+    REAL MINIMUMS (derived from lot size math, not guesses):
+    - Forex 0.01 micro lot, EURUSD, 20-pip SL → $2 risk → need $100 account for 2%
+    - Forex 0.01 micro lot, EURUSD, 10-pip SL → $1 risk → need $50 account for 2%
+    - Crypto spot: $1 minimum order → need $50 account for 2%
+    - Safe forex minimum: ~$100 (₦160,000 at ₦1,600/$)
+    - Minimum crypto real money: ~$50 (₦80,000)
     """
-    balance_usd = balance_ngn / ngn_rate
-    risk_ngn    = balance_ngn * 0.02
-    risk_usd    = balance_usd * 0.02
+    balance_usd  = balance_ngn / ngn_rate
+    risk_ngn     = balance_ngn * 0.02
+    risk_usd     = balance_usd * 0.02
 
-    if balance_usd < 1:
-        tier = "nano"
-        recommendation = "demo"
-        account_type   = "Demo Account (practice with virtual funds)"
-        min_lots       = "N/A"
-        crypto_units   = "practice only"
-    elif balance_usd < 10:
-        tier = "micro"
-        recommendation = "demo + crypto spot"
-        account_type   = "Demo Account or Crypto Spot (buy fractional crypto)"
-        min_lots       = "N/A for forex — too small for MT5 micro-lot (min $50)"
-        crypto_units   = f"~{risk_usd:.4f} USD worth of BTC/ETH/SOL"
+    # ── Tier thresholds (USD) based on real lot-size math ──────────────────
+    # $0-5      → demo only (2% = $0.10 — can't open any real position)
+    # $5-50     → demo + crypto spot watch (2% = $0.10-1.00 — barely viable for crypto)
+    # $50-100   → crypto real money only (2% = $1-2 — enough for crypto, NOT forex)
+    # $100-300  → forex micro OK with TIGHT SL (2% = $2-6 — covers 0.01 lots barely)
+    # $300-1000 → forex micro comfortable (2% = $6-20)
+    # $1000+    → standard forex approach
+
+    if balance_usd < 5:
+        tier = "demo_only"
+    elif balance_usd < 50:
+        tier = "crypto_watch"
     elif balance_usd < 100:
-        tier = "mini"
-        recommendation = "crypto micro or demo forex"
-        account_type   = "Micro Account (some brokers accept $10+ min deposit)"
-        min_lots       = "0.01 lots (micro) on low-margin pairs"
-        crypto_units   = f"~{risk_usd:.4f} USD worth per trade"
-    elif balance_usd < 500:
-        tier = "standard_micro"
-        recommendation = "forex micro lots"
-        account_type   = "Standard Account — trade 0.01-0.05 lots"
-        min_lots       = f"0.01 lots (${balance_usd * 0.001:.2f} per pip on EUR/USD)"
-        crypto_units   = f"${risk_usd:.2f} per position"
+        tier = "crypto_only"
+    elif balance_usd < 300:
+        tier = "forex_entry"
+    elif balance_usd < 1000:
+        tier = "forex_micro"
     else:
-        tier = "standard"
-        recommendation = "full forex trading"
-        account_type   = "Standard Account — full access to all 30 pairs"
-        min_lots       = f"0.01-{balance_usd/10000:.2f} lots (scaled to 2% risk)"
-        crypto_units   = f"${risk_usd:.2f} per position"
+        tier = "forex_standard"
 
-    plan = f"""━━━ YOUR PERSONALISED TRADING PLAN ━━━
-Balance: ₦{balance_ngn:,.0f} NGN = ${balance_usd:.2f} USD
-Risk per trade (2%): ₦{risk_ngn:,.0f} NGN = ${risk_usd:.4f} USD
-Account type: {account_type}
-Position size: {min_lots}
-Strategy: {recommendation.title()}
+    # ── Calculate what 0.01 lots ACTUALLY risks on EURUSD with a 20-pip SL ──
+    # $0.10/pip × 20 pips = $2.00 actual risk per trade at minimum lot
+    actual_min_lot_risk_usd = 2.00   # 0.01 lots, 20-pip SL on EURUSD
+    min_forex_balance_usd   = actual_min_lot_risk_usd / 0.02   # = $100
+    min_forex_balance_ngn   = min_forex_balance_usd * ngn_rate
+    min_crypto_balance_usd  = 1.00 / 0.02  # $1 min order / 2% = $50
+    min_crypto_balance_ngn  = min_crypto_balance_usd * ngn_rate
 
+    plan = f"""━━━ YOUR HONEST TRADING PLAN ━━━
+Balance: ₦{balance_ngn:,.0f} = ${balance_usd:.2f} USD
+2% Risk amount: ₦{risk_ngn:,.0f} = ${risk_usd:.4f} USD
 """
-    if tier == "nano":
-        plan += """PLAN: Start on Demo to build skill and track record.
-• Use the /demo/open_account endpoint to practice with virtual ₦50,000
-• Target 70%+ win rate on demo before depositing any real money
-• Minimum real deposit to trade forex: ~₦50,000 (~$30)
-• While saving: study CLEO's signals daily and track which ones hit TP1"""
 
-    elif tier == "micro":
-        plan += f"""PLAN: Demo + Crypto Spot micro-trading.
-• Open a free demo account (CLEO's demo system) to practice risk management
-• For real trading: platforms like Binance/Bybit allow crypto with just ${balance_usd:.2f}
-• Buy ${risk_usd:.4f} worth of BTC or ETH per signal — fractional amounts allowed
-• Target: grow to ₦50,000 (~$30) before opening a forex account
-• Expected growth at 70% accuracy: +20-40% per month on demo"""
+    if tier == "demo_only":
+        plan += f"""
+⚠️  REALITY CHECK — Your 2% risk is only ${risk_usd:.4f}.
+    No real broker or exchange accepts orders this small.
+    The right move here is DEMO trading — not real money yet.
 
-    elif tier == "mini":
-        plan += f"""PLAN: Crypto micro-trading + saving for forex.
-• Your ${balance_usd:.2f} can trade crypto on Binance/Bybit/Kraken spot
-• Risk ${risk_usd:.4f} per signal (2% of balance)
-• Best pairs for your size: BTCUSDT, ETHUSDT, SOLUSDT (high liquidity, tight spread)
-• For forex: brokers like FBS, Exness, XM accept deposits from $10
-• Target: 3-5 trades per week, aim for TP1 each time"""
+WHAT TO DO NOW:
+• Practice on CLEO's demo account (virtual ₦50,000 — free)
+• Study signals daily, paper-trade every entry/exit, track your win rate
+• Goal: Hit 65%+ win rate on demo for 30 consecutive trades
+• Then deposit your ₦{balance_ngn:,.0f} PLUS save more to reach ₦{min_crypto_balance_ngn:,.0f} for crypto
 
-    else:
-        plan += f"""PLAN: Live forex + crypto trading.
-• Your ${balance_usd:.2f} qualifies for micro-lot forex trading
-• Risk ₦{risk_ngn:,.0f} / ${risk_usd:.2f} per trade (2% rule — never break this)
-• Lot size guideline: 0.01 lots per ~$100 in account (conservative)
-• Recommended pairs: EURUSD, GBPUSD (tightest spreads save you money)
-• Max 3 trades open at once — protects against correlated losses
-• Target monthly return: 8-15% (conservative), up to 25% (aggressive)"""
+MINIMUM TO START REAL TRADING:
+• Crypto (Binance/Bybit spot): ₦{min_crypto_balance_ngn:,.0f} (~${min_crypto_balance_usd:.0f})
+• Forex micro (0.01 lots):     ₦{min_forex_balance_ngn:,.0f} (~${min_forex_balance_usd:.0f})"""
+
+    elif tier == "crypto_watch":
+        plan += f"""
+⚠️  ALMOST THERE — Your 2% risk = ${risk_usd:.4f}.
+    Crypto spot needs $1+ per order (your 2% is below this).
+    You CAN buy and hold crypto as spot investment (not leveraged trading).
+
+WHAT TO DO NOW:
+• Demo trade forex and crypto on CLEO's demo system — sharpen your entries
+• You can BUY (not trade) fractional crypto: ${balance_usd:.2f} of BTC/ETH as long-term hold
+• Grow your account to ₦{min_crypto_balance_ngn:,.0f} before trading with SL/TP
+• Target: save ₦{max(0, min_crypto_balance_ngn - balance_ngn):,.0f} more to reach crypto trading minimum
+
+MINIMUM TO START REAL TRADING:
+• Crypto (Binance/Bybit spot): ₦{min_crypto_balance_ngn:,.0f} (~${min_crypto_balance_usd:.0f})
+• Forex micro (0.01 lots):     ₦{min_forex_balance_ngn:,.0f} (~${min_forex_balance_usd:.0f})"""
+
+    elif tier == "crypto_only":
+        plan += f"""
+✅  CRYPTO READY — Your 2% risk = ${risk_usd:.2f} (above $1 minimum for crypto).
+⚠️  NOT FOREX READY — Forex 0.01 micro lot risks $2 minimum. Your 2% = ${risk_usd:.2f}.
+    Opening 0.01 forex lots now would risk {actual_min_lot_risk_usd / balance_usd * 100:.0f}% of your account per trade.
+
+WHAT TO DO NOW (CRYPTO):
+• Platform: Binance, Bybit, or Kraken — spot trading only (no leverage)
+• Risk per trade: ${risk_usd:.2f} (buy this USD value of the asset, set SL/TP)
+• Best assets for your size: BTCUSDT, ETHUSDT, SOLUSDT (liquid, tight spread)
+• 3 trades max open at once
+
+WHAT TO DO FOR FOREX:
+• Demo only — practice on CLEO's demo system (free, no real money)
+• Save to ₦{min_forex_balance_ngn:,.0f} (~${min_forex_balance_usd:.0f}) before opening real forex
+
+GROWTH TARGET:
+• At 70% win rate trading crypto: expect +15-30% per month on your ${balance_usd:.2f}
+• Reinvest profits until you hit ₦{min_forex_balance_ngn:,.0f} for forex"""
+
+    elif tier == "forex_entry":
+        plan += f"""
+✅  FOREX MICRO READY — Your 2% risk = ${risk_usd:.2f}.
+    You can trade 0.01 micro lots. Keep SL tight (≤20 pips) to stay within 2%.
+
+FOREX PLAN (0.01 micro lots):
+• Broker: Exness, XM, or FBS (low minimum deposit, tight spreads)
+• Lot size: 0.01 lots on every trade (fixed — do NOT increase yet)
+• Max SL: 20 pips (at 0.01 lots, 20 pips = $2 = your ~2% risk)
+• Best pairs: EURUSD, GBPUSD (tightest spreads, most liquidity)
+• Max 3 trades open at once
+
+CRYPTO PLAN (parallel):
+• Risk ${risk_usd:.2f} per signal on BTCUSDT, ETHUSDT, SOLUSDT
+• Run both forex and crypto simultaneously to diversify
+
+GROWTH TARGET:
+• At 70% win rate: +10-20% per month on your ₦{balance_ngn:,.0f}
+• Scale lot size to 0.02 when account hits ${balance_usd * 1.5:.0f}"""
+
+    elif tier == "forex_micro":
+        ideal_lots = round(risk_usd / 2.0 * 0.01, 2)   # $2 per 0.01 lot
+        plan += f"""
+✅  COMFORTABLE FOREX — Your 2% risk = ${risk_usd:.2f}.
+    You can comfortably scale beyond the minimum micro lot.
+
+FOREX PLAN:
+• Lot size: {ideal_lots} lots (scaled for your 2% risk with 20-pip SL)
+• Broker: Exness, XM, Pepperstone, or FXTM
+• Best pairs: EURUSD, GBPUSD, USDJPY, AUDUSD
+• Max 3 trades open at once — diversify across uncorrelated pairs
+
+CRYPTO PLAN:
+• Risk ${risk_usd:.2f} per signal on BTCUSDT, ETHUSDT, SOLUSDT
+• Use spot trading — no leverage needed at this stage
+
+GROWTH TARGET:
+• Conservative: +8-15% per month
+• Aggressive: +20-30% per month (3 trades/week, TP2 targets)"""
+
+    else:  # forex_standard
+        ideal_lots = round(risk_usd / 2.0 * 0.01, 2)
+        plan += f"""
+✅  FULL FOREX ACCESS — Your 2% risk = ${risk_usd:.2f}.
+    All 30 pairs available. Scale properly.
+
+FOREX PLAN:
+• Lot size: {ideal_lots} lots (2% risk, 20-pip SL baseline)
+• All 15 forex pairs in CLEO's universe available
+• Pyramid into winning trades (add at 1R, move SL to entry)
+• Consider prop firm challenge at this level (FTMO, MyFundedFX)
+
+CRYPTO PLAN:
+• Risk ${risk_usd:.2f} per crypto signal
+• Can diversify across 3-4 crypto assets simultaneously
+
+GROWTH TARGET:
+• Conservative: +8-12% per month
+• Compound effect: ₦{balance_ngn:,.0f} → ₦{balance_ngn * 2:,.0f} in 6-9 months at 10%/month"""
 
     return plan
 
@@ -2441,8 +2569,13 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
    Trend → Momentum → Confirmation → Volatility → Risk → Conviction.
    Then give your answer with that reasoning embedded naturally in your response.
 2. LIVE DATA — if live data is shown above, USE it. Never say "I don't have data" when data is shown.
-3. NO EXCUSES ON BUDGET — if {name} mentions ANY amount (even ₦500), give a concrete plan.
-   Use the budget plan above. Never say "this is too small." Always say "here's what you can do."
+3. HONEST BUDGET GUIDANCE — when {name} mentions a balance, apply these real rules:
+   • Under $5 (₦{5 * ngn_rate:,.0f}): Demo ONLY. Say it directly. 2% = $0.10 — no broker accepts this.
+   • $5-$50 (₦{5 * ngn_rate:,.0f}-₦{50 * ngn_rate:,.0f}): Hold crypto as investment only. NO active trading.
+   • $50-$100 (₦{50 * ngn_rate:,.0f}-₦{100 * ngn_rate:,.0f}): Crypto real money ✅. Forex demo only.
+   • $100+ (₦{100 * ngn_rate:,.0f}+): Forex micro (0.01 lots) now viable. Both markets open.
+   ⚠️ NEVER recommend forex to anyone below $100. 0.01 lots with 20-pip SL = $2 risk minimum.
+   Always tell them the exact NGN amount they need to reach the next tier.
 4. NGN ↔ USD — convert instantly: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD. Always show both.
 5. RISK DISCIPLINE — recommend 2% risk per trade always. For {user.trading_style} / {user.risk_tolerance} risk.
 6. MATHS — show exact calculations. Entry ± ATR×1.5 = SL. R×1.5 = TP1. R×2.5 = TP2. R×4 = TP3.
