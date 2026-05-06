@@ -4631,7 +4631,7 @@ async def voice_speak(
 
     voice = body.get("voice", "cleo")
     try:
-        audio_bytes = text_to_speech(text, voice=voice)
+        audio_bytes = await text_to_speech(text, voice=voice)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"TTS failed: {str(e)[:200]}")
 
@@ -4719,7 +4719,7 @@ async def voice_chat(
     audio_mp3: bytes = b""
     audio_b64: str   = ""
     try:
-        audio_mp3 = text_to_speech(tts_text, voice=voice)
+        audio_mp3 = await text_to_speech(tts_text, voice=voice)
         audio_b64 = base64.b64encode(audio_mp3).decode("utf-8")
     except Exception as e:
         print(f"[VOICE/TTS] non-critical error: {e}")

@@ -267,41 +267,21 @@ TTS_VOICES = {
 }
 
 
-def _run_async(coro):
-    """Run an async coroutine synchronously, compatible with uvicorn's event loop."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result(timeout=30)
-        else:
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
+async def text_to_speech(text: str, voice: str = "cleo") -> bytes:
+    """
+    Convert text to speech using Microsoft Edge neural TTS (via edge-tts).
+    Returns raw MP3 bytes. No API key required. Must be awaited.
 
-
-async def _tts_async(text: str, voice_id: str) -> bytes:
-    """Internal async TTS using edge-tts."""
-    communicate = edge_tts.Communicate(text, voice_id)
+    voice: 'cleo' (default warm female) | 'female' | 'male' | 'warm' | 'deep'
+           OR a raw Edge voice name like 'en-US-AriaNeural'.
+    """
+    voice_id   = TTS_VOICES.get(voice, voice)
+    clean_text = text.strip()[:4000]
+    if not clean_text:
+        return b""
+    communicate = edge_tts.Communicate(clean_text, voice_id)
     buf = io.BytesIO()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             buf.write(chunk["data"])
     return buf.getvalue()
-
-
-def text_to_speech(text: str, voice: str = "cleo") -> bytes:
-    """
-    Convert text to speech using Microsoft Edge neural TTS (via edge-tts).
-    Returns raw MP3 bytes. No API key required.
-
-    voice: 'cleo' (default warm female) | 'female' | 'male' | 'warm' | 'deep'
-           OR a raw Edge voice name like 'en-US-AriaNeural'.
-    """
-    voice_id  = TTS_VOICES.get(voice, voice)
-    clean_text = text.strip()[:4000]
-    if not clean_text:
-        return b""
-    return _run_async(_tts_async(clean_text, voice_id))
