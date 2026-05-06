@@ -1,10 +1,17 @@
 # main.py
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Response
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-import os, json, re, time, requests, random, math, threading
+import os, json, re, time, requests, random, math, threading, base64
 from datetime import datetime, timedelta
-from ai_provider import get_ai_response, get_ai_response_creative
+from ai_provider import (
+    get_ai_response,
+    get_ai_response_creative,
+    get_ai_response_chat,
+    transcribe_audio,
+    text_to_speech,
+    TTS_VOICES,
+)
 from sqlalchemy.orm import Session
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -2195,17 +2202,26 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
         db.refresh(conv)
         conv_id = conv.id
 
-    # ── load this conversation's history (last 12 turns) ──
+    # ── load this conversation's history (last 40 messages = 20 turns) ──
     history = (
         db.query(DBChatMessage)
         .filter(DBChatMessage.conversation_id == conv_id)
         .order_by(DBChatMessage.created_at.desc())
-        .limit(12)
+        .limit(40)
         .all()
     )
+    history = list(reversed(history))
+
+    # Build native Groq messages array (proper multi-turn memory)
+    history_messages = []
+    for m in history:
+        role = "assistant" if m.role in ("aria", "assistant", "cleo") else "user"
+        history_messages.append({"role": role, "content": m.content})
+
+    # Compact history text for system prompt reference
     history_text = "\n".join(
-        [f"{m.role.upper()}: {m.content}" for m in reversed(history)]
-    )
+        [f"{m.role.upper()}: {m.content[:200]}" for m in history[-6:]]
+    ) if history else ""
 
     # ── load long-term memories ──
     memories = get_user_memories(user, db)
@@ -2455,8 +2471,10 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 11. TONE — warm, institutional, direct. Like a senior trader mentoring a student. No hype.
 12. NEVER guarantee profits. End every trade recommendation with ⚠️ Risk: [one-sentence disclaimer]."""
 
-    full_prompt = f"{system_prompt}\n\n{name}: {chat.message}\nCLEO:"
-    response = get_ai_response_creative(full_prompt)
+    # ── Build the messages array: history + current user message ──
+    # This gives CLEO native multi-turn memory rather than text-embedded history.
+    chat_messages = history_messages + [{"role": "user", "content": chat.message}]
+    response = get_ai_response_chat(chat_messages, system_prompt, max_tokens=2048)
 
     # ── save messages to DB ──
     db.add(
@@ -4548,6 +4566,196 @@ def scheduler_status():
             "The scheduler automatically generates signals every hour and queues "
             "auto-trade eligible ones (confidence >= min_confidence) for all active bots."
         ),
+    }
+
+
+# ═══════════════════════════════════════════════════
+#  VOICE CHAT ENDPOINTS
+#  STT: Groq Whisper large-v3 (free)
+#  TTS: Groq PlayAI (free)
+# ═══════════════════════════════════════════════════
+
+
+@app.post("/voice/transcribe")
+async def voice_transcribe(
+    file: UploadFile = File(...),
+):
+    """
+    Convert an audio recording to text using Groq Whisper.
+
+    Send a multipart/form-data POST with field name `file`.
+    Accepts: webm, mp3, mp4, wav, ogg, m4a, flac (max ~25 MB).
+
+    Returns:
+      { "text": "transcription here", "filename": "...", "duration_hint": "..." }
+    """
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio file received.")
+
+    filename = file.filename or "audio.webm"
+    try:
+        text = transcribe_audio(audio_bytes, filename=filename)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Transcription failed: {str(e)[:200]}")
+
+    return {
+        "success": True,
+        "text": text,
+        "filename": filename,
+        "bytes_received": len(audio_bytes),
+    }
+
+
+@app.post("/voice/speak")
+async def voice_speak(
+    body: dict,
+):
+    """
+    Convert text to speech using Groq PlayAI TTS.
+
+    POST JSON body:
+      {
+        "text": "Hello, this is CLEO speaking.",
+        "voice": "cleo"          // optional: cleo | female | male | warm | deep
+      }
+
+    Returns raw MP3 audio bytes (Content-Type: audio/mpeg).
+    Frontend can play this directly:
+      const audio = new Audio(URL.createObjectURL(new Blob([response.data], {type:'audio/mpeg'})))
+      audio.play()
+    """
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="`text` field is required.")
+
+    voice = body.get("voice", "cleo")
+    try:
+        audio_bytes = text_to_speech(text, voice=voice)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS failed: {str(e)[:200]}")
+
+    return Response(
+        content=audio_bytes,
+        media_type="audio/mpeg",
+        headers={
+            "Content-Disposition": "inline; filename=cleo_response.mp3",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+@app.post("/voice/chat")
+async def voice_chat(
+    file: UploadFile = File(...),
+    username: str    = Form(...),
+    conversation_id: Optional[int] = Form(None),
+    voice: str       = Form("cleo"),
+    db: Session      = Depends(get_db),
+):
+    """
+    Full voice chat round-trip:
+      1. Transcribe audio → text   (Groq Whisper)
+      2. Send text to CLEO         (same as POST /chat)
+      3. Convert CLEO response → MP3  (Groq PlayAI TTS)
+
+    Send as multipart/form-data:
+      - file           : audio blob (webm / mp3 / wav / m4a)
+      - username       : your username
+      - conversation_id: (optional) continue existing conversation
+      - voice          : (optional) cleo | female | male | warm | deep
+
+    Returns JSON:
+      {
+        "success": true,
+        "transcription": "what the user said",
+        "response": "CLEO's text response",
+        "audio_base64": "base64-encoded MP3 — play directly in browser",
+        "audio_content_type": "audio/mpeg",
+        "conversation_id": 42,
+        "conversation_title": "EURUSD Strategy"
+      }
+
+    To play audio on the frontend:
+      const bytes = Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0))
+      const blob  = new Blob([bytes], { type: 'audio/mpeg' })
+      new Audio(URL.createObjectURL(blob)).play()
+    """
+    # ── Step 1: Transcribe audio ──
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio file.")
+
+    filename = file.filename or "audio.webm"
+    try:
+        transcription = transcribe_audio(audio_bytes, filename=filename)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Transcription failed: {str(e)[:200]}")
+
+    if not transcription:
+        raise HTTPException(status_code=422, detail="Could not transcribe audio — please speak clearly.")
+
+    # ── Step 2: Send transcription to CLEO (reuse chat endpoint logic) ──
+    chat_req = ChatMessage(
+        username        = username,
+        message         = transcription,
+        conversation_id = conversation_id,
+    )
+    try:
+        chat_result = chat_with_aria(chat_req, db=db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chat error: {str(e)[:200]}")
+
+    cleo_text = chat_result.get("response", "")
+
+    # ── Step 3: Convert CLEO's response to audio ──
+    # Strip markdown for cleaner TTS (remove **, ##, ━━, emojis lists, etc.)
+    tts_text = re.sub(r"[*#━─│╔╗╚╝╠╣╦╩╬]+", "", cleo_text)
+    tts_text = re.sub(r"\n{3,}", "\n\n", tts_text).strip()
+    tts_text = tts_text[:3500]   # keep within TTS limit
+
+    audio_mp3: bytes = b""
+    audio_b64: str   = ""
+    try:
+        audio_mp3 = text_to_speech(tts_text, voice=voice)
+        audio_b64 = base64.b64encode(audio_mp3).decode("utf-8")
+    except Exception as e:
+        print(f"[VOICE/TTS] non-critical error: {e}")
+        # Return text response even if TTS fails
+
+    return {
+        "success":              True,
+        "transcription":        transcription,
+        "response":             cleo_text,
+        "audio_base64":         audio_b64,
+        "audio_content_type":   "audio/mpeg",
+        "conversation_id":      chat_result.get("conversation_id"),
+        "conversation_title":   chat_result.get("conversation_title"),
+        "username":             username,
+        "tts_available":        bool(audio_b64),
+    }
+
+
+@app.get("/voice/voices")
+def list_voices():
+    """List all available TTS voice options for the voice chat endpoints."""
+    return {
+        "voices": [
+            {"id": "cleo",   "edge_voice": "en-US-AriaNeural",  "gender": "female", "style": "warm professional — CLEO default"},
+            {"id": "female", "edge_voice": "en-US-JennyNeural", "gender": "female", "style": "clear, friendly"},
+            {"id": "male",   "edge_voice": "en-US-GuyNeural",   "gender": "male",   "style": "clear, authoritative"},
+            {"id": "warm",   "edge_voice": "en-GB-SoniaNeural", "gender": "female", "style": "warm British female"},
+            {"id": "deep",   "edge_voice": "en-US-EricNeural",  "gender": "male",   "style": "deeper male voice"},
+        ],
+        "tts_engine": "Microsoft Edge Neural TTS (edge-tts, free)",
+        "stt_model":  "whisper-large-v3 via Groq (free)",
+        "usage": {
+            "speak":     "POST /voice/speak  — JSON body: {text, voice}  → returns MP3 bytes",
+            "transcribe": "POST /voice/transcribe  — multipart file  → returns {text}",
+            "chat":      "POST /voice/chat  — multipart (file, username, conversation_id?, voice?) → returns {transcription, response, audio_base64}",
+        },
     }
 
 

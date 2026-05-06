@@ -3,7 +3,7 @@
 ## Project Overview
 FastAPI backend for CLEO — an AI-powered institutional-grade trading bot analyzing 30 Forex and crypto markets. Provides real-time signal generation from live Alpha Vantage OHLCV data, NGN/USD conversion, demo trading, persistent PostgreSQL user data, personalized advice, a visual trading simulator, and a full MT5 auto-execution engine with Risk Engine, Market Filter, and Trade Manager.
 
-## Current Status (April 2026)
+## Current Status (May 2026)
 - **Backend**: Running on port 5000
 - **Data Source**: Twelve Data (primary, 800 req/day) → Alpha Vantage (fallback, 25/day) → AI reasoning
 - **AI Model**: llama-3.3-70b-versatile via Groq (100,000 TPD free tier)
@@ -14,6 +14,8 @@ FastAPI backend for CLEO — an AI-powered institutional-grade trading bot analy
 - **Economic Calendar**: ForexFactory free feed (30-min cache) + static fallback; 88+ events/week; currency inference for null fields
 - **AI Reasoning**: Upgraded to 6-step framework (Trend→Momentum→Confirmation→Volatility→Risk→Conviction) in both signal generation and chat
 - **Budget-Aware Planning**: Any NGN amount triggers a personalised trading plan — CLEO never says "too small", always gives a concrete plan
+- **Voice Chat**: STT via Groq Whisper large-v3; TTS via Microsoft Edge Neural (edge-tts, free); full round-trip `/voice/chat` endpoint
+- **In-Session Memory Fix**: Chat now uses proper Groq multi-turn messages array (40 msg history) — CLEO remembers everything said in current conversation
 
 ## Architecture
 
@@ -106,6 +108,12 @@ PENDING → QUEUED → SENT → ACTIVE → CLOSED
 - `POST /user/{username}` — Create/update profile
 - `GET /user/{username}` — Full profile with stats
 - `GET /account/monitor/{username}` — Account overview
+
+### Voice Chat
+- `POST /voice/transcribe` — Upload audio → `{text}` (Groq Whisper STT)
+- `POST /voice/speak` — JSON `{text, voice}` → MP3 bytes (Edge TTS)
+- `POST /voice/chat` — Multipart `(file, username, conversation_id?, voice?)` → `{transcription, response, audio_base64}` full round-trip
+- `GET /voice/voices` — List available voices
 
 ### AI Chat (Persistent with Memory)
 - `POST /chat` — Chat with CLEO

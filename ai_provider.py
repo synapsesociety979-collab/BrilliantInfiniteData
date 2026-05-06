@@ -1,7 +1,10 @@
 # ai_provider.py
 import os
+import io
 import time
+import asyncio
 from groq import Groq
+import edge_tts
 
 api_key = os.getenv("GROQ_API_KEY")
 client  = Groq(api_key=api_key)
@@ -102,7 +105,7 @@ When a user tells you their balance — ANY amount in NGN or USD — you MUST:
 
 
 def _call_model(model: str, prompt: str, temperature: float, max_tokens: int) -> str:
-    """Make a single API call to the specified Groq model."""
+    """Make a single API call (single-turn) to the specified Groq model."""
     completion = client.chat.completions.create(
         model    = model,
         messages = [
@@ -115,17 +118,31 @@ def _call_model(model: str, prompt: str, temperature: float, max_tokens: int) ->
     return completion.choices[0].message.content
 
 
-def get_ai_response(prompt: str, temperature: float = 0.15,
-                    max_tokens: int = 4096) -> str:
-    """
-    Send a prompt to Groq.
-    Model priority:
-      1. llama-3.3-70b-versatile (primary, best quality, 100K tokens/day)
-      2. llama-3.1-8b-instant    (fallback, 500K tokens/day)
-    Per-minute limits retried once after 65s.
-    Daily limits switch immediately to fallback.
-    Temperature 0.15 = precise, consistent, low randomness for signals.
-    """
+def _call_model_multiturn(
+    model: str,
+    messages: list,
+    system_prompt: str,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    """Multi-turn chat call — receives full messages array with roles."""
+    all_messages = [{"role": "system", "content": system_prompt}] + messages
+    completion = client.chat.completions.create(
+        model       = model,
+        messages    = all_messages,
+        temperature = temperature,
+        max_tokens  = max_tokens,
+    )
+    return completion.choices[0].message.content
+
+
+def _run_with_fallback(
+    caller,          # callable(*args) → str
+    *args,
+    temperature: float = 0.45,
+    max_tokens: int = 2048,
+) -> str:
+    """Shared retry / fallback logic for both single-turn and multi-turn calls."""
     global _daily_limit_hit
 
     models_to_try = [FALLBACK_MODEL] if _daily_limit_hit else [PRIMARY_MODEL, FALLBACK_MODEL]
@@ -133,8 +150,7 @@ def get_ai_response(prompt: str, temperature: float = 0.15,
     for model in models_to_try:
         for attempt in range(2):
             try:
-                result = _call_model(model, prompt, temperature, max_tokens)
-                return result
+                return caller(model, *args, temperature=temperature, max_tokens=max_tokens)
 
             except Exception as e:
                 err      = str(e).lower()
@@ -170,17 +186,122 @@ def get_ai_response(prompt: str, temperature: float = 0.15,
     return "ERROR: AI unavailable — please try again shortly."
 
 
+def get_ai_response(prompt: str, temperature: float = 0.15,
+                    max_tokens: int = 4096) -> str:
+    """
+    Single-turn prompt → response.
+    Model priority:
+      1. llama-3.3-70b-versatile (primary, best quality, 100K tokens/day)
+      2. llama-3.1-8b-instant    (fallback, 500K tokens/day)
+    Temperature 0.15 = precise, consistent, low randomness for signals.
+    """
+    def caller(model, prompt, *, temperature, max_tokens):
+        return _call_model(model, prompt, temperature, max_tokens)
+
+    return _run_with_fallback(caller, prompt, temperature=temperature, max_tokens=max_tokens)
+
+
 def get_ai_response_creative(prompt: str, max_tokens: int = 2048) -> str:
-    """
-    Higher temperature for chat — more natural, warm language.
-    Still precise enough to give real analysis.
-    """
+    """Higher temperature for chat — more natural, warm language."""
     return get_ai_response(prompt, temperature=0.45, max_tokens=max_tokens)
 
 
 def get_ai_response_analytical(prompt: str, max_tokens: int = 3000) -> str:
-    """
-    Very low temperature for deep analytical tasks — market deep dives,
-    backtesting commentary, risk reports. Maximum precision.
-    """
+    """Very low temperature for deep analytical tasks — maximum precision."""
     return get_ai_response(prompt, temperature=0.1, max_tokens=max_tokens)
+
+
+def get_ai_response_chat(
+    messages: list,
+    system_prompt: str,
+    max_tokens: int = 2048,
+) -> str:
+    """
+    Proper multi-turn chat using Groq's native messages format.
+    `messages` = list of {"role": "user"/"assistant", "content": str}
+    This gives CLEO true in-session memory — it sees the full conversation
+    as a native message array, not just text embedded in the system prompt.
+    """
+    def caller(model, messages, system_prompt, *, temperature, max_tokens):
+        return _call_model_multiturn(model, messages, system_prompt, temperature, max_tokens)
+
+    return _run_with_fallback(
+        caller, messages, system_prompt,
+        temperature=0.45, max_tokens=max_tokens,
+    )
+
+
+# ─── Voice: Speech-to-Text (Groq Whisper) ────────────────────────────────────
+
+def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> str:
+    """
+    Transcribe audio bytes to text using Groq Whisper large-v3.
+    Accepts any format Whisper supports: webm, mp3, mp4, wav, ogg, m4a, flac.
+    Returns the transcription string.
+    """
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = filename
+
+    transcription = client.audio.transcriptions.create(
+        model = "whisper-large-v3",
+        file  = audio_file,
+        response_format = "text",
+    )
+    if isinstance(transcription, str):
+        return transcription.strip()
+    return getattr(transcription, "text", str(transcription)).strip()
+
+
+# ─── Voice: Text-to-Speech (Microsoft Edge TTS — free, no API key) ───────────
+#
+# Uses Microsoft's Edge neural TTS voices via the edge-tts package.
+# Quality is on par with Azure Cognitive Services TTS (same backend).
+# No API key required. Returns MP3 bytes.
+
+TTS_VOICES = {
+    "cleo":   "en-US-AriaNeural",      # default CLEO voice — warm, professional female
+    "female": "en-US-JennyNeural",     # friendly female
+    "male":   "en-US-GuyNeural",       # clear male
+    "warm":   "en-GB-SoniaNeural",     # British female — warm tone
+    "deep":   "en-US-EricNeural",      # deeper male voice
+}
+
+
+def _run_async(coro):
+    """Run an async coroutine synchronously, compatible with uvicorn's event loop."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, coro)
+                return future.result(timeout=30)
+        else:
+            return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
+
+
+async def _tts_async(text: str, voice_id: str) -> bytes:
+    """Internal async TTS using edge-tts."""
+    communicate = edge_tts.Communicate(text, voice_id)
+    buf = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buf.write(chunk["data"])
+    return buf.getvalue()
+
+
+def text_to_speech(text: str, voice: str = "cleo") -> bytes:
+    """
+    Convert text to speech using Microsoft Edge neural TTS (via edge-tts).
+    Returns raw MP3 bytes. No API key required.
+
+    voice: 'cleo' (default warm female) | 'female' | 'male' | 'warm' | 'deep'
+           OR a raw Edge voice name like 'en-US-AriaNeural'.
+    """
+    voice_id  = TTS_VOICES.get(voice, voice)
+    clean_text = text.strip()[:4000]
+    if not clean_text:
+        return b""
+    return _run_async(_tts_async(clean_text, voice_id))
