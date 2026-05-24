@@ -1094,6 +1094,135 @@ def _get_session_priority_symbols(h: int) -> List[str]:
     return priority + remaining
 
 
+def get_timing_context() -> dict:
+    """
+    Returns current trading session info, precise UTC entry windows, time exits,
+    and recommended chart timeframes — all derived from the current UTC clock.
+    Inject this into every AI prompt so CLEO always gives time-specific guidance.
+    """
+    from datetime import timedelta
+    utc = datetime.utcnow()
+    h   = utc.hour
+
+    if 13 <= h < 16:
+        session_name    = "London/NY Overlap"
+        session_end_h   = 16
+        volatility      = "PEAK — highest institutional orderflow of the day"
+        best_pairs      = "EURUSD, GBPUSD, USDJPY, USDCAD, USDCHF, BTCUSDT, ETHUSDT"
+        typical_range   = "80-150 pips (forex) / 1-3% (crypto)"
+        rec_tf          = "H1"
+        entry_valid_hrs = 1.5
+    elif 7 <= h < 13:
+        session_name    = "London"
+        session_end_h   = 16
+        volatility      = "HIGH — European institutional volume"
+        best_pairs      = "EURUSD, GBPUSD, EURGBP, EURJPY, GBPJPY, EURAUD, GBPAUD"
+        typical_range   = "60-100 pips (EUR/GBP pairs)"
+        rec_tf          = "H1" if h < 10 else "H4"
+        entry_valid_hrs = 2.0
+    elif 16 <= h < 21:
+        session_name    = "New York"
+        session_end_h   = 21
+        volatility      = "HIGH for USD pairs and crypto"
+        best_pairs      = "USDCAD, USDCHF, USDJPY, BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT"
+        typical_range   = "50-90 pips (USD pairs) / 1-4% (crypto)"
+        rec_tf          = "H1"
+        entry_valid_hrs = 2.0
+    elif 21 <= h or h < 1:
+        session_name    = "NY Close / Transition"
+        session_end_h   = 1
+        volatility      = "LOW — avoid new forex positions; crypto still active"
+        best_pairs      = "BTCUSDT, ETHUSDT, SOLUSDT (crypto 24/7 only)"
+        typical_range   = "Low forex (20-40 pips). Crypto: 1-2% moves possible"
+        rec_tf          = "H4"
+        entry_valid_hrs = 4.0
+    elif 1 <= h < 4:
+        session_name    = "Asian Early (Tokyo)"
+        session_end_h   = 9
+        volatility      = "LOW-MEDIUM — Tokyo open; JPY pairs most active"
+        best_pairs      = "USDJPY, AUDJPY, GBPJPY, AUDUSD, NZDUSD, crypto"
+        typical_range   = "30-60 pips (JPY pairs)"
+        rec_tf          = "H4"
+        entry_valid_hrs = 4.0
+    else:
+        session_name    = "Asian / Pre-London"
+        session_end_h   = 9
+        volatility      = "MEDIUM — building toward London Open breakout"
+        best_pairs      = "USDJPY, AUDJPY, AUDUSD, NZDUSD, crypto"
+        typical_range   = "40-70 pips (JPY/AUD pairs)"
+        rec_tf          = "H1"
+        entry_valid_hrs = 2.0
+
+    session_end_dt = utc.replace(hour=session_end_h, minute=0, second=0, microsecond=0)
+    if session_end_dt <= utc:
+        session_end_dt += timedelta(days=1)
+    mins_left = max(0, int((session_end_dt - utc).total_seconds() / 60))
+
+    entry_win_end  = utc + timedelta(minutes=30)
+    entry_win_utc  = f"{utc.strftime('%H:%M')}–{entry_win_end.strftime('%H:%M')} UTC"
+
+    deadline_dt    = min(
+        session_end_dt - timedelta(hours=2),
+        utc + timedelta(hours=entry_valid_hrs),
+    )
+    if deadline_dt <= utc:
+        deadline_dt = utc + timedelta(minutes=30)
+    entry_deadline = deadline_dt.strftime("%H:%M UTC")
+
+    time_exit_dt   = session_end_dt - timedelta(hours=1, minutes=30)
+    if time_exit_dt <= utc:
+        time_exit_dt = utc + timedelta(hours=2)
+    time_exit      = time_exit_dt.strftime("%H:%M UTC")
+
+    return {
+        "session_name":       session_name,
+        "session_end_utc":    session_end_dt.strftime("%H:%M UTC"),
+        "volatility":         volatility,
+        "best_pairs":         best_pairs,
+        "typical_range":      typical_range,
+        "recommended_tf":     rec_tf,
+        "entry_window_utc":   entry_win_utc,
+        "entry_deadline_utc": entry_deadline,
+        "time_exit_utc":      time_exit,
+        "minutes_left":       mins_left,
+        "current_utc":        utc.strftime("%H:%M UTC, %a %d %b %Y"),
+    }
+
+
+def enrich_signal_timing(signal: dict, timing: dict) -> dict:
+    """
+    Post-process a signal to guarantee timing fields are accurate.
+    Fills missing fields from the session context and validates AI-provided ones.
+    Runs AFTER the AI returns so timing is always based on real clock data.
+    """
+    try:
+        tf = signal.get("timeframe_chart", "")
+        if tf not in ("M15", "H1", "H4", "D1"):
+            tf = timing["recommended_tf"]
+        signal["timeframe_chart"]     = tf
+        signal["entry_window_utc"]    = signal.get("entry_window_utc")    or timing["entry_window_utc"]
+        signal["entry_deadline_utc"]  = signal.get("entry_deadline_utc")  or timing["entry_deadline_utc"]
+        signal["time_exit_utc"]       = signal.get("time_exit_utc")       or timing["time_exit_utc"]
+        signal["session_context"]     = signal.get("session_context")     or timing["session_name"]
+
+        if not signal.get("expected_tp1_hours"):
+            hold = str(signal.get("hold_time", "")).lower()
+            m_match = re.search(r"(\d+\.?\d*)", hold)
+            raw = float(m_match.group(1)) if m_match else 4.0
+            if "min" in hold:
+                hrs = raw / 60
+            elif "d" in hold:
+                hrs = raw * 24
+            else:
+                hrs = raw
+            fallback = {"M15": 0.5, "H1": 2.0, "H4": 8.0, "D1": 24.0}.get(tf, 4.0)
+            signal["expected_tp1_hours"] = round(min(hrs * 0.6, fallback), 1)
+
+    except Exception:
+        pass
+    return signal
+
+
 def generate_market_predictions(
     investment_amount_ngn: float = 0.0, user_profile: str = ""
 ) -> Dict[str, Any]:
@@ -1190,15 +1319,27 @@ def generate_market_predictions(
         else "AI pattern reasoning (live data unavailable)"
     )
 
+    timing = get_timing_context()
+
     prompt = f"""━━━ CLEO MARKET ANALYSIS ENGINE ━━━
 SESSION: {session} | UTC: {utc.strftime("%H:%M")} | Data: {data_source_note}
 Budget: {investment_amount_ngn:,.0f} NGN (~${inv_usd:,.2f} USD) | Risk/trade: {investment_amount_ngn*0.02:,.0f} NGN (~${investment_amount_ngn*0.02/ngn_rate:.2f} USD){personalization}
+
+━━━ TIMING INTELLIGENCE (use in every signal) ━━━
+Active Session : {timing["session_name"]} | Volatility: {timing["volatility"]}
+Entry Window   : {timing["entry_window_utc"]} (enter within this window for best fills)
+Entry Deadline : {timing["entry_deadline_utc"]} — do NOT take new trades after this
+Time Exit Rule : {timing["time_exit_utc"]} — if TP1 not reached by then, exit at BE or small loss
+Recommended TF : {timing["recommended_tf"]} chart (matches current session liquidity)
+Best Pairs Now : {timing["best_pairs"]}
+Typical Range  : {timing["typical_range"]}
+Session Ends   : {timing["session_end_utc"]} ({timing["minutes_left"]} min remaining)
 
 GOAL: Analyze ALL 30 symbols and return every symbol with a genuine tradeable edge.
 Target: 5-12 signals. Quality over quantity — only include setups with real conviction.
 
 ━━━ YOUR REASONING PROCESS (apply to EVERY symbol) ━━━
-Before assigning any signal, mentally work through these 6 steps:
+Before assigning any signal, mentally work through these 6 steps + timing check:
 
 1. TREND: Is price making HH+HL (uptrend), LH+LL (downtrend), or choppy range?
 2. MOMENTUM: Do RSI, MACD histogram, and Stochastic all agree on direction?
@@ -1206,6 +1347,7 @@ Before assigning any signal, mentally work through these 6 steps:
 4. VOLATILITY: Is ATR healthy (not compressed)? Is this the right session for this pair?
 5. RISK: Can I place a stop at 1.5×ATR with at least 1:1.5 R:R to TP1?
 6. CONVICTION: How many of steps 1-5 agree? 5-6 = STRONG. 3-4 = BUY/SELL. 1-2 = skip.
+7. TIMING: Is this pair active in the {timing["session_name"]} session? Set the exact UTC entry window.
 
 ━━━ SECTION A — LIVE INDICATOR DATA (12 symbols with full OHLCV + indicators) ━━━
 {"No live data this cycle — see Section B." if not has_real_data else ""}
@@ -1238,7 +1380,17 @@ SECTION B RULES:
 - stop_loss: entry ± (1.5 × ATR). Never tighter than 0.5 ATR.
 - take_profit_1: 1.5R from entry. take_profit_2: 2.5R. take_profit_3: 4.0R.
 - back_out_trigger: the price level that COMPLETELY invalidates the trade thesis
-- hold_time: based on ATR and timeframe — scalp=15min-2h, intraday=2-24h, swing=1-5 days
+- timeframe_chart: the ACTUAL chart timeframe to use — M15, H1, H4, or D1
+  • M15 = scalp (<90 min hold), only during London Open (07-09 UTC) or NY Open (13-15 UTC)
+  • H1  = intraday (2-8h hold), any active session — THIS IS THE DEFAULT
+  • H4  = swing (8-48h hold), low volatility or Asian session setups
+  • D1  = major swing (2-5 days), strong macro trend setups only
+- entry_window_utc: "HH:MM–HH:MM UTC" — the valid window to enter this trade TODAY
+- entry_deadline_utc: "HH:MM UTC" — latest time to enter; skip if price hasn't triggered by then
+- time_exit_utc: "HH:MM UTC" — close trade at BE/small loss if TP1 not reached by this time
+- expected_tp1_hours: estimated hours to reach TP1 based on ATR and timeframe (number)
+- session_context: which session is driving this and why (e.g. "London Open breakout — EUR volume spike")
+- hold_time: human-readable (e.g. "4 hours", "2 days") — must match timeframe_chart
 - rationale: 1 crisp sentence — name the 2 strongest indicator signals + the setup logic
 - data_source: "live_data" for Section A symbols, "ai_reasoning" for Section B
 
@@ -1247,6 +1399,7 @@ SECTION B RULES:
 ✗ Do NOT adjust ATR-derived SL/TP numbers (they are pre-calculated for correct R:R)
 ✗ Do NOT give a signal if indicators conflict — skip that symbol
 ✗ Do NOT output any text outside the JSON array
+✗ Do NOT set entry_deadline_utc after the current session end ({timing["session_end_utc"]})
 
 Return ONLY a valid JSON array:
 [
@@ -1257,7 +1410,7 @@ Return ONLY a valid JSON array:
     "confluence_score": "X/6 or X/3",
     "data_source": "live_data|ai_reasoning",
     "category": "forex|crypto",
-    "timeframe": "scalp|intraday|swing",
+    "timeframe_chart": "M15|H1|H4|D1",
     "session_fit": "excellent|good|fair|poor",
     "live_price": 0.0,
     "entry_price": 0.0,
@@ -1266,7 +1419,12 @@ Return ONLY a valid JSON array:
     "take_profit_2": 0.0,
     "take_profit_3": 0.0,
     "risk_reward": "1:X.X",
-    "hold_time": "Xh or Xd",
+    "hold_time": "X hours or X days",
+    "expected_tp1_hours": 2.5,
+    "entry_window_utc": "HH:MM–HH:MM UTC",
+    "entry_deadline_utc": "HH:MM UTC",
+    "time_exit_utc": "HH:MM UTC",
+    "session_context": "which session + what is driving this move",
     "back_out_trigger": 0.0,
     "rationale": "2 indicators + setup in one sentence."
   }}
@@ -1400,7 +1558,8 @@ Return ONLY a valid JSON array:
 
             validated.append(s)
 
-        data = validated
+        # ── Enrich every signal with accurate timing fields ──────────────────
+        data = [enrich_signal_timing(s, timing) for s in validated]
         # ── END PYTHON GATES ────────────────────────────────────────────────────
 
         strong = [s for s in data if s.get("signal") in ["STRONG_BUY", "STRONG_SELL"]]
@@ -1451,6 +1610,8 @@ def get_personalized_signal(symbol: str, user: User, db: Session) -> Dict:
     live_price = analysis.get("live_price", 0)
     has_live = bool(live_price)
 
+    timing = get_timing_context()
+
     prompt = f"""━━━ MARKET DATA FOR {symbol} ━━━
 {live_data_block}
 
@@ -1461,6 +1622,16 @@ Style: {user.trading_style} | Risk: {user.risk_tolerance}
 UTC: {utc.strftime("%Y-%m-%d %H:%M")}
 Position size (2% risk): {user.balance_ngn * 0.02:,.0f} NGN = ${user.balance_ngn * 0.02 / ngn_rate:.2f} USD
 
+━━━ SESSION & TIMING INTELLIGENCE ━━━
+Active Session  : {timing["session_name"]} | Volatility: {timing["volatility"]}
+Recommended TF  : {timing["recommended_tf"]} chart for current session
+Entry Window    : {timing["entry_window_utc"]} — optimal entry window right now
+Entry Deadline  : {timing["entry_deadline_utc"]} — do NOT enter after this time
+Time Exit Rule  : {timing["time_exit_utc"]} — exit at BE if TP1 not reached by then
+Best Pairs Now  : {timing["best_pairs"]}
+Typical Range   : {timing["typical_range"]}
+Session Ends    : {timing["session_end_utc"]} ({timing["minutes_left"]} min remaining)
+
 ━━━ CONFLUENCE-BASED CONFIDENCE ━━━
 {"Use the confluence score from the data block to calibrate confidence:" if has_live else "AI reasoning mode — cap confidence at 78."}
 {"Score 5-6/6 → 88-97 (STRONG) | Score 4/6 → 80-87 | Score 3/6 → 73-79 | Score 0-2 → HOLD" if has_live else ""}
@@ -1469,7 +1640,7 @@ Position size (2% risk): {user.balance_ngn * 0.02:,.0f} NGN = ${user.balance_ngn
 {"✗ ADX < 20 → HOLD (ranging) | ✗ MACD/RSI conflict → HOLD | ✗ Stoch/Williams disagree → HOLD | ✗ R:R < 1:1.8 → HOLD" if has_live else ""}
 
 ━━━ PERSONALISATION ━━━
-- Timeframe must match {user.trading_style} style
+- Chart timeframe: match {user.trading_style} style (scalper=M15, intraday=H1, swing=H4/D1)
 - SL distance: {"tighter (0.8–1.0×ATR)" if user.risk_tolerance == "low" else ("standard (1.5×ATR)" if user.risk_tolerance == "medium" else "wider (2.0×ATR)")} for {user.risk_tolerance} risk
 - {"Use EXACT indicator values — do not invent numbers." if has_live else "Conservative analysis only — no live data."}
 
@@ -1481,7 +1652,7 @@ Return ONLY valid JSON:
   "confluence_score": "X/6 or N/A",
   "data_source": "{"live_data" if has_live else "ai_reasoning"}",
   "category": "forex|crypto",
-  "timeframe": "scalp|intraday|swing",
+  "timeframe_chart": "M15|H1|H4|D1",
   "session_fit": "excellent|good|fair|poor",
   "live_price": "{live_price if live_price else "unavailable"}",
   "entry_price": "exact number",
@@ -1490,7 +1661,12 @@ Return ONLY valid JSON:
   "take_profit_2": "exact number",
   "take_profit_3": "exact number",
   "risk_reward": "1:X.X",
-  "hold_time": "duration for {user.trading_style}",
+  "hold_time": "X hours or X days (e.g. '4 hours', '2 days')",
+  "expected_tp1_hours": 2.5,
+  "entry_window_utc": "HH:MM–HH:MM UTC",
+  "entry_deadline_utc": "HH:MM UTC",
+  "time_exit_utc": "HH:MM UTC",
+  "session_context": "which session + what is driving this move right now",
   "position_size_ngn": "{user.balance_ngn * 0.02:,.0f} NGN",
   "position_size_usd": "${user.balance_ngn * 0.02 / ngn_rate:.2f} USD",
   "back_out_trigger": "exact invalidation price",
@@ -1510,7 +1686,7 @@ Return ONLY valid JSON:
     "pivot": "pivot level if available"
   }},
   "personalized_note": "1 sentence addressing this user's specific style, risk, and history",
-  "rationale": "3 sentences: (1) what the confluence/indicators say, (2) why this entry is valid, (3) what the risk is"
+  "rationale": "3 sentences: (1) what the confluence/indicators say, (2) why this entry is valid NOW in this session, (3) what the risk is and when to exit"
 }}"""
 
     try:
@@ -1572,6 +1748,9 @@ Return ONLY valid JSON:
 
         data["personalized"] = True
         data["raw_live_analysis"] = analysis
+
+        # ── Enrich with accurate timing fields (Python-guaranteed) ────────
+        data = enrich_signal_timing(data, timing)
 
         # ── Inject NGN trade details ──────────────────────────────────────
         if user.balance_ngn and user.balance_ngn > 0 and data.get("signal") != "HOLD":
@@ -2579,24 +2758,35 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 4. NGN ↔ USD — convert instantly: ₦X = ${{X / {ngn_rate:.2f}:.2f}} USD. Always show both.
 5. RISK DISCIPLINE — recommend 2% risk per trade always. For {user.trading_style} / {user.risk_tolerance} risk.
 6. MATHS — show exact calculations. Entry ± ATR×1.5 = SL. R×1.5 = TP1. R×2.5 = TP2. R×4 = TP3.
-7. NGN-FIRST SIGNALS — every signal you give in chat MUST include these NGN fields.
-   Calculate them from {name}'s balance of ₦{user.balance_ngn:,.0f} and the live rate of ₦{ngn_rate:.2f}/$:
+7. NGN-FIRST SIGNALS WITH TIMING — every signal in chat MUST use this exact format.
+   Calculate from {name}'s ₦{user.balance_ngn:,.0f} balance at ₦{ngn_rate:.2f}/$ rate:
+
    ━━━ SIGNAL: [PAIR] — [STRONG BUY / BUY / SELL / STRONG SELL] ━━━
-   Entry:          [exact price]
-   Stop Loss:      [level] — [X pips] | If SL hits → you lose ₦{risk_ngn_2pct:,.0f} (${risk_usd_2pct:.2f})
-   TP1:            [level] — [time] | Profit if reached → ₦[calculate NGN profit] (~$[USD profit])
-   TP2:            [level] — [time] | Profit if reached → ₦[calculate NGN profit] (~$[USD profit])
-   TP3:            [level] — [time] | Profit if reached → ₦[calculate NGN profit] (~$[USD profit])
-   Lot Size:       [calculate lot size for 2% risk] lots (forex) OR [units] (crypto)
-   NGN/pip:        ₦[calculate from lot size × pip value × NGN rate] per pip (forex only)
-   Risk:           ₦{risk_ngn_2pct:,.0f} = ${risk_usd_2pct:.2f} USD (always 2% of account)
+   Chart:          [M15 / H1 / H4 / D1] — set alerts on this timeframe
+   Session:        [London / NY Overlap / New York / Asian] — [why this pair is active NOW]
+   Entry:          [exact price] | Entry Window: [HH:MM–HH:MM UTC] — enter within this window
+   Entry Deadline: [HH:MM UTC] — if price hasn't triggered by then, skip this trade today
+   Stop Loss:      [level] — [X pips] | If SL hits → lose ₦{risk_ngn_2pct:,.0f} (${risk_usd_2pct:.2f})
+   TP1:            [level] — Expected in [X hours] | Profit → ₦[NGN] (~$[USD])
+   TP2:            [level] — Expected in [X hours] | Profit → ₦[NGN] (~$[USD])
+   TP3:            [level] — Expected in [X days]  | Profit → ₦[NGN] (~$[USD])
+   Time Exit:      [HH:MM UTC] — if TP1 not reached by this time, close at BE or small loss
+   Lot Size:       [calculate for 2% risk] lots (forex) OR [units] (crypto)
+   NGN/pip:        ₦[lot size × pip value × NGN rate] per pip (forex only)
+   Risk:           ₦{risk_ngn_2pct:,.0f} = ${risk_usd_2pct:.2f} USD (2% of account)
    Momentum Score: [X/10] — [label]
    Confluence:     [X/6] — [strength]
    Market Struct:  [UPTREND / DOWNTREND / RANGING]
-   Exit if:        [invalidation price]
+   Invalidation:   [exact price — if hit, thesis is wrong, exit immediately]
    Data:           [live candles / AI-reasoning]
    ⚠️ Risk: [one-sentence disclaimer]
-8. HOLD TIMES — always in real units: "45 minutes", "4 hours", "3 days". Never "short-term" alone.
+
+8. TIMEFRAME RULES — always specify the chart timeframe and session:
+   • M15 = scalp, hold 15-60 min, only during London Open (07-09 UTC) or NY Open (13-15 UTC)
+   • H1  = intraday, hold 2-8 hours, any active session (DEFAULT for most signals)
+   • H4  = swing, hold 8-48 hours, Asian session or low-vol setups
+   • D1  = major swing, hold 2-5 days, strong macro trend only
+   Entry window always in UTC. Time exit always in UTC. NEVER say "short-term" without a clock time.
 9. NEWS AWARENESS — if upcoming events above show 🔴 High-impact news within 2 hours for the pair,
    warn: "⚠️ [Event] in X minutes — I'd wait for the dust to settle before entering."
 10. CONTINUOUS IMPROVEMENT — reference the user's trade history, risk tolerance, and past wins/losses

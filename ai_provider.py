@@ -54,12 +54,40 @@ STEP 3 — TREND CONFIRMATION
     Price rejecting upper band = potential short. SQUEEZE (tight bands) = breakout imminent.
   • Candle pattern: engulfing/marubozu = strong signal. Doji = wait. Hammer = reversal watch.
 
-STEP 4 — VOLATILITY & TIMING
+STEP 4 — VOLATILITY, TIMING & SESSION INTELLIGENCE
   • ATR tells you HOW FAR price moves per candle — use it for SL/TP sizing.
   • Low ATR = compressed market, breakout coming. High ATR = active, wider stops needed.
-  • Session matters: London (07:00-16:00 UTC) and NY (12:00-21:00 UTC) are highest volume.
-    Asian session (00:00-09:00 UTC) suits JPY pairs. Overlap 12:00-16:00 UTC = best liquidity.
   • Volume surge = institutional participation. Low volume = weak signal, wait.
+
+  SESSION WINDOWS (UTC) — memorise these:
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │ Asian Early   00:00–04:00 UTC │ Best: USDJPY, AUDJPY — range 30-60 pip  │
+  │ Asian/London  04:00–07:00 UTC │ Best: JPY, AUD — build toward LO break  │
+  │ London Open   07:00–10:00 UTC │ Best: EURUSD, GBPUSD — 60-100 pip range │
+  │ London Mid    10:00–13:00 UTC │ Best: EUR/GBP crosses — H4 signals       │
+  │ NY/LO Overlap 13:00–16:00 UTC │ PEAK: ALL pairs — 80-150 pip range ✓✓   │
+  │ New York      16:00–21:00 UTC │ Best: USD pairs + crypto — H1 signals    │
+  │ NY Close      21:00–00:00 UTC │ AVOID forex; crypto still trades         │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  TIMEFRAME SELECTION RULES:
+  • M15 (15-min chart): Scalp only — London/NY Open first 30 min. Hold 15-60 min.
+  • H1  (1-hour chart):  Standard intraday. All active sessions. Hold 2-8 hours.
+  • H4  (4-hour chart):  Swing setups. Asian session or low-volatility windows. Hold 1-3 days.
+  • D1  (daily chart):   Major swing trades. Enter on daily close/open. Hold 3-10 days.
+
+  ENTRY WINDOW RULES (apply to every signal):
+  • Always specify the UTC window when entry is valid (e.g., "Enter 09:00–09:30 UTC")
+  • Entry deadline = latest time to enter (beyond this, wait for next session)
+  • Time exit = if TP1 not reached by this UTC time, close for BE or small loss
+  • London Open trades: deadline is 10:00 UTC. Time exit: 14:00 UTC.
+  • NY Overlap trades: deadline is 15:00 UTC. Time exit: 17:00 UTC.
+  • H4/D1 trades: entry within 4 hours. Time exit: next session close.
+
+  EXPECTED TP1 TIMING (ATR-based rules of thumb):
+  • H1 signal with 20-pip TP1: expect 1-3 hours in London, 45 min in Overlap
+  • H4 signal with 60-pip TP1: expect 4-12 hours
+  • D1 signal with 150-pip TP1: expect 1-3 days
 
 STEP 5 — RISK CALCULATION (always before entry)
   • Stop Loss = beyond the nearest Fibonacci level OR pivot point (whichever is closer to price)
