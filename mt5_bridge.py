@@ -39,7 +39,7 @@ import requests
 from dotenv import load_dotenv
 
 # ── Load .env ────────────────────────────────────────────────────────────────
-load_dotenv()
+load_dotenv(override=True)  # override=True forces .env values over Windows system vars (e.g. USERNAME)
 
 API_URL       = os.getenv("API_URL", "").rstrip("/")
 USERNAME      = os.getenv("USERNAME", "")
