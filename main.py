@@ -1971,6 +1971,15 @@ class UserAccountRequest(BaseModel):
 # ----------------------------
 # Health
 # ----------------------------
+@app.get("/mt5_bridge_download")
+def download_bridge():
+    """Serve the latest mt5_bridge.py for easy update on Windows."""
+    from fastapi.responses import FileResponse
+    import os
+    bridge_path = os.path.join(os.path.dirname(__file__), "mt5_bridge.py")
+    return FileResponse(bridge_path, media_type="text/plain", filename="mt5_bridge.py")
+
+
 @app.get("/")
 def health_check():
     return {
