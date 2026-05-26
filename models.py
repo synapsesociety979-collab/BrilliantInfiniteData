@@ -275,9 +275,10 @@ class BotConfig(Base):
     mt5_broker = Column(String, nullable=True)
 
     # Live account state (updated each time the MT5 bridge connects)
-    mt5_account_balance = Column(Float, nullable=True)   # last known balance in USD
-    mt5_account_equity  = Column(Float, nullable=True)   # last known equity in USD
-    bridge_last_seen    = Column(DateTime, nullable=True) # when bridge last pinged
+    mt5_account_balance  = Column(Float,  nullable=True)   # last known balance in USD
+    mt5_account_equity   = Column(Float,  nullable=True)   # last known equity in USD
+    mt5_account_currency = Column(String, nullable=True)   # account currency (USD/NGN/GBP…)
+    bridge_last_seen     = Column(DateTime, nullable=True) # when bridge last pinged
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
@@ -362,6 +363,7 @@ def init_db():
     migrations = [
         "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_account_balance FLOAT",
         "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_account_equity FLOAT",
+        "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_account_currency VARCHAR",
         "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS bridge_last_seen TIMESTAMP",
     ]
     with engine.connect() as conn:

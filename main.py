@@ -3805,6 +3805,7 @@ class BridgeConnectRequest(BaseModel):
     mt5_server: Optional[str] = None
     balance: Optional[float] = None
     equity: Optional[float] = None
+    currency: Optional[str] = "USD"
 
 
 # ── Helper: verify bridge key ─────────────────────────────────────
@@ -4244,20 +4245,52 @@ def bridge_connect(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Save live balance/equity so the scheduler can use them for lot sizing
     cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
-    if cfg:
-        if req.balance is not None:
-            cfg.mt5_account_balance = float(req.balance)
-        if req.equity is not None:
-            cfg.mt5_account_equity = float(req.equity)
-        cfg.bridge_last_seen = datetime.utcnow()
-        db.commit()
+    if not cfg:
+        raise HTTPException(status_code=400, detail="Bot not configured. Call /bot/configure first.")
+
+    # Validate bridge key at registration
+    provided_key = req.bridge_key or x_bridge_key
+    if cfg.bridge_api_key and provided_key and cfg.bridge_api_key != provided_key:
+        raise HTTPException(status_code=403, detail="Invalid bridge API key")
+
+    # Convert balance to USD for correct lot sizing
+    raw_balance  = float(req.balance or 0)
+    raw_equity   = float(req.equity  or 0)
+    currency     = (req.currency or "USD").upper()
+
+    if currency == "USD" or raw_balance == 0:
+        balance_usd = raw_balance
+        equity_usd  = raw_equity
+    else:
+        # Convert foreign currency → USD using live rates
+        try:
+            rates = get_all_exchange_rates("USD")
+            fx = rates.get(currency, 1.0)
+            balance_usd = round(raw_balance / fx, 2) if fx else raw_balance
+            equity_usd  = round(raw_equity  / fx, 2) if fx else raw_equity
+        except Exception:
+            balance_usd = raw_balance
+            equity_usd  = raw_equity
+
+    # Persist
+    cfg.mt5_account_balance  = balance_usd
+    cfg.mt5_account_equity   = equity_usd
+    cfg.mt5_account_currency = currency
+    cfg.mt5_account_number   = str(req.mt5_account) if req.mt5_account else cfg.mt5_account_number
+    cfg.mt5_server           = req.mt5_server or cfg.mt5_server
+    cfg.bridge_last_seen     = datetime.utcnow()
+    db.commit()
+
+    print(f"[BRIDGE] {username} connected | {currency} {raw_balance:,.2f} → ${balance_usd:,.2f} USD | MT5 #{req.mt5_account}")
 
     return {
+        "success": True,
         "status": "connected",
         "message": f"Bridge registered for {username}",
-        "balance_saved": cfg.mt5_account_balance if cfg else None,
+        "balance_usd": balance_usd,
+        "equity_usd": equity_usd,
+        "currency": currency,
         "server_time": datetime.utcnow().isoformat(),
     }
 

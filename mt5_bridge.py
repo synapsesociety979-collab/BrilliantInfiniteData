@@ -230,16 +230,18 @@ def register_bridge() -> bool:
                 "bridge_key":       BRIDGE_KEY,
                 "mt5_account":      MT5_LOGIN,
                 "mt5_server":       MT5_SERVER,
-                "balance":          acc.balance if acc else 0,
-                "equity":           acc.equity  if acc else 0,
+                "balance":          acc.balance   if acc else 0,
+                "equity":           acc.equity    if acc else 0,
+                "currency":         acc.currency  if acc else "USD",
             },
             headers=_headers(), timeout=10,
         )
         data = r.json()
         if data.get("success"):
-            log.info("✅ Bridge registered with CLEO backend")
+            bal_usd = data.get("balance_usd", "?")
+            log.info(f"✅ Bridge registered — account balance: ${bal_usd} USD")
             return True
-        log.warning(f"Bridge register: {data.get('message', data)}")
+        log.warning(f"Bridge register failed: {data.get('message', data)}")
         return False
     except Exception as e:
         log.warning(f"Bridge register failed: {e}")
