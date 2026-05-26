@@ -297,21 +297,21 @@ def report_rejected(order_id: str, reason: str) -> None:
         log.warning(f"report_rejected error: {e}")
 
 
-def send_position_update(position: dict) -> dict:
+def send_position_update(positions: list) -> list:
     """
-    Send position state to backend Trade Manager.
-    Returns instructions: {move_sl, close_partial, close_full}.
+    Send position states to backend Trade Manager.
+    Returns list of instruction dicts: [{action, mt5_ticket, new_sl, close_reason, ...}].
     """
     try:
         r = requests.post(
             f"{API_URL}/bot/position_update/{USERNAME}",
             params={"bridge_key": BRIDGE_KEY},
-            json=position,
+            json={"positions": positions},
             headers=_headers(), timeout=10,
         )
-        return r.json().get("instructions", {})
+        return r.json().get("instructions", [])
     except Exception:
-        return {}
+        return []
 
 
 def report_partial_close(order_id: str, closed_lots: float, close_price: float) -> None:
@@ -345,68 +345,92 @@ def report_closed(order_id: str, close_price: float, pnl: float, reason: str) ->
 def manage_positions() -> None:
     """
     For every open position with CLEO's magic number:
-    1. Send state to backend Trade Manager
-    2. Apply any instructions received (move SL, partial close, full close)
+    1. Collect all positions into one batch and send to backend Trade Manager
+    2. Apply instructions returned for each ticket (move SL, partial close, full close)
     """
-    positions = mt5.positions_get()
-    if not positions:
+    all_positions = mt5.positions_get()
+    if not all_positions:
         return
 
-    for pos in positions:
-        if pos.magic != MAGIC:
-            continue
+    # Build lookup: ticket → mt5 position object
+    cleo_positions = {
+        pos.ticket: pos
+        for pos in all_positions
+        if pos.magic == MAGIC
+    }
+    if not cleo_positions:
+        return
 
-        symbol  = pos.symbol
-        ticket  = pos.ticket
+    # Build payload list — field names must match PositionUpdateItem on the backend
+    payload = []
+    for ticket, pos in cleo_positions.items():
         direction = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
-        tick    = mt5.symbol_info_tick(symbol)
+        tick = mt5.symbol_info_tick(pos.symbol)
         if not tick:
             continue
-
         current_price = tick.bid if direction == "BUY" else tick.ask
-        floating_pnl  = pos.profit
-
-        state = {
-            "ticket":        ticket,
-            "symbol":        symbol,
-            "direction":     direction,
-            "open_price":    pos.price_open,
+        payload.append({
+            "mt5_ticket":    ticket,
+            "symbol":        pos.symbol,
             "current_price": current_price,
+            "floating_pnl":  pos.profit,
+            "volume":        pos.volume,
             "current_sl":    pos.sl,
             "current_tp":    pos.tp,
-            "lots":          pos.volume,
-            "floating_pnl":  floating_pnl,
-            "open_time":     pos.time,
-            "comment":       pos.comment,
-        }
+        })
 
-        instructions = send_position_update(state)
-        if not instructions:
+    if not payload:
+        return
+
+    # Send batch to Trade Manager — returns list of instruction dicts
+    instructions_list = send_position_update(payload)
+    if not instructions_list:
+        return
+
+    # Apply each instruction
+    for inst in instructions_list:
+        action  = inst.get("action", "HOLD")
+        ticket  = inst.get("mt5_ticket")
+        order_id = inst.get("order_id", "")
+
+        if action == "HOLD" or not ticket:
             continue
 
-        info = mt5.symbol_info(symbol)
+        pos = cleo_positions.get(ticket)
+        if not pos:
+            continue
 
-        # ── Move stop loss (break-even or trailing) ──────────────────────────
-        new_sl = instructions.get("move_sl")
-        if new_sl and abs(new_sl - pos.sl) > info.point:
-            req = {
-                "action":   mt5.TRADE_ACTION_SLTP,
-                "position": ticket,
-                "sl":       round(float(new_sl), info.digits),
-                "tp":       pos.tp,
-            }
-            res = mt5.order_send(req)
-            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                log.info(f"🔒 SL moved to {new_sl} for {symbol} #{ticket}")
-            else:
-                log.warning(f"SL move failed for #{ticket}: {res.retcode if res else mt5.last_error()}")
+        symbol    = pos.symbol
+        direction = "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL"
+        tick      = mt5.symbol_info_tick(symbol)
+        info      = mt5.symbol_info(symbol)
+        if not tick or not info:
+            continue
 
-        # ── Partial close ─────────────────────────────────────────────────────
-        if instructions.get("close_partial"):
-            close_lots = round(pos.volume / 2, 2)
-            close_type = mt5.ORDER_TYPE_SELL if direction == "BUY" else mt5.ORDER_TYPE_BUY
+        # ── Move SL (break-even or trailing stop) ────────────────────────────
+        if action in ("MOVE_SL_BREAKEVEN", "TRAIL_SL"):
+            new_sl = inst.get("new_sl")
+            if new_sl and abs(float(new_sl) - pos.sl) > info.point:
+                res = mt5.order_send({
+                    "action":   mt5.TRADE_ACTION_SLTP,
+                    "position": ticket,
+                    "sl":       round(float(new_sl), info.digits),
+                    "tp":       pos.tp,
+                })
+                if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                    label = "BE" if action == "MOVE_SL_BREAKEVEN" else "TRAIL"
+                    log.info(f"🔒 [{label}] SL → {new_sl} | {symbol} #{ticket}")
+                else:
+                    log.warning(f"SL move failed #{ticket}: {res.retcode if res else mt5.last_error()}")
+
+        # ── Partial close (close % at TP1, move SL to break-even) ────────────
+        elif action == "PARTIAL_CLOSE":
+            close_pct   = float(inst.get("close_pct", 50)) / 100.0
+            close_lots  = round(pos.volume * close_pct, 2)
+            close_lots  = max(close_lots, info.volume_min)
+            close_type  = mt5.ORDER_TYPE_SELL if direction == "BUY" else mt5.ORDER_TYPE_BUY
             close_price = tick.bid if direction == "BUY" else tick.ask
-            req = {
+            res = mt5.order_send({
                 "action":       mt5.TRADE_ACTION_DEAL,
                 "position":     ticket,
                 "symbol":       symbol,
@@ -415,22 +439,29 @@ def manage_positions() -> None:
                 "price":        close_price,
                 "deviation":    20,
                 "magic":        MAGIC,
-                "comment":      "CLEO-partial",
+                "comment":      "CLEO-TP1",
                 "type_time":    mt5.ORDER_TIME_GTC,
                 "type_filling": _get_filling_mode(symbol),
-            }
-            res = mt5.order_send(req)
+            })
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                log.info(f"💰 Partial close {close_lots} lots {symbol} #{ticket}")
-                report_partial_close(
-                    instructions.get("order_id", ""), close_lots, close_price
-                )
+                log.info(f"💰 Partial close {close_lots} lots {symbol} #{ticket} @ {close_price}")
+                report_partial_close(order_id, close_lots, close_price)
+                # Also move SL to break-even
+                new_sl = inst.get("new_sl")
+                if new_sl:
+                    mt5.order_send({
+                        "action":   mt5.TRADE_ACTION_SLTP,
+                        "position": ticket,
+                        "sl":       round(float(new_sl), info.digits),
+                        "tp":       pos.tp,
+                    })
 
-        # ── Full close ────────────────────────────────────────────────────────
-        if instructions.get("close_full"):
+        # ── Full close (time exit, safety, manual) ────────────────────────────
+        elif action == "CLOSE":
             close_type  = mt5.ORDER_TYPE_SELL if direction == "BUY" else mt5.ORDER_TYPE_BUY
             close_price = tick.bid if direction == "BUY" else tick.ask
-            req = {
+            reason      = inst.get("close_reason", "trade_manager")
+            res = mt5.order_send({
                 "action":       mt5.TRADE_ACTION_DEAL,
                 "position":     ticket,
                 "symbol":       symbol,
@@ -439,19 +470,13 @@ def manage_positions() -> None:
                 "price":        close_price,
                 "deviation":    20,
                 "magic":        MAGIC,
-                "comment":      f"CLEO-{instructions.get('close_reason','exit')}",
+                "comment":      f"CLEO-{reason}",
                 "type_time":    mt5.ORDER_TIME_GTC,
                 "type_filling": _get_filling_mode(symbol),
-            }
-            res = mt5.order_send(req)
+            })
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                log.info(f"🚪 Full close {symbol} #{ticket} PnL={floating_pnl:.2f}")
-                report_closed(
-                    instructions.get("order_id", ""),
-                    close_price,
-                    floating_pnl,
-                    instructions.get("close_reason", "trade_manager"),
-                )
+                log.info(f"🚪 Closed {symbol} #{ticket} | reason={reason} | PnL={pos.profit:.2f}")
+                report_closed(order_id, close_price, pos.profit, reason)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
