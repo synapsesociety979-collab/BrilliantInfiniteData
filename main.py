@@ -39,7 +39,7 @@ from models import (
 from trading_engine import RiskEngine, MarketFilter, TradeManager
 from market_data import (
     get_symbol_analysis, format_for_ai_prompt, format_for_ai_prompt_compact, fetch_realtime_quote,
-    FALLBACK_PRICES, FALLBACK_ATR_PCT,
+    FALLBACK_PRICES, FALLBACK_ATR_PCT, get_intraday_summary,
 )
 
 # ----------------------------
@@ -2506,6 +2506,162 @@ def delete_all_conversations(username: str, db: Session = Depends(get_db)):
 
 
 # ═══════════════════════════════════════════════════
+#  TIME-WINDOW PARSER  — "next 5 min", "10-12 WAT"
+# ═══════════════════════════════════════════════════
+
+def parse_time_window(message: str) -> dict:
+    """
+    Extract a trading time window from natural language.
+
+    Handles:
+      • "next 5 minutes" / "in 10 minutes" / "next 2 hours"
+      • "10-12 WAT"  / "2pm-4pm WAT"  / "10:30-11:30 WAT"
+      • "10-12 UTC"  / "14:00-16:00 UTC"
+      • "tonight WAT" / "london session" / "ny session"
+
+    WAT = West Africa Time = UTC+1 (Nigeria / Ghana / Senegal)
+
+    Returns dict:
+      detected          bool
+      duration_minutes  int
+      td_interval       str   Twelve Data interval string
+      candle_label      str   human-readable (M1/M5/M15/M30/H1/H4)
+      window_start_utc  str   "HH:MM" or None
+      window_end_utc    str   "HH:MM" or None
+      window_start_wat  str   "HH:MM" or None
+      window_end_wat    str   "HH:MM" or None
+      description       str   sentence CLEO can reference
+    """
+    msg = message.lower().strip()
+    now_utc = datetime.utcnow()
+
+    WAT_OFFSET = 1  # WAT = UTC+1
+
+    def _pick_interval(minutes: int):
+        if minutes <= 5:    return "1min",  "M1"
+        if minutes <= 15:   return "5min",  "M5"
+        if minutes <= 45:   return "15min", "M15"
+        if minutes <= 90:   return "30min", "M30"
+        if minutes <= 240:  return "1h",    "H1"
+        return "4h", "H4"
+
+    def _fmt(h, m=0):
+        return f"{int(h):02d}:{int(m):02d}"
+
+    def _wat_to_utc(h, m=0):
+        total_min = h * 60 + m - WAT_OFFSET * 60
+        total_min %= 1440
+        return total_min // 60, total_min % 60
+
+    # ── 1. "next X minutes" / "in X minutes" / "next X hours" ──
+    match = re.search(r"(?:next|in)\s+(\d+)\s*(minute|min|hour|hr)s?", msg)
+    if match:
+        val  = int(match.group(1))
+        unit = match.group(2)
+        dur  = val if unit in ("minute", "min") else val * 60
+        start_utc = now_utc
+        end_utc   = now_utc + timedelta(minutes=dur)
+        td_int, label = _pick_interval(dur)
+        return {
+            "detected": True,
+            "duration_minutes": dur,
+            "td_interval": td_int,
+            "candle_label": label,
+            "window_start_utc": _fmt(start_utc.hour, start_utc.minute),
+            "window_end_utc":   _fmt(end_utc.hour,   end_utc.minute),
+            "window_start_wat": _fmt((start_utc.hour + WAT_OFFSET) % 24, start_utc.minute),
+            "window_end_wat":   _fmt((end_utc.hour   + WAT_OFFSET) % 24, end_utc.minute),
+            "description": (
+                f"⏱ {dur}-minute window — {_fmt(start_utc.hour, start_utc.minute)}–"
+                f"{_fmt(end_utc.hour, end_utc.minute)} UTC "
+                f"({_fmt((start_utc.hour+WAT_OFFSET)%24, start_utc.minute)}–"
+                f"{_fmt((end_utc.hour+WAT_OFFSET)%24, end_utc.minute)} WAT)"
+            ),
+        }
+
+    # ── 2. "X-Y WAT" / "X-Y UTC" / "Xam-Ypm WAT" / "X:MM-Y:MM WAT" ──
+    tz_match = re.search(
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*[-–to]+\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+        r"\s*(wat|west african|nigeria|ghana|utc|gmt)",
+        msg
+    )
+    if tz_match:
+        h1  = int(tz_match.group(1))
+        m1  = int(tz_match.group(2) or 0)
+        ap1 = tz_match.group(3) or ""
+        h2  = int(tz_match.group(4))
+        m2  = int(tz_match.group(5) or 0)
+        ap2 = tz_match.group(6) or ""
+        tz  = tz_match.group(7)
+
+        # am/pm adjustment
+        if ap1 == "pm" and h1 < 12: h1 += 12
+        if ap1 == "am" and h1 == 12: h1 = 0
+        if ap2 == "pm" and h2 < 12: h2 += 12
+        if ap2 == "am" and h2 == 12: h2 = 0
+
+        if "utc" in tz or "gmt" in tz:
+            su_h, su_m = h1, m1
+            eu_h, eu_m = h2, m2
+            sw_h = (su_h + WAT_OFFSET) % 24; sw_m = su_m
+            ew_h = (eu_h + WAT_OFFSET) % 24; ew_m = eu_m
+        else:
+            su_h, su_m = _wat_to_utc(h1, m1)
+            eu_h, eu_m = _wat_to_utc(h2, m2)
+            sw_h, sw_m = h1, m1
+            ew_h, ew_m = h2, m2
+
+        dur = ((eu_h * 60 + eu_m) - (su_h * 60 + su_m)) % (24 * 60)
+        if dur == 0: dur = 60
+        td_int, label = _pick_interval(dur)
+
+        return {
+            "detected": True,
+            "duration_minutes": dur,
+            "td_interval": td_int,
+            "candle_label": label,
+            "window_start_utc": _fmt(su_h, su_m),
+            "window_end_utc":   _fmt(eu_h, eu_m),
+            "window_start_wat": _fmt(sw_h, sw_m),
+            "window_end_wat":   _fmt(ew_h, ew_m),
+            "description": (
+                f"⏱ {dur}-minute window — {_fmt(su_h,su_m)}–{_fmt(eu_h,eu_m)} UTC "
+                f"({_fmt(sw_h,sw_m)}–{_fmt(ew_h,ew_m)} WAT)"
+            ),
+        }
+
+    # ── 3. Named sessions ──
+    session_map = {
+        "london":  (7,  0, 16,  0),
+        "new york": (12, 0, 21, 0),
+        "ny":       (12, 0, 21, 0),
+        "overlap":  (12, 0, 16, 0),
+        "asian":    (23, 0, 8,  0),
+        "tokyo":    (23, 0, 8,  0),
+    }
+    for sname, (sh, sm, eh, em) in session_map.items():
+        if sname in msg:
+            dur = ((eh * 60 + em) - (sh * 60 + sm)) % (24 * 60)
+            td_int, label = _pick_interval(60)   # sessions → H1 candles
+            return {
+                "detected": True,
+                "duration_minutes": dur,
+                "td_interval": td_int,
+                "candle_label": label,
+                "window_start_utc": _fmt(sh, sm),
+                "window_end_utc":   _fmt(eh, em),
+                "window_start_wat": _fmt((sh + WAT_OFFSET) % 24, sm),
+                "window_end_wat":   _fmt((eh + WAT_OFFSET) % 24, em),
+                "description": (
+                    f"⏱ {sname.title()} session — {_fmt(sh,sm)}–{_fmt(eh,em)} UTC "
+                    f"({_fmt((sh+WAT_OFFSET)%24,sm)}–{_fmt((eh+WAT_OFFSET)%24,em)} WAT)"
+                ),
+            }
+
+    return {"detected": False}
+
+
+# ═══════════════════════════════════════════════════
 #  MAIN CHAT ENDPOINT — Full memory + conversation
 # ═══════════════════════════════════════════════════
 
@@ -2725,6 +2881,63 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
             except Exception:
                 pass
 
+    # ── detect time window ("next 5 min", "10-12 WAT", etc.) ──
+    tw = parse_time_window(chat.message)
+    time_window_section = ""
+    intraday_section    = ""
+
+    if tw.get("detected"):
+        td_int   = tw["td_interval"]
+        label    = tw["candle_label"]
+        dur      = tw["duration_minutes"]
+        time_window_section = f"""
+━━━ TIME WINDOW REQUEST ━━━
+The user wants analysis for: {tw['description']}
+• Candle timeframe to use: {label} ({td_int})
+• Duration: {dur} minutes
+• UTC window:  {tw['window_start_utc']} → {tw['window_end_utc']}
+• WAT window:  {tw['window_start_wat']} → {tw['window_end_wat']}
+IMPORTANT: ALL entry/exit times in your signal MUST fall inside this window.
+Do NOT give a D1 or H4 signal. This is a {label} scalp/intraday call.
+Entry Deadline = {tw['window_end_utc']} UTC ({tw['window_end_wat']} WAT) — no entry after that."""
+
+        # Fetch intraday candles for every mentioned symbol
+        intraday_blocks = []
+        for sym, _ in mentioned_pairs:
+            try:
+                summary = get_intraday_summary(sym, interval=td_int)
+                if "error" not in summary:
+                    intraday_blocks.append(
+                        f"── {sym} {label} LIVE DATA ──\n"
+                        f"Price: {summary['price']} | Trend: {summary['trend']} | "
+                        f"Momentum: {summary['momentum']}\n"
+                        f"RSI({label}): {summary['rsi']} | "
+                        f"MACD hist: {summary['macd_hist']} ({'▲ bullish' if summary['macd_hist'] > 0 else '▼ bearish'})\n"
+                        f"EMA9: {summary['ema9']}  EMA21: {summary['ema21']}  EMA50: {summary['ema50']}\n"
+                        f"ATR({label}): {summary['atr_pips']} pips\n"
+                        f"Last candle: O={summary['last_candle']['open']} "
+                        f"H={summary['last_candle']['high']} "
+                        f"L={summary['last_candle']['low']} "
+                        f"C={summary['last_candle']['close']} "
+                        f"({summary['last_candle']['type']}, "
+                        f"body={summary['last_candle']['body_pips']}p)\n"
+                        f"Recent 20-bar range: {summary['recent_low_20']} – {summary['recent_high_20']}\n"
+                        f"5-bar price change: {summary['price_chg_5bars_pct']:+.3f}%"
+                    )
+                else:
+                    intraday_blocks.append(f"── {sym} {label}: {summary['error']} — use AI reasoning")
+            except Exception as e:
+                intraday_blocks.append(f"── {sym} {label}: data error ({e})")
+
+        if intraday_blocks:
+            intraday_section = (
+                f"\n━━━ {label} INTRADAY DATA (live candles for your window) ━━━\n"
+                + "\n\n".join(intraday_blocks)
+                + "\n\nCRITICAL: Use these SHORT-TERM indicators above — NOT the daily candle data — "
+                  f"to generate the {dur}-minute signal. ATR above IS the {label} ATR. "
+                  f"SL = entry ± 1.5× {label} ATR. TP1 = entry ± 1.5× SL distance."
+            )
+
     # ── build system prompt ──
     balance_usd  = (user.balance_ngn or 0) / ngn_rate
     risk_ngn_2pct = (user.balance_ngn or 0) * 0.02
@@ -2757,6 +2970,10 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
 
 ━━━ WHAT YOU REMEMBER ABOUT {name.upper()} ━━━
 {memories}
+
+{time_window_section}
+
+{intraday_section}
 
 {"━━━ LIVE MARKET DATA FOR: " + ", ".join(covered_syms) + " ━━━" if live_data_section_chat else ""}
 {live_data_section_chat}
@@ -2813,12 +3030,18 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
    Data:           [live candles / AI-reasoning]
    ⚠️ Risk: [one-sentence disclaimer]
 
-8. TIMEFRAME RULES — always specify the chart timeframe and session:
-   • M15 = scalp, hold 15-60 min, only during London Open (07-09 UTC) or NY Open (13-15 UTC)
-   • H1  = intraday, hold 2-8 hours, any active session (DEFAULT for most signals)
-   • H4  = swing, hold 8-48 hours, Asian session or low-vol setups
-   • D1  = major swing, hold 2-5 days, strong macro trend only
-   Entry window always in UTC. Time exit always in UTC. NEVER say "short-term" without a clock time.
+8. TIMEFRAME RULES — match timeframe to the user's requested window:
+   • M1  = ultra-scalp, hold 1-5 min. SL = 3-5 pips. TP = 5-8 pips. Only when user says "next 1-5 min".
+   • M5  = scalp, hold 5-15 min. SL = 5-10 pips. TP = 8-15 pips. "next 5-15 min" requests.
+   • M15 = scalp, hold 15-60 min, during London Open (07-09 UTC) or NY Open (13-15 UTC).
+   • M30 = short intraday, hold 30-90 min. Good for WAT time-window requests.
+   • H1  = intraday, hold 2-8 hours, any active session (DEFAULT when no window given).
+   • H4  = swing, hold 8-48 hours, Asian session or low-vol setups.
+   • D1  = major swing, hold 2-5 days, strong macro trend only.
+   Entry window always in UTC AND WAT. Time exit always in both timezones.
+   NEVER say "short-term" without a clock time.
+   IF a TIME WINDOW REQUEST is shown above → you MUST use that timeframe and window. No exceptions.
+   For scalp (M1-M15) signals: TP should be reachable within the requested duration.
 9. NEWS AWARENESS — if upcoming events above show 🔴 High-impact news within 2 hours for the pair,
    warn: "⚠️ [Event] in X minutes — I'd wait for the dust to settle before entering."
 10. CONTINUOUS IMPROVEMENT — reference the user's trade history, risk tolerance, and past wins/losses
@@ -2829,7 +3052,9 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
     # ── Build the messages array: history + current user message ──
     # This gives CLEO native multi-turn memory rather than text-embedded history.
     chat_messages = history_messages + [{"role": "user", "content": chat.message}]
-    response = get_ai_response_chat(chat_messages, system_prompt, max_tokens=2048)
+    # Use more tokens when a time window + intraday data is present — signals are longer
+    max_tok = 3000 if tw.get("detected") else 2048
+    response = get_ai_response_chat(chat_messages, system_prompt, max_tokens=max_tok)
 
     # ── save messages to DB ──
     db.add(

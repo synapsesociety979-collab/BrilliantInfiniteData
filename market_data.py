@@ -399,6 +399,163 @@ def fetch_td_ohlcv(symbol: str, outputsize: int = 200) -> Optional[pd.DataFrame]
     return df
 
 
+def fetch_td_ohlcv_intraday(symbol: str, interval: str = "5min", outputsize: int = 60) -> Optional[pd.DataFrame]:
+    """
+    Fetch short-timeframe OHLCV candles from Twelve Data.
+    interval: "1min" | "5min" | "15min" | "30min" | "1h" | "4h"
+    Returns DataFrame sorted oldest→newest, or None on failure.
+    """
+    td_sym = _to_td_symbol(symbol)
+    cache_key = f"td_intraday_{symbol}_{interval}"
+    cache_ttl = 60  # 1-minute cache for intraday (fresh enough for scalping)
+    if cache_key in _DATA_CACHE and time.time() - _DATA_CACHE[cache_key]["ts"] < cache_ttl:
+        return _DATA_CACHE[cache_key]["df"]
+
+    data = _fetch_td("/time_series", {
+        "symbol":     td_sym,
+        "interval":   interval,
+        "outputsize": outputsize,
+        "type":       "price",
+    })
+
+    if "_limited" in data or "_error" in data or "_no_key" in data:
+        return None
+
+    values = data.get("values")
+    if not values:
+        return None
+
+    rows = []
+    for v in values:
+        try:
+            rows.append({
+                "time":   pd.to_datetime(v["datetime"]),
+                "open":   float(v.get("open", 0)),
+                "high":   float(v.get("high", 0)),
+                "low":    float(v.get("low",  0)),
+                "close":  float(v.get("close", 0)),
+                "volume": float(v.get("volume", 0) or 0),
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+    _DATA_CACHE[cache_key] = {"df": df, "ts": time.time()}
+    print(f"[TD-INTRADAY] {symbol} {interval} — {len(df)} candles loaded")
+    return df
+
+
+def get_intraday_summary(symbol: str, interval: str = "5min") -> dict:
+    """
+    Compute a short-timeframe technical summary for CLEO's scalp/intraday signals.
+    Returns a dict with price action, EMA, RSI, MACD, ATR, candle pattern, momentum.
+    """
+    df = fetch_td_ohlcv_intraday(symbol, interval=interval, outputsize=60)
+    if df is None or len(df) < 20:
+        return {"error": f"No intraday data for {symbol} on {interval}"}
+
+    close = df["close"]
+    high  = df["high"]
+    low   = df["low"]
+    n     = len(df)
+
+    # EMA 9 / 21 / 50
+    ema9  = close.ewm(span=9,  adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=min(50, n-1), adjust=False).mean()
+
+    # RSI 14
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    rsi   = (100 - 100 / (1 + rs)).iloc[-1]
+
+    # MACD 12/26/9
+    ema12  = close.ewm(span=12, adjust=False).mean()
+    ema26  = close.ewm(span=26, adjust=False).mean()
+    macd   = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    hist   = macd - signal
+
+    # ATR 14
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().iloc[-1]
+
+    # last candle
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2]
+    price = last["close"]
+
+    # short trend direction
+    if ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1]:
+        trend = "UPTREND"
+    elif ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1]:
+        trend = "DOWNTREND"
+    else:
+        trend = "MIXED"
+
+    # momentum
+    price_change_pct = ((price - close.iloc[-6]) / close.iloc[-6]) * 100 if n >= 6 else 0
+    momentum = "BULLISH" if price_change_pct > 0 else "BEARISH"
+
+    # candle body / wick analysis
+    body  = abs(last["close"] - last["open"])
+    upper_wick = last["high"] - max(last["close"], last["open"])
+    lower_wick = min(last["close"], last["open"]) - last["low"]
+    candle_type = "BULLISH" if last["close"] > last["open"] else "BEARISH"
+
+    # recent high/low (last 20 candles)
+    recent_high = high.iloc[-20:].max()
+    recent_low  = low.iloc[-20:].min()
+
+    # pip size
+    is_jpy = "JPY" in symbol.upper()
+    pip = 0.01 if is_jpy else 0.0001
+    atr_pips = round(atr / pip, 1)
+
+    return {
+        "symbol":         symbol,
+        "interval":       interval,
+        "price":          round(price, 5),
+        "trend":          trend,
+        "momentum":       momentum,
+        "candle_type":    candle_type,
+        "rsi":            round(float(rsi), 1) if not np.isnan(rsi) else None,
+        "macd":           round(float(macd.iloc[-1]), 6),
+        "macd_signal":    round(float(signal.iloc[-1]), 6),
+        "macd_hist":      round(float(hist.iloc[-1]), 6),
+        "ema9":           round(float(ema9.iloc[-1]), 5),
+        "ema21":          round(float(ema21.iloc[-1]), 5),
+        "ema50":          round(float(ema50.iloc[-1]), 5),
+        "atr_price":      round(float(atr), 5),
+        "atr_pips":       atr_pips,
+        "recent_high_20": round(float(recent_high), 5),
+        "recent_low_20":  round(float(recent_low), 5),
+        "price_chg_5bars_pct": round(price_change_pct, 3),
+        "last_candle": {
+            "open":  round(last["open"], 5),
+            "high":  round(last["high"], 5),
+            "low":   round(last["low"],  5),
+            "close": round(last["close"],5),
+            "body_pips":        round(body / pip, 1),
+            "upper_wick_pips":  round(upper_wick / pip, 1),
+            "lower_wick_pips":  round(lower_wick / pip, 1),
+            "type":             candle_type,
+        },
+        "candles_available": n,
+        "data_source": "Twelve Data intraday",
+    }
+
+
 def fetch_td_price(symbol: str) -> Optional[float]:
     """
     Fetch real-time price from Twelve Data.
