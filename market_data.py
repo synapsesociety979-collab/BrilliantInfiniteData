@@ -31,6 +31,21 @@ FALLBACK_TTL  = 300    # 5 min cache for AI-only mode
 import json as _json
 _DISK_CACHE_PATH = "/tmp/aria_market_cache.json"
 
+_CACHE_SCHEMA_VERSION = 2   # bump this whenever get_symbol_analysis() output shape changes
+
+
+def _cache_entry_is_valid(data: dict) -> bool:
+    """
+    Return True only if the cached analysis has all fields produced by the
+    current code version.  Stale entries missing new keys are silently dropped
+    so they are re-computed on the next request rather than served with holes.
+    """
+    if data.get("ai_only_mode"):
+        return True  # fallback entries don't have regime/divergence — that's fine
+    required = ("market_regime", "divergence")
+    return all(k in data for k in required)
+
+
 def _load_disk_cache() -> None:
     """Load persisted cache from disk into _DATA_CACHE on startup."""
     global _DATA_CACHE
@@ -38,14 +53,23 @@ def _load_disk_cache() -> None:
         with open(_DISK_CACHE_PATH, "r") as f:
             raw = _json.load(f)
         now = time.time()
+        loaded = 0
+        skipped = 0
         # Only keep entries that haven't fully expired (use 2× TTL so we
         # still have something to serve while we try to refresh)
         for k, v in raw.items():
             age = now - v.get("ts", 0)
             ttl = FALLBACK_TTL if v["data"].get("ai_only_mode") else CACHE_TTL
-            if age < ttl * 2:
-                _DATA_CACHE[k] = v
-        print(f"[CACHE] Loaded {len(_DATA_CACHE)} entries from disk")
+            if age >= ttl * 2:
+                skipped += 1
+                continue
+            # Schema version check — discard entries missing new fields
+            if not _cache_entry_is_valid(v.get("data", {})):
+                skipped += 1
+                continue
+            _DATA_CACHE[k] = v
+            loaded += 1
+        print(f"[CACHE] Loaded {loaded} entries from disk ({skipped} stale/outdated dropped)")
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -594,6 +618,213 @@ def calc_rsi(close: pd.Series, period: int = 14) -> float:
     rsi   = 100 - (100 / (1 + rs))
     val   = rsi.iloc[-1]
     return round(float(val), 2) if not np.isnan(val) else 50.0
+
+
+def calc_rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
+    """Return the full RSI series (needed for divergence detection)."""
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def detect_market_regime(
+    df: pd.DataFrame,
+    adx: float,
+    bb_upper: float,
+    bb_lower: float,
+    atr: float,
+) -> dict:
+    """
+    Classify the current market regime using ADX, Bollinger Band width, and ATR ratio.
+
+    Regimes:
+      STRONG_TREND    — ADX > 35, bands expanding  → ride the trend, wide TP
+      TRENDING        — ADX 22-35                   → standard ATR-based entries
+      TRANSITIONING   — ADX 18-22                   → reduced confidence
+      RANGING         — ADX < 18, tight bands       → avoid directional trades
+      COMPRESSION     — ADX < 18, bands squeezing   → breakout imminent, wait
+      VOLATILE_BREAKOUT — ATR spike > 1.8× average  → wide SL, large TP, fast moves
+    """
+    close = df["close"]
+    price = float(close.iloc[-1])
+
+    # Bollinger Band width as % of price
+    bb_width = bb_upper - bb_lower
+    bb_width_pct = (bb_width / price) * 100 if price > 0 else 0
+
+    # Historical avg BB width over last 50 bars
+    if len(close) >= 20:
+        rolling_std = close.rolling(20).std()
+        avg_bb_width_pct = float((rolling_std.mean() * 4 / close.mean()) * 100)
+    else:
+        avg_bb_width_pct = bb_width_pct
+
+    # ATR ratio vs 50-period historical ATR average
+    if len(df) >= 50:
+        hist_tr = pd.concat([
+            df["high"] - df["low"],
+            (df["high"] - df["close"].shift()).abs(),
+            (df["low"]  - df["close"].shift()).abs(),
+        ], axis=1).max(axis=1)
+        avg_atr_50 = float(hist_tr.rolling(50).mean().dropna().mean())
+        atr_ratio = atr / avg_atr_50 if avg_atr_50 > 0 else 1.0
+    else:
+        atr_ratio = 1.0
+
+    expanding_bands = bb_width_pct > avg_bb_width_pct * 1.1
+    contracting_bands = bb_width_pct < avg_bb_width_pct * 0.8
+
+    if atr_ratio > 1.8:
+        regime = "VOLATILE_BREAKOUT"
+        desc   = (f"ATR is {atr_ratio:.1f}× its 50-bar average — explosive directional move. "
+                  "Use wider SL (2×ATR), larger TP (4×ATR). Move BE quickly.")
+        sl_mult, tp1_mult, tp2_mult, tp3_mult = 2.0, 2.5, 4.0, 6.0
+    elif adx > 35 and expanding_bands:
+        regime = "STRONG_TREND"
+        desc   = (f"ADX={adx} (very strong) + expanding Bollinger Bands. "
+                  "High-conviction trend — trade with momentum, hold for TP2/TP3.")
+        sl_mult, tp1_mult, tp2_mult, tp3_mult = 1.5, 2.0, 3.5, 5.0
+    elif adx > 22:
+        regime = "TRENDING"
+        desc   = (f"ADX={adx} — clear directional bias. "
+                  "Standard ATR-based SL/TP valid. Trend-following entries preferred.")
+        sl_mult, tp1_mult, tp2_mult, tp3_mult = 1.5, 1.5, 3.0, 4.5
+    elif 18 <= adx <= 22:
+        regime = "TRANSITIONING"
+        desc   = (f"ADX={adx} — market changing character. "
+                  "Reduce position size. Tighter TP targets. Confirm before entry.")
+        sl_mult, tp1_mult, tp2_mult, tp3_mult = 1.2, 1.2, 2.0, 3.0
+    elif adx < 18 and contracting_bands:
+        regime = "COMPRESSION"
+        desc   = (f"ADX={adx} + contracting Bollinger Bands — coil tightening. "
+                  "Breakout imminent. Wait for a confirmed candle close in the breakout direction.")
+        sl_mult, tp1_mult, tp2_mult, tp3_mult = 1.0, 1.5, 2.5, 4.0
+    else:
+        regime = "RANGING"
+        desc   = (f"ADX={adx} — no meaningful directional momentum. "
+                  "Fade band extremes only. Avoid breakout entries.")
+        sl_mult, tp1_mult, tp2_mult, tp3_mult = 1.0, 1.0, 1.8, 2.5
+
+    return {
+        "regime":          regime,
+        "description":     desc,
+        "adx":             adx,
+        "atr_ratio":       round(atr_ratio, 2),
+        "bb_width_pct":    round(bb_width_pct, 3),
+        "sl_multiplier":   sl_mult,
+        "tp1_multiplier":  tp1_mult,
+        "tp2_multiplier":  tp2_mult,
+        "tp3_multiplier":  tp3_mult,
+    }
+
+
+def detect_divergence(
+    price_series: pd.Series,
+    rsi_series:   pd.Series,
+    lookback:     int = 35,
+) -> dict:
+    """
+    Detect RSI/price divergence — one of the highest-conviction reversal signals.
+
+    BULLISH divergence: price makes a lower low  BUT RSI makes a higher low  → potential UP reversal
+    BEARISH divergence: price makes a higher high BUT RSI makes a lower high → potential DOWN reversal
+
+    Returns dict:
+      detected  bool
+      type      "bullish" | "bearish" | "none"
+      strength  "strong" | "moderate" | "mild"
+      description  human-readable explanation
+    """
+    if len(price_series) < lookback or len(rsi_series) < lookback:
+        return {"detected": False, "type": "none", "strength": "none",
+                "description": "insufficient data for divergence scan"}
+
+    prices = price_series.tail(lookback).values
+    rsis   = rsi_series.tail(lookback).values
+
+    # Replace NaN RSI values
+    rsis = np.where(np.isnan(rsis), 50.0, rsis)
+
+    min_gap = 4  # minimum bars between swing points
+
+    def _peaks(arr):
+        pts = []
+        for i in range(min_gap, len(arr) - min_gap):
+            window = arr[i - min_gap: i + min_gap + 1]
+            if arr[i] == window.max():
+                pts.append(i)
+        return pts
+
+    def _troughs(arr):
+        pts = []
+        for i in range(min_gap, len(arr) - min_gap):
+            window = arr[i - min_gap: i + min_gap + 1]
+            if arr[i] == window.min():
+                pts.append(i)
+        return pts
+
+    peaks   = _peaks(prices)
+    troughs = _troughs(prices)
+
+    result = {"detected": False, "type": "none", "strength": "none",
+              "description": "no divergence detected"}
+
+    # ── Bearish divergence (peaks) ────────────────────────────────
+    if len(peaks) >= 2:
+        p1, p2 = peaks[-2], peaks[-1]
+        price_hh = prices[p2] > prices[p1]   # price: higher high
+        rsi_lh   = rsis[p2]  < rsis[p1]      # RSI:   lower high
+        if price_hh and rsi_lh:
+            diff = abs(rsis[p1] - rsis[p2])
+            strength = "strong" if diff > 10 else "moderate" if diff > 5 else "mild"
+            result = {
+                "detected":     True,
+                "type":         "bearish",
+                "strength":     strength,
+                "description": (
+                    f"⚠️ BEARISH DIVERGENCE ({strength}) — price printed a higher high "
+                    f"({prices[p1]:.5g}→{prices[p2]:.5g}) but RSI made a lower high "
+                    f"({rsis[p1]:.1f}→{rsis[p2]:.1f}). Momentum is weakening — "
+                    f"sellers likely to take control. Favour SELL signals."
+                ),
+                "price_swing_1": round(float(prices[p1]), 6),
+                "price_swing_2": round(float(prices[p2]), 6),
+                "rsi_swing_1":   round(float(rsis[p1]), 1),
+                "rsi_swing_2":   round(float(rsis[p2]), 1),
+            }
+
+    # ── Bullish divergence (troughs) — only override if stronger ──
+    if len(troughs) >= 2:
+        t1, t2 = troughs[-2], troughs[-1]
+        price_ll = prices[t2] < prices[t1]   # price: lower low
+        rsi_hl   = rsis[t2]  > rsis[t1]      # RSI:   higher low
+        if price_ll and rsi_hl:
+            diff = abs(rsis[t2] - rsis[t1])
+            strength = "strong" if diff > 10 else "moderate" if diff > 5 else "mild"
+            bull_result = {
+                "detected":     True,
+                "type":         "bullish",
+                "strength":     strength,
+                "description": (
+                    f"✅ BULLISH DIVERGENCE ({strength}) — price printed a lower low "
+                    f"({prices[t1]:.5g}→{prices[t2]:.5g}) but RSI made a higher low "
+                    f"({rsis[t1]:.1f}→{rsis[t2]:.1f}). Sellers are exhausted — "
+                    f"buyers likely stepping in. Favour BUY signals."
+                ),
+                "price_swing_1": round(float(prices[t1]), 6),
+                "price_swing_2": round(float(prices[t2]), 6),
+                "rsi_swing_1":   round(float(rsis[t1]), 1),
+                "rsi_swing_2":   round(float(rsis[t2]), 1),
+            }
+            # Use bullish result if no bearish found, or bullish is stronger
+            strength_rank = {"strong": 3, "moderate": 2, "mild": 1, "none": 0}
+            if (not result["detected"] or
+                    strength_rank.get(strength, 0) > strength_rank.get(result.get("strength"), 0)):
+                result = bull_result
+
+    return result
 
 
 def calc_macd(close: pd.Series, fast=12, slow=26, signal=9) -> Tuple[float, float, float]:
@@ -1208,7 +1439,8 @@ def get_symbol_analysis(symbol: str, fetch_realtime_price: bool = True) -> dict:
     price = round(float(close.iloc[-1]), 6)
 
     # ── Core indicators ──────────────────────────────────────────
-    rsi                        = calc_rsi(close)
+    rsi_ser                    = calc_rsi_series(close)   # full series for divergence
+    rsi                        = round(float(rsi_ser.iloc[-1]), 2) if not np.isnan(rsi_ser.iloc[-1]) else 50.0
     macd_line, sig_line, hist  = calc_macd(close)
     ema20                      = calc_ema(close, 20)
     ema50                      = calc_ema(close, 50)
@@ -1229,6 +1461,10 @@ def get_symbol_analysis(symbol: str, fetch_realtime_price: bool = True) -> dict:
     fibs               = calc_fibonacci_levels(df)
     mkt_structure      = calc_market_structure(close)
 
+    # ── Market regime + RSI divergence (new intelligence layer) ──
+    regime      = detect_market_regime(df, adx, bb_upper, bb_lower, atr)
+    divergence  = detect_divergence(close, rsi_ser)
+
     # ── Confluence score ─────────────────────────────────────────
     bb_width = bb_upper - bb_lower
     bb_pct   = (price - bb_lower) / bb_width if bb_width > 0 else 0.5
@@ -1238,6 +1474,53 @@ def get_symbol_analysis(symbol: str, fetch_realtime_price: bool = True) -> dict:
         price=price, stoch_k=stoch_k, stoch_d=stoch_d,
         adx=adx, williams_r=williams_r, bb_pct=bb_pct,
     )
+
+    # ── Regime + divergence bonus on confluence count ─────────────
+    # These are hard-evidence boosts — not AI guesses
+    regime_name = regime["regime"]
+    bonus_reasons = []
+
+    # +1 if regime is clearly trending (ADX confirms momentum)
+    if regime_name in ("STRONG_TREND", "TRENDING"):
+        if conf_direction != "NEUTRAL":
+            conf_count   += 1
+            bonus_reasons.append(f"Regime: {regime_name} (ADX={adx} confirms trend)")
+
+    # +1 if divergence matches confluence direction
+    if divergence["detected"]:
+        div_type = divergence["type"]
+        if (div_type == "bullish" and conf_direction == "BUY") or \
+           (div_type == "bearish" and conf_direction == "SELL"):
+            conf_count   += 1
+            bonus_reasons.append(f"RSI divergence ({div_type}, {divergence['strength']}) confirms signal")
+
+    # +1 for high-quality candle pattern matching direction
+    pat = pattern.lower()
+    bullish_pats = ("bullish engulfing", "hammer", "morning star",
+                    "three white soldiers", "bullish marubozu", "inverted hammer")
+    bearish_pats = ("bearish engulfing", "shooting star", "evening star",
+                    "three black crows", "bearish marubozu", "hanging man")
+    if conf_direction == "BUY"  and any(p in pat for p in bullish_pats):
+        conf_count   += 1
+        bonus_reasons.append(f"Strong bullish candle pattern: {pattern.split('(')[0].strip()}")
+    elif conf_direction == "SELL" and any(p in pat for p in bearish_pats):
+        conf_count   += 1
+        bonus_reasons.append(f"Strong bearish candle pattern: {pattern.split('(')[0].strip()}")
+
+    # +1 if price is near a key Fibonacci level (61.8% or 38.2%)
+    if fibs:
+        key_fibs = [fibs.get("fib_618"), fibs.get("fib_382"), fibs.get("fib_786")]
+        for fib_lvl in key_fibs:
+            if fib_lvl and abs(price - fib_lvl) / price < 0.003:  # within 0.3%
+                conf_count   += 1
+                bonus_reasons.append(f"Price at key Fibonacci level ({fib_lvl:.5g})")
+                break
+
+    # Add bonus reasons to explanation list
+    conf_reasons.extend(bonus_reasons)
+
+    # Cap confluence at 10 (was /6, now effectively /10 with bonuses)
+    conf_count = min(conf_count, 10)
 
     # ── Momentum score ───────────────────────────────────────────
     momentum = calc_momentum_score(
@@ -1316,15 +1599,20 @@ def get_symbol_analysis(symbol: str, fetch_realtime_price: bool = True) -> dict:
                 f"({pct_away:.2f}% away) | Range: {fibs.get('swing_low')}–{fibs.get('swing_high')}"
             )
 
-    # ── ATR-based SL/TP (1.5R / 3R / 4.5R) ──────────────────────
-    sl_buy   = round(price - atr * 1.5, 6)
-    sl_sell  = round(price + atr * 1.5, 6)
-    tp1_buy  = round(price + atr * 1.5, 6)
-    tp2_buy  = round(price + atr * 3.0, 6)
-    tp3_buy  = round(price + atr * 4.5, 6)
-    tp1_sell = round(price - atr * 1.5, 6)
-    tp2_sell = round(price - atr * 3.0, 6)
-    tp3_sell = round(price - atr * 4.5, 6)
+    # ── Regime-adaptive SL/TP multipliers ────────────────────────
+    sl_m  = regime["sl_multiplier"]
+    tp1_m = regime["tp1_multiplier"]
+    tp2_m = regime["tp2_multiplier"]
+    tp3_m = regime["tp3_multiplier"]
+
+    sl_buy   = round(price - atr * sl_m,  6)
+    sl_sell  = round(price + atr * sl_m,  6)
+    tp1_buy  = round(price + atr * tp1_m, 6)
+    tp2_buy  = round(price + atr * tp2_m, 6)
+    tp3_buy  = round(price + atr * tp3_m, 6)
+    tp1_sell = round(price - atr * tp1_m, 6)
+    tp2_sell = round(price - atr * tp2_m, 6)
+    tp3_sell = round(price - atr * tp3_m, 6)
 
     result = {
         "symbol":             symbol,
@@ -1334,13 +1622,15 @@ def get_symbol_analysis(symbol: str, fetch_realtime_price: bool = True) -> dict:
         "candles_used":       len(df),
         "last_candle_time":   str(df["time"].iloc[-1].date()),
         "ai_only_mode":       False,
+        "market_regime":      regime,
+        "divergence":         divergence,
         "confluence": {
             "direction":    conf_direction,
             "score":        conf_count,
-            "out_of":       6,
-            "strength":     "STRONG" if conf_count >= 5 else ("MODERATE" if conf_count >= 3 else "WEAK"),
+            "out_of":       10,
+            "strength":     "STRONG" if conf_count >= 7 else ("MODERATE" if conf_count >= 4 else "WEAK"),
             "reasons":      conf_reasons,
-            "tradeable":    adx >= 20,
+            "tradeable":    adx >= 20 and regime_name != "RANGING",
             "adx_note":     adx_reading,
         },
         "momentum": momentum,
@@ -1423,13 +1713,32 @@ def format_for_ai_prompt(symbol_or_analysis, analysis: dict = None) -> str:
     mom  = analysis.get("momentum", {})
     mstr = analysis.get("market_structure", "unknown")
 
+    regime = analysis.get("market_regime", {}) or {}
+    div    = analysis.get("divergence", {}) or {}
+
+    regime_line = (
+        f"REGIME: {regime.get('regime','?')} | ADX={regime.get('adx','?')} | "
+        f"ATR-ratio={regime.get('atr_ratio','?')} | "
+        f"SL×{regime.get('sl_multiplier','1.5')} TP1×{regime.get('tp1_multiplier','1.5')} "
+        f"TP2×{regime.get('tp2_multiplier','3.0')} TP3×{regime.get('tp3_multiplier','4.5')}"
+    )
+    regime_desc = regime.get("description", "")
+
+    if div.get("detected"):
+        div_line = f"RSI DIVERGENCE ⚡: {div.get('description','')}"
+    else:
+        div_line = f"RSI DIVERGENCE: none detected"
+
     lines = [
         f"=== {sym} | Live Price: {price} ({source}) ===",
         f"Data: {analysis.get('data_source')} | Candles: {analysis.get('candles_used')} | Last: {analysis.get('last_candle_time','')}",
         f"",
+        f"── {regime_line}",
+        f"   {regime_desc}",
+        f"── {div_line}",
         f"── MARKET STRUCTURE: {mstr}",
         f"── MOMENTUM SCORE: {mom.get('score',0):+.1f}/10 → {mom.get('label','?')}",
-        f"── CONFLUENCE: {conf.get('direction','?')} | Score {conf.get('score',0)}/{conf.get('out_of',6)} ({conf.get('strength','?')}) | Tradeable: {conf.get('tradeable','?')}",
+        f"── CONFLUENCE: {conf.get('direction','?')} | Score {conf.get('score',0)}/{conf.get('out_of',10)} ({conf.get('strength','?')}) | Tradeable: {conf.get('tradeable','?')}",
         f"   Reasons: {' | '.join(conf.get('reasons', ['insufficient data']))}",
         f"",
         f"── TREND & MOMENTUM INDICATORS",
@@ -1509,8 +1818,17 @@ def format_for_ai_prompt_compact(analysis: dict) -> str:
     mscore   = mom.get("score", 0)
     mstr     = str(analysis.get("market_structure", "?")).split("—")[0].strip()
 
+    regime   = analysis.get("market_regime", {}) or {}
+    div      = analysis.get("divergence", {}) or {}
+    reg_name = regime.get("regime", "?")
+    atr_r    = regime.get("atr_ratio", "?")
+    div_tag  = ""
+    if div.get("detected"):
+        div_tag = f" DIV={div.get('type','?')}({div.get('strength','?')})"
+
     return (
-        f"{sym}[LIVE] p={price} | conf={cdir}{cscore}/6 {tradeable} | mom={mscore:+.0f}/10 | struct={mstr} | "
+        f"{sym}[LIVE] p={price} | regime={reg_name}(ATR×{atr_r}){div_tag} | "
+        f"conf={cdir}{cscore}/10 {tradeable} | mom={mscore:+.0f}/10 | struct={mstr} | "
         f"RSI={rsi_raw} MACD={macd_dir} EMA={ema_dir} ADX={adx_raw} StochK={stoch_k} WR={wr_raw} | "
         f"pat={pattern} | "
         f"BUY:SL={sl_b},TP1={tp1_b},TP2={tp2_b} | "

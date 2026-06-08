@@ -1338,27 +1338,70 @@ Session Ends   : {timing["session_end_utc"]} ({timing["minutes_left"]} min remai
 GOAL: Analyze ALL 30 symbols and return every symbol with a genuine tradeable edge.
 Target: 5-12 signals. Quality over quantity — only include setups with real conviction.
 
-━━━ YOUR REASONING PROCESS (apply to EVERY symbol) ━━━
-Before assigning any signal, mentally work through these 6 steps + timing check:
+━━━ YOUR 9-STEP REASONING PROCESS (apply to EVERY symbol) ━━━
+Before assigning any signal, silently work through ALL 9 steps. Only output a signal when ≥4 steps agree.
 
-1. TREND: Is price making HH+HL (uptrend), LH+LL (downtrend), or choppy range?
-2. MOMENTUM: Do RSI, MACD histogram, and Stochastic all agree on direction?
-3. CONFIRMATION: Is EMA stack aligned? Does ADX confirm a trending market (>20)?
-4. VOLATILITY: Is ATR healthy (not compressed)? Is this the right session for this pair?
-5. RISK: Can I place a stop at 1.5×ATR with at least 1:1.5 R:R to TP1?
-6. CONVICTION: How many of steps 1-5 agree? 5-6 = STRONG. 3-4 = BUY/SELL. 1-2 = skip.
-7. TIMING: Is this pair active in the {timing["session_name"]} session? Set the exact UTC entry window.
+1. MARKET REGIME — What is the ADX reading? Is it RANGING (<20), TRENDING (20-35), or STRONG_TREND (>35)?
+   • RANGING: skip directional trades entirely — only fade band extremes.
+   • TRANSITIONING (18-22): lower confidence, reduce size, tighter targets.
+   • TRENDING/STRONG_TREND: full confidence — trend-following entries valid.
 
-━━━ SECTION A — LIVE INDICATOR DATA (12 symbols with full OHLCV + indicators) ━━━
+2. MULTI-TIMEFRAME TREND — Does the EMA200 (weekly proxy) agree with EMA50 and EMA20?
+   • Price > EMA20 > EMA50 > EMA200 = fully aligned bull — high conviction.
+   • Price < EMA20 < EMA50 < EMA200 = fully aligned bear — high conviction.
+   • Mixed EMA stack = conflicted — reduce confidence by 5-8%.
+   • NEVER trade AGAINST EMA200 direction unless divergence is confirmed.
+
+3. MOMENTUM TRIPLE-CHECK — Do RSI + MACD + Stochastic ALL agree?
+   • RSI 50-65 (bull) / 35-50 (bear): healthy momentum
+   • RSI >70 or <30: extreme zone — reversal risk — flag it
+   • MACD histogram growing = acceleration. Shrinking = deceleration — warning.
+   • Stochastic K crossing D in oversold/overbought = high-quality entry trigger
+
+4. RSI DIVERGENCE — Is there a divergence in the indicator data?
+   • Bullish divergence (price LL, RSI HL) = smart money accumulating — +2 conviction
+   • Bearish divergence (price HH, RSI LH) = smart money distributing — +2 conviction
+   • Divergence overrides weak EMA stack if RSI swing gap > 5 points
+
+5. KEY LEVEL CONTEXT — Is price at a meaningful level?
+   • Near pivot S1/S2 (potential support for BUY) or R1/R2 (resistance for SELL)?
+   • Near 61.8% or 38.2% Fibonacci retracement? These are institutional magnet levels.
+   • Near round numbers (1.1000, 150.00, 1.2500)? Smart money clusters orders there.
+   • Entry AT a key level = high conviction. Entry in middle of range = skip.
+
+6. CANDLESTICK PATTERN QUALITY — Does the last candle confirm direction?
+   • High conviction: engulfing, pin bar (hammer/shooting star), morning/evening star
+   • Moderate: marubozu, three soldiers/crows
+   • Ignore: single candles without context, doji without breakout direction
+   • Pattern must MATCH signal direction — a bearish pin bar on a BUY signal = red flag.
+
+7. VOLATILITY + SESSION FIT — Is this the right market condition for this pair NOW?
+   • ATR: healthy range? Compressed ATR (<0.5× average) = no move expected, skip.
+   • ATR spike (>1.8× average) = volatile breakout — widen SL, use larger TP.
+   • Session: Is this pair active in {timing["session_name"]}? Low-liquidity pair + wrong session = skip.
+
+8. RISK ARCHITECTURE — Can you construct a valid trade?
+   • SL must be at a logical level (below support for BUY, above resistance for SELL).
+   • R:R ≥ 1:1.5 to TP1, ≥ 1:2.5 to TP2. If not achievable, skip.
+   • Position must be closeable within the session window.
+
+9. CONVICTION SCORE — Count how many of steps 1-8 genuinely agree.
+   • 7-8 steps agree → STRONG_BUY or STRONG_SELL (confidence 88-97)
+   • 5-6 steps agree → BUY or SELL (confidence 78-87)
+   • 4 steps agree  → BUY or SELL (confidence 73-77)
+   • <4 steps agree → SKIP — no signal. Quality > quantity.
+
+━━━ SECTION A — LIVE INDICATOR DATA + REGIME (12 symbols with full OHLCV + indicators) ━━━
 {"No live data this cycle — see Section B." if not has_real_data else ""}
 {live_data_section if has_real_data else ""}
 
 SECTION A RULES:
-✓ For each symbol above: run all 6 reasoning steps explicitly in your head
-✓ Use the EXACT indicator values shown — never invent or adjust them
-✓ Confluence score 2/6+ required. ADX must be > 20. R:R must be ≥ 1:1.5
-✓ Confidence mapping: 6/6→92-97 | 5/6→86-91 | 4/6→80-85 | 3/6→75-79 | 2/6→73-74
-✗ Skip if: confluence 0-1/6, ADX<20, R:R<1:1.5, or AI direction ≠ confluence direction
+✓ For each symbol: run all 9 reasoning steps in your head before assigning a signal
+✓ Use the EXACT indicator values — never invent or adjust them
+✓ Confidence mapping: 8-9/10 → 92-97 | 6-7/10 → 84-91 | 4-5/10 → 76-83 | 3/10 → 73-75
+✓ If market_regime = RANGING or COMPRESSION → skip directional signals for that symbol
+✓ If divergence detected → boost confidence by 4% and note it in rationale
+✗ Skip if: confluence <3/10, ADX<20 with no divergence, R:R<1:1.5, or direction ≠ indicator consensus
 
 ━━━ SECTION B — AI PATTERN REASONING ({len(remaining_symbols)} symbols, ATR-derived levels provided) ━━━
 For these symbols: use intermarket correlations, macro drivers, session behaviour,
@@ -1368,7 +1411,7 @@ The ATR-derived SL/TP levels below are pre-calculated — USE THEM EXACTLY.
 {remaining_text if remaining_text else "(all symbols covered in Section A)"}
 
 SECTION B RULES:
-✓ Run your 6-step reasoning even without live indicators
+✓ Run your 9-step reasoning even without live indicators — use estimated values
 ✓ Use macro context: Is USD strong or weak right now? Risk-on or risk-off?
 ✓ Use session context: {session.split("—")[0].strip()} session — which pairs have liquidity NOW?
 ✓ Use correlations: EURUSD ↑ often means GBPUSD ↑, USDCHF ↓
@@ -1469,59 +1512,114 @@ Return ONLY a valid JSON array:
 
             # Gate 3: live-data signals must pass Python confluence check
             if src == "live_data" and sym in analyses_by_symbol:
-                calc = analyses_by_symbol[sym].get("confluence", {})
+                analysis_data  = analyses_by_symbol[sym]
+                calc           = analysis_data.get("confluence", {})
                 calc_dir       = calc.get("direction", "NEUTRAL")
                 calc_score     = int(calc.get("score", 0))
                 calc_tradeable = calc.get("tradeable", True)
+                regime_data    = analysis_data.get("market_regime", {})
+                divergence_data= analysis_data.get("divergence", {})
+                regime_name    = regime_data.get("regime", "UNKNOWN")
 
-                # Need at least 2 indicators agreeing (was 3 — lowered for real data
-                # where markets are often mixed; auto-trader still requires 3)
-                if calc_score < 2:
-                    print(f"[GATE] Rejected {sym} {sig}: confluence {calc_score}/6 < 2")
+                # ── Hard block: RANGING or COMPRESSION market ──────────
+                if regime_name in ("RANGING", "COMPRESSION") and not divergence_data.get("detected"):
+                    print(f"[GATE] Rejected {sym} {sig}: regime={regime_name} — no directional trades")
                     continue
 
-                # Direction must not be opposite to what Python calculated
+                # ── Minimum confluence threshold ────────────────────────
+                if calc_score < 3:
+                    print(f"[GATE] Rejected {sym} {sig}: confluence {calc_score}/10 < 3")
+                    continue
+
+                # ── Direction must agree with Python indicators ─────────
                 is_buy  = sig in ("BUY", "STRONG_BUY")
                 is_sell = sig in ("SELL", "STRONG_SELL")
                 if is_buy  and calc_dir == "SELL":
-                    print(f"[GATE] Rejected {sym} {sig}: AI says BUY but Python says SELL")
+                    print(f"[GATE] Rejected {sym} {sig}: AI BUY but Python SELL")
                     continue
                 if is_sell and calc_dir == "BUY":
-                    print(f"[GATE] Rejected {sym} {sig}: AI says SELL but Python says BUY")
+                    print(f"[GATE] Rejected {sym} {sig}: AI SELL but Python BUY")
                     continue
 
-                # Fully neutral market with weak score → reject (was < 3, now < 2)
-                if calc_dir == "NEUTRAL" and calc_score < 2:
-                    print(f"[GATE] Rejected {sym} {sig}: NEUTRAL market, score only {calc_score}/6")
+                if calc_dir == "NEUTRAL" and calc_score < 4:
+                    print(f"[GATE] Rejected {sym} {sig}: NEUTRAL market, score {calc_score}/10 < 4")
                     continue
 
-                # ADX gate: market must be trending (not ranging)
+                # ── ADX gate ────────────────────────────────────────────
                 if not calc_tradeable:
-                    print(f"[GATE] Rejected {sym} {sig}: ADX <20 (ranging market)")
+                    print(f"[GATE] Rejected {sym} {sig}: not tradeable ({regime_name})")
                     continue
 
-                # Confidence scaled to confluence score
-                if calc_score >= 5:
-                    if conf > 95: s["confidence"] = 93
-                elif calc_score == 4:
-                    if conf > 87: s["confidence"] = 85
-                elif calc_score == 3:
-                    if conf > 79: s["confidence"] = 77
-                else:  # score == 2
-                    if conf > 73: s["confidence"] = 73
+                # ── Python confidence adjustment engine ─────────────────
+                # Adjust AI confidence using hard indicator evidence
+                adj = 0
 
-                # Signal quality label (for UI — auto-trader uses 3+ only)
-                if calc_score >= 4:
+                # Regime bonus/penalty
+                if regime_name == "STRONG_TREND":
+                    adj += 4   # strong trend = higher conviction
+                elif regime_name == "TRENDING":
+                    adj += 2
+                elif regime_name == "TRANSITIONING":
+                    adj -= 4   # market changing character = uncertainty
+                elif regime_name in ("RANGING", "COMPRESSION"):
+                    adj -= 8   # should be blocked above, but extra safety
+
+                # Divergence bonus (confirmed by Python, not just AI)
+                if divergence_data.get("detected"):
+                    div_type = divergence_data.get("type", "none")
+                    div_str  = divergence_data.get("strength", "mild")
+                    dir_match = (div_type == "bullish" and is_buy) or \
+                                (div_type == "bearish" and is_sell)
+                    if dir_match:
+                        str_bonus = {"strong": 5, "moderate": 3, "mild": 2}.get(div_str, 2)
+                        adj += str_bonus
+                        s["divergence_signal"] = divergence_data.get("description", "")
+
+                # Counter-EMA200 penalty (high-risk counter-trend trade)
+                ema200_val = analysis_data.get("indicators", {}).get("ema_stack", "")
+                if is_buy  and "BEARISH" in str(ema200_val).upper():
+                    adj -= 5   # buying into a daily downtrend
+                if is_sell and "BULLISH" in str(ema200_val).upper():
+                    adj -= 5   # selling into a daily uptrend
+
+                # ATR volatility bonus (market in motion = better fills)
+                atr_ratio = regime_data.get("atr_ratio", 1.0)
+                if 1.2 <= atr_ratio <= 1.8:
+                    adj += 2   # elevated but not extreme volatility = good moves
+
+                # Apply adjustment (clamp between 73 and 97)
+                adjusted_conf = max(73, min(97, conf + adj))
+                s["confidence"] = adjusted_conf
+
+                # Confidence cap scaled to confluence score
+                conf_cap_map = {10: 97, 9: 95, 8: 92, 7: 88, 6: 84, 5: 80, 4: 77, 3: 74}
+                cap = conf_cap_map.get(calc_score, 73)
+                if s["confidence"] > cap:
+                    s["confidence"] = cap
+
+                # ── Signal quality label ────────────────────────────────
+                if calc_score >= 7 or (calc_score >= 5 and divergence_data.get("detected")):
+                    s["signal_quality"] = "⭐ premium"
+                elif calc_score >= 5:
                     s["signal_quality"] = "strong"
-                elif calc_score == 3:
+                elif calc_score >= 4:
                     s["signal_quality"] = "moderate"
                 else:
                     s["signal_quality"] = "weak — monitor only"
 
-                # Stamp the verified confluence data
-                s["confluence_score"]     = f"{calc_score}/6"
+                # ── Regime-adaptive SL/TP note for downstream ──────────
+                s["regime"]           = regime_name
+                s["regime_note"]      = regime_data.get("description", "")
+                s["sl_multiplier"]    = regime_data.get("sl_multiplier", 1.5)
+                s["tp1_multiplier"]   = regime_data.get("tp1_multiplier", 1.5)
+
+                # ── Stamp verified confluence data ──────────────────────
+                s["confluence_score"]     = f"{calc_score}/10"
                 s["confluence_direction"] = calc_dir
-                s["auto_trade_eligible"]  = calc_score >= 3 and calc_tradeable
+                s["auto_trade_eligible"]  = calc_score >= 4 and calc_tradeable and regime_name not in ("RANGING", "COMPRESSION")
+
+                print(f"[GATE] ✅ {sym} {sig} | score={calc_score}/10 | regime={regime_name} | conf={conf}→{s['confidence']} (adj={adj:+d})"
+                      + (f" | divergence={divergence_data.get('type')}" if divergence_data.get("detected") else ""))
 
             # ── NGN trade details (injected for every validated signal) ──────
             if investment_amount_ngn > 0:
@@ -3852,19 +3950,23 @@ def get_live_technical_data(
         log_activity(user, "viewed_live_data", symbol=symbol, db=db)
     analysis = get_symbol_analysis(symbol)
     return {
-        "symbol": symbol,
-        "success": bool(analysis.get("live_price")),
-        "data_source": analysis.get("data_source", "unavailable"),
-        "live_price": analysis.get("live_price"),
-        "last_candle_time": analysis.get("last_candle_time"),
-        "candles_used": analysis.get("candles_used"),
-        "confluence": analysis.get("confluence", {}),
-        "indicators": analysis.get("indicators", {}),
-        "key_levels": analysis.get("key_levels", {}),
-        "trend_bias": analysis.get("trend_bias"),
-        "fetched_at": datetime.utcnow().isoformat(),
+        "symbol":          symbol,
+        "success":         bool(analysis.get("live_price")),
+        "data_source":     analysis.get("data_source", "unavailable"),
+        "live_price":      analysis.get("live_price"),
+        "last_candle_time":analysis.get("last_candle_time"),
+        "candles_used":    analysis.get("candles_used"),
+        "market_regime":   analysis.get("market_regime"),
+        "divergence":      analysis.get("divergence"),
+        "confluence":      analysis.get("confluence", {}),
+        "momentum":        analysis.get("momentum"),
+        "market_structure":analysis.get("market_structure"),
+        "indicators":      analysis.get("indicators", {}),
+        "key_levels":      analysis.get("key_levels", {}),
+        "trend_bias":      analysis.get("trend_bias"),
+        "fetched_at":      datetime.utcnow().isoformat(),
         "cache_ttl_minutes": 15,
-        "note": "Data from Alpha Vantage daily candles. Cached 15 min to respect rate limits.",
+        "note": "Data from Twelve Data / Alpha Vantage. Regime-adaptive SL/TP. Cached 15 min.",
     }
 
 
