@@ -1903,12 +1903,35 @@ app.add_middleware(
 )
 
 
+def _keep_alive_ping():
+    """Ping our own health endpoint every 10 minutes to prevent Render free-tier spin-down."""
+    import requests as _req
+    time.sleep(60)  # wait for server to fully start first
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not render_url:
+        # Try to detect Render URL automatically, fall back to localhost
+        render_url = "http://localhost:5000"
+    ping_url = render_url.rstrip("/") + "/"
+    print(f"[KEEPALIVE] Self-ping started — hitting {ping_url} every 10 min")
+    while True:
+        try:
+            r = _req.get(ping_url, timeout=10)
+            print(f"[KEEPALIVE] ✅ Ping OK ({r.status_code})")
+        except Exception as e:
+            print(f"[KEEPALIVE] ⚠️ Ping failed: {e}")
+        time.sleep(600)  # 10 minutes
+
+
 @app.on_event("startup")
 def start_auto_scheduler():
     """Launch the 24/7 auto-trading scheduler as a background daemon thread."""
     t = threading.Thread(target=_auto_trade_scheduler, daemon=True)
     t.start()
     print("[SCHEDULER] 24/7 auto-trade scheduler started")
+
+    ka = threading.Thread(target=_keep_alive_ping, daemon=True)
+    ka.start()
+    print("[KEEPALIVE] Keep-alive ping thread started")
 
 
 # ----------------------------
