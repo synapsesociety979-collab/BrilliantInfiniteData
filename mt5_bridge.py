@@ -53,6 +53,7 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))    # seconds between polls
 
 # Common MT5 terminal install paths — searched in order if MT5_PATH not set
 _MT5_DEFAULT_PATHS = [
+    r"C:\Program Files\HFM Metatrader 5\terminal64.exe",
     r"C:\Program Files\HFMarketsGlobal MT5 Terminal\terminal64.exe",
     r"C:\Program Files\HFM MT5\terminal64.exe",
     r"C:\Program Files\HFMarketsGlobal-Demo\terminal64.exe",
