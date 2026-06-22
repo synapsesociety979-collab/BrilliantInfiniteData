@@ -47,8 +47,20 @@ BRIDGE_KEY    = os.getenv("BRIDGE_API_KEY", "")
 MT5_LOGIN     = int(os.getenv("MT5_LOGIN", "0"))
 MT5_PASSWORD  = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER    = os.getenv("MT5_SERVER", "HFMarkets-Live")
+MT5_PATH      = os.getenv("MT5_PATH", "")   # optional: full path to terminal64.exe
 MAGIC         = int(os.getenv("MAGIC_NUMBER", "202600"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))    # seconds between polls
+
+# Common MT5 terminal install paths — searched in order if MT5_PATH not set
+_MT5_DEFAULT_PATHS = [
+    r"C:\Program Files\HFMarketsGlobal MT5 Terminal\terminal64.exe",
+    r"C:\Program Files\HFM MT5\terminal64.exe",
+    r"C:\Program Files\HFMarketsGlobal-Demo\terminal64.exe",
+    r"C:\Program Files\HFMarketsGlobal\terminal64.exe",
+    r"C:\Program Files\MetaTrader 5\terminal64.exe",
+    r"C:\Program Files (x86)\MetaTrader 5\terminal64.exe",
+    r"C:\Program Files\MetaTrader 5 HFM\terminal64.exe",
+]
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -86,16 +98,61 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def mt5_connect() -> bool:
-    """Initialize and log into MT5. Returns True on success."""
-    if not mt5.initialize():
-        log.error(f"MT5 initialize() failed: {mt5.last_error()}")
+    """
+    Initialize and log into MT5.  Returns True on success.
+
+    The IPC-timeout error (-10005) happens when mt5.initialize() is called
+    without a path and the library cannot auto-locate the terminal.
+    We try the user-supplied MT5_PATH first, then scan the common install
+    locations, and finally fall back to the no-argument call as a last resort.
+    """
+    # Build the list of paths to try
+    paths_to_try: list = []
+    if MT5_PATH and os.path.isfile(MT5_PATH):
+        paths_to_try.append(MT5_PATH)        # user-specified path (highest priority)
+    for p in _MT5_DEFAULT_PATHS:
+        if os.path.isfile(p):
+            paths_to_try.append(p)
+    paths_to_try.append(None)               # None = no-argument fallback
+
+    initialized = False
+    used_path   = None
+    for path in paths_to_try:
+        if path:
+            ok = mt5.initialize(path=path)
+            desc = f"path={path}"
+        else:
+            ok = mt5.initialize()
+            desc = "no-path fallback"
+
+        if ok:
+            initialized = True
+            used_path   = path
+            log.info(f"MT5 initialize() succeeded ({desc})")
+            break
+        else:
+            err = mt5.last_error()
+            log.warning(f"MT5 initialize() failed ({desc}): {err}")
+
+    if not initialized:
+        log.error(
+            "MT5 initialize() failed on all paths.\n"
+            "  Fix: Add MT5_PATH to your .env file pointing to terminal64.exe\n"
+            "  Example:  MT5_PATH=C:\\Program Files\\HFMarketsGlobal MT5 Terminal\\terminal64.exe\n"
+            "  To find the path: right-click your MT5 shortcut → Properties → Target"
+        )
         return False
+
     if not mt5.login(MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
         log.error(f"MT5 login failed: {mt5.last_error()}")
         mt5.shutdown()
         return False
+
     info = mt5.account_info()
-    log.info(f"MT5 connected — Account: {info.login} | Balance: {info.balance:.2f} {info.currency} | Server: {MT5_SERVER}")
+    log.info(
+        f"MT5 connected — Account: {info.login} | "
+        f"Balance: {info.balance:.2f} {info.currency} | Server: {MT5_SERVER}"
+    )
     return True
 
 
