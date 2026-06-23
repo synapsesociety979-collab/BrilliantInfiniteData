@@ -245,7 +245,7 @@ def _run_with_fallback(
 
 
 def get_ai_response(prompt: str, temperature: float = 0.15,
-                    max_tokens: int = 4096) -> str:
+                    max_tokens: int = 2048) -> str:
     """
     Single-turn prompt → response.
     Model priority:

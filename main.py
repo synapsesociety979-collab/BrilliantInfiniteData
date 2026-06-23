@@ -1264,9 +1264,10 @@ def generate_market_predictions(
 
     personalization = f"\nUSER PROFILE: {user_profile}" if user_profile else ""
 
-    # Fetch REAL live data for session-priority symbols (up to 12 to respect rate limits)
+    # Fetch REAL live data for session-priority symbols (up to 8 — stays inside the
+    # Twelve Data 8 req/min free tier so _td_throttle() never sleeps)
     priority_symbols = _get_session_priority_symbols(h)
-    real_data_symbols = priority_symbols[:12]
+    real_data_symbols = priority_symbols[:8]
     live_data_blocks = []
     has_real_data = False
 
@@ -1474,7 +1475,7 @@ Return ONLY a valid JSON array:
 ]"""
 
     try:
-        content = get_ai_response(prompt, max_tokens=2048)
+        content = get_ai_response(prompt, max_tokens=1200)
         if not content or content.startswith("ERROR:"):
             # If stale cache exists, serve it rather than failing completely
             if cache_key in PREDICTIONS_CACHE:
@@ -2820,10 +2821,17 @@ def chat_with_aria(chat: ChatMessage, db: Session = Depends(get_db)):
     memories = get_user_memories(user, db)
     name = user.display_name or user.username
 
-    # ── market context ──
+    # ── market context — use CACHE ONLY, never block chat on fresh generation ──
     ngn_rate = get_ngn_rate()
-    preds = generate_market_predictions(user.balance_ngn)
-    signals = preds.get("signals", [])
+    # Pull from whichever cache key exists (user-amount-specific first, then generic)
+    _chat_cache_key = f"preds_{int(user.balance_ngn)}"
+    _chat_preds = (
+        PREDICTIONS_CACHE.get(_chat_cache_key)
+        or PREDICTIONS_CACHE.get("preds_0")
+        or {}
+    )
+    preds   = _chat_preds.get("data", {}) if isinstance(_chat_preds, dict) and "data" in _chat_preds else _chat_preds
+    signals = preds.get("signals", []) if isinstance(preds, dict) else []
     profile = get_user_profile_summary(user, db)
 
     # ── detect symbols mentioned in the message and fetch live data ──
@@ -3151,7 +3159,7 @@ Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
     # This gives CLEO native multi-turn memory rather than text-embedded history.
     chat_messages = history_messages + [{"role": "user", "content": chat.message}]
     # Use more tokens when a time window + intraday data is present — signals are longer
-    max_tok = 3000 if tw.get("detected") else 2048
+    max_tok = 2000 if tw.get("detected") else 1500
     response = get_ai_response_chat(chat_messages, system_prompt, max_tokens=max_tok)
 
     # ── save messages to DB ──
