@@ -4085,6 +4085,204 @@ def connect_account(req: UserAccountRequest, db: Session = Depends(get_db)):
 
 
 # ════════════════════════════════════════════════════════════════
+#  MT5 CONNECT — save credentials, generate bridge key, show status
+# ════════════════════════════════════════════════════════════════
+
+class MT5ConnectRequest(BaseModel):
+    mt5_login: str               # MT5 account number e.g. "49560269"
+    mt5_server: str              # broker server e.g. "HFMarketsGlobal-Demo"
+    mt5_broker: Optional[str] = None   # human name e.g. "HFM"
+    platform: Optional[str] = "MT5"   # MT5 | MT4 (future)
+
+
+@app.post("/mt5/connect/{username}")
+def mt5_connect_account(
+    username: str,
+    req: MT5ConnectRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Step 1 of MT5 connection flow.
+    Saves the user's MT5 account number + server, generates a bridge API key,
+    and returns a ready-to-use .env file for mt5_bridge.py.
+    Password is NEVER stored on the server — user fills it into their .env.
+    """
+    user = get_or_create_user(username, db)
+    cfg  = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+
+    if not cfg:
+        cfg = BotConfig(
+            user_id       = user.id,
+            bridge_api_key = _secrets.token_urlsafe(32),
+        )
+        db.add(cfg)
+
+    # Save credentials
+    cfg.mt5_account_number = req.mt5_login.strip()
+    cfg.mt5_server         = req.mt5_server.strip()
+    cfg.mt5_broker         = req.mt5_broker or cfg.mt5_broker
+    cfg.mt5_connected_at   = datetime.utcnow()
+
+    # Default risk settings if this is the first connect
+    if cfg.allowed_sessions is None:
+        cfg.allowed_sessions = ["london", "overlap", "newyork"]
+
+    cfg.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(cfg)
+
+    bridge_key   = cfg.bridge_api_key
+    backend_url  = "https://brilliantinfinitedata-2.onrender.com"
+
+    env_content = f"""# CLEO MT5 Bridge — auto-generated for {username}
+# Copy this file as ".env" next to mt5_bridge.py on your Windows machine
+# Then fill in MT5_PASSWORD below and run:  python mt5_bridge.py
+
+API_URL={backend_url}
+USERNAME={username}
+BRIDGE_API_KEY={bridge_key}
+
+MT5_LOGIN={req.mt5_login}
+MT5_PASSWORD=YOUR_MT5_PASSWORD_HERE
+MT5_SERVER={req.mt5_server}
+MT5_PATH=C:\\Program Files\\HFM Metatrader 5\\terminal64.exe
+
+# Optional — leave blank to use defaults
+MAGIC_NUMBER=202600
+POLL_INTERVAL=5
+"""
+
+    return {
+        "success"     : True,
+        "message"     : f"MT5 account {req.mt5_login} registered. Run the bridge to go live.",
+        "username"    : username,
+        "mt5_login"   : req.mt5_login,
+        "mt5_server"  : req.mt5_server,
+        "bridge_key"  : bridge_key,
+        "status"      : "PENDING — bridge not yet connected",
+        "next_steps"  : [
+            "1. Download mt5_bridge.py from your Replit project",
+            "2. Copy the env_file_content below and save it as '.env' next to mt5_bridge.py",
+            "3. Fill in MT5_PASSWORD in the .env file",
+            "4. Run:  python mt5_bridge.py",
+            "5. Come back here — your balance will appear automatically",
+        ],
+        "env_file_content": env_content,
+    }
+
+
+@app.get("/mt5/status/{username}")
+def mt5_connection_status(username: str, db: Session = Depends(get_db)):
+    """
+    Returns live MT5 connection status + account balance.
+    'connected' = bridge pinged the backend within the last 90 seconds.
+    """
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+
+    if not cfg or not cfg.mt5_account_number:
+        return {
+            "connected"      : False,
+            "status"         : "NOT_CONFIGURED",
+            "message"        : "No MT5 account linked yet. Call POST /mt5/connect/{username} first.",
+            "balance_usd"    : None,
+            "balance_ngn"    : None,
+        }
+
+    # Bridge is "live" if it pinged within last 90 seconds
+    now       = datetime.utcnow()
+    last_seen = cfg.bridge_last_seen
+    is_live   = (
+        last_seen is not None
+        and (now - last_seen).total_seconds() < 90
+    )
+
+    balance_usd  = cfg.mt5_account_balance  or 0.0
+    equity_usd   = cfg.mt5_account_equity   or balance_usd
+    currency     = cfg.mt5_account_currency or "USD"
+    ngn_rate     = get_ngn_rate()
+    balance_ngn  = round(balance_usd * ngn_rate, 2)
+    equity_ngn   = round(equity_usd  * ngn_rate, 2)
+
+    open_profit  = getattr(cfg, "mt5_open_profit", None) or 0.0
+
+    last_sync_str = (
+        last_seen.strftime("%Y-%m-%d %H:%M:%S UTC")
+        if last_seen else "Never"
+    )
+
+    secs_ago = int((now - last_seen).total_seconds()) if last_seen else None
+
+    return {
+        "connected"         : is_live,
+        "status"            : "LIVE" if is_live else ("DISCONNECTED" if last_seen else "PENDING"),
+        "message"           : (
+            f"Bridge active — last sync {secs_ago}s ago"
+            if is_live else
+            "Bridge is offline — run mt5_bridge.py on your Windows machine"
+            if last_seen else
+            "Bridge has never connected — follow the setup steps"
+        ),
+        "mt5_account"       : cfg.mt5_account_number,
+        "mt5_server"        : cfg.mt5_server,
+        "mt5_broker"        : cfg.mt5_broker,
+        "currency"          : currency,
+        "balance_usd"       : round(balance_usd, 2),
+        "balance_ngn"       : balance_ngn,
+        "equity_usd"        : round(equity_usd, 2),
+        "equity_ngn"        : equity_ngn,
+        "open_profit_usd"   : round(open_profit, 2),
+        "usd_ngn_rate"      : ngn_rate,
+        "last_sync"         : last_sync_str,
+        "bot_active"        : cfg.is_active or False,
+        "bridge_key"        : cfg.bridge_api_key,
+    }
+
+
+@app.get("/mt5/env_file/{username}")
+def mt5_get_env_file(username: str, db: Session = Depends(get_db)):
+    """
+    Returns the pre-filled .env file content for mt5_bridge.py.
+    Frontend can use this to show a copy-paste box or trigger a download.
+    """
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    if not cfg or not cfg.bridge_api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="No MT5 account configured yet. Call POST /mt5/connect/{username} first.",
+        )
+
+    backend_url = "https://brilliantinfinitedata-2.onrender.com"
+
+    env_content = f"""# CLEO MT5 Bridge — generated for {username}
+API_URL={backend_url}
+USERNAME={username}
+BRIDGE_API_KEY={cfg.bridge_api_key}
+
+MT5_LOGIN={cfg.mt5_account_number or "YOUR_ACCOUNT_NUMBER"}
+MT5_PASSWORD=YOUR_MT5_PASSWORD_HERE
+MT5_SERVER={cfg.mt5_server or "YOUR_BROKER_SERVER"}
+MT5_PATH=C:\\Program Files\\HFM Metatrader 5\\terminal64.exe
+
+MAGIC_NUMBER=202600
+POLL_INTERVAL=5
+"""
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(
+        content=env_content,
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="cleo_bridge_{username}.env"'},
+    )
+
+
+# ════════════════════════════════════════════════════════════════
 #  CLEO AUTO-TRADER  —  Bot Config · Risk Engine · Market Filter
 #                        Trade Manager · MT5 Bridge endpoints
 # ════════════════════════════════════════════════════════════════

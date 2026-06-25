@@ -365,6 +365,9 @@ def init_db():
         "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_account_equity FLOAT",
         "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_account_currency VARCHAR",
         "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS bridge_last_seen TIMESTAMP",
+        "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_broker VARCHAR",
+        "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_connected_at TIMESTAMP",
+        "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_open_profit FLOAT",
     ]
     with engine.connect() as conn:
         for sql in migrations:
