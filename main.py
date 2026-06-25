@@ -1264,10 +1264,10 @@ def generate_market_predictions(
 
     personalization = f"\nUSER PROFILE: {user_profile}" if user_profile else ""
 
-    # Fetch REAL live data for session-priority symbols (up to 8 — stays inside the
-    # Twelve Data 8 req/min free tier so _td_throttle() never sleeps)
+    # Fetch REAL live data for session-priority symbols (cap at 7 — matches the
+    # Twelve Data free-tier throttle window so _td_throttle() never sleeps)
     priority_symbols = _get_session_priority_symbols(h)
-    real_data_symbols = priority_symbols[:8]
+    real_data_symbols = priority_symbols[:7]
     live_data_blocks = []
     has_real_data = False
 
@@ -1475,7 +1475,7 @@ Return ONLY a valid JSON array:
 ]"""
 
     try:
-        content = get_ai_response(prompt, max_tokens=1200)
+        content = get_ai_response(prompt, max_tokens=1800)
         if not content or content.startswith("ERROR:"):
             # If stale cache exists, serve it rather than failing completely
             if cache_key in PREDICTIONS_CACHE:
