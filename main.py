@@ -844,7 +844,7 @@ def get_market_context() -> str:
 # ----------------------------
 PREDICTIONS_CACHE: Dict[str, Any] = {}
 ADVICE_CACHE: Dict[str, Any] = {}
-CACHE_TTL = 3600          # 60 min prediction cache (preserves Groq's 100K TPD free tier)
+CACHE_TTL = 900           # 15 min prediction cache — fresh signals every 15 min
 PRED_DISK_PATH = "/tmp/aria_pred_cache.json"
 _PRED_GENERATING = False   # lock to prevent simultaneous Groq calls
 
