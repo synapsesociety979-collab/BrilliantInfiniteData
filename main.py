@@ -1390,7 +1390,8 @@ Before assigning any signal, silently work through ALL 9 steps. Only output a si
    • 7-8 steps agree → STRONG_BUY or STRONG_SELL (confidence 88-97)
    • 5-6 steps agree → BUY or SELL (confidence 78-87)
    • 4 steps agree  → BUY or SELL (confidence 73-77)
-   • <4 steps agree → SKIP — no signal. Quality > quantity.
+   • 3 steps agree  → BUY or SELL (confidence 70-72) — include these, do not skip
+   • <3 steps agree → SKIP — truly no edge.
 
 ━━━ SECTION A — LIVE INDICATOR DATA + REGIME (12 symbols with full OHLCV + indicators) ━━━
 {"No live data this cycle — see Section B." if not has_real_data else ""}
@@ -1399,10 +1400,11 @@ Before assigning any signal, silently work through ALL 9 steps. Only output a si
 SECTION A RULES:
 ✓ For each symbol: run all 9 reasoning steps in your head before assigning a signal
 ✓ Use the EXACT indicator values — never invent or adjust them
-✓ Confidence mapping: 8-9/10 → 92-97 | 6-7/10 → 84-91 | 4-5/10 → 76-83 | 3/10 → 73-75
+✓ Confidence mapping: 8-9/10 → 92-97 | 6-7/10 → 84-91 | 4-5/10 → 76-83 | 3/10 → 73-75 | 2/10 → 70-72
 ✓ If market_regime = RANGING or COMPRESSION → skip directional signals for that symbol
 ✓ If divergence detected → boost confidence by 4% and note it in rationale
-✗ Skip if: confluence <3/10, ADX<20 with no divergence, R:R<1:1.5, or direction ≠ indicator consensus
+✓ Aim to produce signals for ALL symbols where you see any edge — 70%+ confidence is the floor, not the target
+✗ Skip ONLY if: confluence <2/10, ADX<15 with no divergence at all, or R:R<1:1.5
 
 ━━━ SECTION B — AI PATTERN REASONING ({len(remaining_symbols)} symbols, ATR-derived levels provided) ━━━
 For these symbols: use intermarket correlations, macro drivers, session behaviour,
@@ -1504,7 +1506,7 @@ Return ONLY a valid JSON array:
             src  = s.get("data_source", "ai_reasoning")
 
             # Gate 1: minimum confidence
-            if conf < 73:
+            if conf < 70:
                 continue
 
             # Gate 2: HOLD signals excluded
@@ -1528,22 +1530,32 @@ Return ONLY a valid JSON array:
                     continue
 
                 # ── Minimum confluence threshold ────────────────────────
-                if calc_score < 3:
-                    print(f"[GATE] Rejected {sym} {sig}: confluence {calc_score}/10 < 3")
+                if calc_score < 2:
+                    print(f"[GATE] Rejected {sym} {sig}: confluence {calc_score}/10 < 2")
                     continue
 
-                # ── Direction must agree with Python indicators ─────────
+                # ── Direction conflict — penalise rather than hard-block ──
                 is_buy  = sig in ("BUY", "STRONG_BUY")
                 is_sell = sig in ("SELL", "STRONG_SELL")
                 if is_buy  and calc_dir == "SELL":
-                    print(f"[GATE] Rejected {sym} {sig}: AI BUY but Python SELL")
-                    continue
-                if is_sell and calc_dir == "BUY":
-                    print(f"[GATE] Rejected {sym} {sig}: AI SELL but Python BUY")
+                    # AI disagrees with Python indicators — penalise -10 and warn
+                    conf = max(70, conf - 10)
+                    s["confidence"] = conf
+                    s["_direction_conflict"] = True
+                    print(f"[GATE] ⚠ {sym} {sig}: AI BUY vs Python SELL — conf penalised to {conf}")
+                elif is_sell and calc_dir == "BUY":
+                    conf = max(70, conf - 10)
+                    s["confidence"] = conf
+                    s["_direction_conflict"] = True
+                    print(f"[GATE] ⚠ {sym} {sig}: AI SELL vs Python BUY — conf penalised to {conf}")
+
+                # Still block if confidence fell below threshold after penalty
+                if conf < 70:
+                    print(f"[GATE] Rejected {sym} {sig}: confidence {conf}% below 70 after direction penalty")
                     continue
 
-                if calc_dir == "NEUTRAL" and calc_score < 4:
-                    print(f"[GATE] Rejected {sym} {sig}: NEUTRAL market, score {calc_score}/10 < 4")
+                if calc_dir == "NEUTRAL" and calc_score < 3:
+                    print(f"[GATE] Rejected {sym} {sig}: NEUTRAL market, score {calc_score}/10 < 3")
                     continue
 
                 # ── ADX gate ────────────────────────────────────────────
@@ -1588,13 +1600,13 @@ Return ONLY a valid JSON array:
                 if 1.2 <= atr_ratio <= 1.8:
                     adj += 2   # elevated but not extreme volatility = good moves
 
-                # Apply adjustment (clamp between 73 and 97)
-                adjusted_conf = max(73, min(97, conf + adj))
+                # Apply adjustment (clamp between 70 and 97)
+                adjusted_conf = max(70, min(97, conf + adj))
                 s["confidence"] = adjusted_conf
 
                 # Confidence cap scaled to confluence score
-                conf_cap_map = {10: 97, 9: 95, 8: 92, 7: 88, 6: 84, 5: 80, 4: 77, 3: 74}
-                cap = conf_cap_map.get(calc_score, 73)
+                conf_cap_map = {10: 97, 9: 95, 8: 92, 7: 88, 6: 84, 5: 80, 4: 77, 3: 74, 2: 71}
+                cap = conf_cap_map.get(calc_score, 70)
                 if s["confidence"] > cap:
                     s["confidence"] = cap
 
@@ -5216,7 +5228,7 @@ def _run_scheduler_cycle(db):
             continue
 
         # Filter signals per this user's confidence setting
-        user_min_conf = float(cfg.min_confidence or 73)
+        user_min_conf = float(cfg.min_confidence or 70)
         auto_signals = [
             s for s in tradeable_signals
             if float(s.get("confidence", 0)) >= user_min_conf
