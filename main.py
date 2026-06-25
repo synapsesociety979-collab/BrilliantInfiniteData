@@ -4089,10 +4089,11 @@ def connect_account(req: UserAccountRequest, db: Session = Depends(get_db)):
 # ════════════════════════════════════════════════════════════════
 
 class MT5ConnectRequest(BaseModel):
-    mt5_login: str               # MT5 account number e.g. "49560269"
-    mt5_server: str              # broker server e.g. "HFMarketsGlobal-Demo"
+    mt5_login: str                      # MT5 account number e.g. "49560269"
+    mt5_password: str                   # MT5 account password (used only for MetaApi provisioning)
+    mt5_server: str                     # broker server e.g. "HFMarketsGlobal-Demo"
     mt5_broker: Optional[str] = None   # human name e.g. "HFM"
-    platform: Optional[str] = "MT5"   # MT5 | MT4 (future)
+    platform: Optional[str] = "mt5"   # mt5 | mt4
 
 
 @app.post("/mt5/connect/{username}")
@@ -4102,80 +4103,122 @@ def mt5_connect_account(
     db: Session = Depends(get_db),
 ):
     """
-    Step 1 of MT5 connection flow.
-    Saves the user's MT5 account number + server, generates a bridge API key,
-    and returns a ready-to-use .env file for mt5_bridge.py.
-    Password is NEVER stored on the server — user fills it into their .env.
+    Fully-automatic MT5 connection via MetaApi cloud.
+    User enters their MT5 login + password on the frontend — MetaApi spins up
+    a cloud MT5 terminal for them. No Windows machine, no bridge download needed.
+
+    Flow:
+    1. Check if this login is already provisioned on MetaApi
+    2. If not, provision a new MetaApi account (creates cloud MT5 terminal)
+    3. Save the MetaApi account_id to our DB
+    4. Return status — frontend polls /mt5/status to know when balance is live
     """
+    if not _ma.METAAPI_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="MetaApi integration not configured. Set METAAPI_TOKEN environment variable.",
+        )
+
     user = get_or_create_user(username, db)
     cfg  = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
 
     if not cfg:
         cfg = BotConfig(
-            user_id       = user.id,
+            user_id        = user.id,
             bridge_api_key = _secrets.token_urlsafe(32),
         )
         db.add(cfg)
 
-    # Save credentials
+    # Save MT5 details
     cfg.mt5_account_number = req.mt5_login.strip()
     cfg.mt5_server         = req.mt5_server.strip()
     cfg.mt5_broker         = req.mt5_broker or cfg.mt5_broker
     cfg.mt5_connected_at   = datetime.utcnow()
 
-    # Default risk settings if this is the first connect
     if cfg.allowed_sessions is None:
         cfg.allowed_sessions = ["london", "overlap", "newyork"]
 
-    cfg.updated_at = datetime.utcnow()
+    # Check if we already have a MetaApi account for this login
+    existing_ma_id = cfg.metaapi_account_id
+    if existing_ma_id:
+        try:
+            acc = _ma.get_account(existing_ma_id)
+            state = acc.get("state", "UNKNOWN")
+            cfg.metaapi_status = state
+            cfg.updated_at     = datetime.utcnow()
+            db.commit()
+            return {
+                "success"           : True,
+                "already_connected" : True,
+                "message"           : f"Account already provisioned (state: {state}). Polling for live data.",
+                "metaapi_account_id": existing_ma_id,
+                "state"             : state,
+                "poll_endpoint"     : f"/mt5/status/{username}",
+            }
+        except Exception:
+            pass  # provisioning record may be gone; re-provision below
+
+    # Check MetaApi for an existing account with the same login
+    existing = _ma.find_account_by_login(req.mt5_login.strip())
+    if existing:
+        ma_id = existing["id"]
+        cfg.metaapi_account_id = ma_id
+        cfg.metaapi_status     = existing.get("state", "DEPLOYED")
+        cfg.updated_at         = datetime.utcnow()
+        db.commit()
+        return {
+            "success"           : True,
+            "already_connected" : True,
+            "message"           : "Found existing MetaApi account. Connecting now.",
+            "metaapi_account_id": ma_id,
+            "state"             : existing.get("state"),
+            "poll_endpoint"     : f"/mt5/status/{username}",
+        }
+
+    # Provision a new MetaApi cloud account
+    try:
+        result = _ma.provision_account(
+            login    = req.mt5_login.strip(),
+            password = req.mt5_password,
+            server   = req.mt5_server.strip(),
+            name     = f"CLEO-{username}",
+            platform = req.platform.lower() if req.platform else "mt5",
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    ma_id = result.get("id")
+    if not ma_id:
+        raise HTTPException(status_code=500, detail="MetaApi did not return an account ID.")
+
+    cfg.metaapi_account_id   = ma_id
+    cfg.metaapi_status       = "DEPLOYING"
+    cfg.metaapi_connected_at = datetime.utcnow()
+    cfg.updated_at           = datetime.utcnow()
     db.commit()
     db.refresh(cfg)
 
-    bridge_key   = cfg.bridge_api_key
-    backend_url  = "https://brilliantinfinitedata-2.onrender.com"
-
-    env_content = f"""# CLEO MT5 Bridge — auto-generated for {username}
-# Copy this file as ".env" next to mt5_bridge.py on your Windows machine
-# Then fill in MT5_PASSWORD below and run:  python mt5_bridge.py
-
-API_URL={backend_url}
-USERNAME={username}
-BRIDGE_API_KEY={bridge_key}
-
-MT5_LOGIN={req.mt5_login}
-MT5_PASSWORD=YOUR_MT5_PASSWORD_HERE
-MT5_SERVER={req.mt5_server}
-MT5_PATH=C:\\Program Files\\HFM Metatrader 5\\terminal64.exe
-
-# Optional — leave blank to use defaults
-MAGIC_NUMBER=202600
-POLL_INTERVAL=5
-"""
-
     return {
-        "success"     : True,
-        "message"     : f"MT5 account {req.mt5_login} registered. Run the bridge to go live.",
-        "username"    : username,
-        "mt5_login"   : req.mt5_login,
-        "mt5_server"  : req.mt5_server,
-        "bridge_key"  : bridge_key,
-        "status"      : "PENDING — bridge not yet connected",
-        "next_steps"  : [
-            "1. Download mt5_bridge.py from your Replit project",
-            "2. Copy the env_file_content below and save it as '.env' next to mt5_bridge.py",
-            "3. Fill in MT5_PASSWORD in the .env file",
-            "4. Run:  python mt5_bridge.py",
-            "5. Come back here — your balance will appear automatically",
-        ],
-        "env_file_content": env_content,
+        "success"           : True,
+        "already_connected" : False,
+        "message"           : (
+            "MT5 account is being connected in the cloud. "
+            "This takes 60-120 seconds. Poll /mt5/status to check when balance is live."
+        ),
+        "metaapi_account_id": ma_id,
+        "state"             : "DEPLOYING",
+        "poll_endpoint"     : f"/mt5/status/{username}",
+        "mt5_login"         : req.mt5_login,
+        "mt5_server"        : req.mt5_server,
     }
 
 
 @app.get("/mt5/status/{username}")
 def mt5_connection_status(username: str, db: Session = Depends(get_db)):
     """
-    Returns live MT5 connection status + account balance.
-    'connected' = bridge pinged the backend within the last 90 seconds.
+    Live MT5 account status via MetaApi cloud.
+    Fetches real-time balance, equity, and open P&L directly from the broker.
+    Also falls back to last-known cached values if MetaApi is temporarily unavailable.
     """
     user = db.query(User).filter(User.username == username).first()
     if not user:
@@ -4185,60 +4228,134 @@ def mt5_connection_status(username: str, db: Session = Depends(get_db)):
 
     if not cfg or not cfg.mt5_account_number:
         return {
-            "connected"      : False,
-            "status"         : "NOT_CONFIGURED",
-            "message"        : "No MT5 account linked yet. Call POST /mt5/connect/{username} first.",
-            "balance_usd"    : None,
-            "balance_ngn"    : None,
+            "connected"   : False,
+            "status"      : "NOT_CONFIGURED",
+            "message"     : "No MT5 account linked yet. Call POST /mt5/connect/{username} first.",
+            "balance_usd" : None,
+            "balance_ngn" : None,
         }
 
-    # Bridge is "live" if it pinged within last 90 seconds
-    now       = datetime.utcnow()
-    last_seen = cfg.bridge_last_seen
-    is_live   = (
-        last_seen is not None
-        and (now - last_seen).total_seconds() < 90
-    )
+    ngn_rate = get_ngn_rate()
 
-    balance_usd  = cfg.mt5_account_balance  or 0.0
-    equity_usd   = cfg.mt5_account_equity   or balance_usd
-    currency     = cfg.mt5_account_currency or "USD"
-    ngn_rate     = get_ngn_rate()
-    balance_ngn  = round(balance_usd * ngn_rate, 2)
-    equity_ngn   = round(equity_usd  * ngn_rate, 2)
+    # ── MetaApi path (automatic cloud connection) ─────────────────
+    ma_id = cfg.metaapi_account_id
+    if ma_id and _ma.METAAPI_TOKEN:
+        try:
+            # 1. Check deployment state
+            acc   = _ma.get_account(ma_id)
+            state = acc.get("state", "UNKNOWN")
+            conn  = acc.get("connectionStatus", "UNKNOWN")
 
-    open_profit  = getattr(cfg, "mt5_open_profit", None) or 0.0
+            # Update cached status
+            cfg.metaapi_status = state
+            cfg.updated_at     = datetime.utcnow()
 
-    last_sync_str = (
-        last_seen.strftime("%Y-%m-%d %H:%M:%S UTC")
-        if last_seen else "Never"
-    )
+            if state == "DEPLOYED" and conn == "CONNECTED":
+                # 2. Fetch live trading data
+                info        = _ma.get_account_info(ma_id)
+                balance_usd = float(info.get("balance",    0.0))
+                equity_usd  = float(info.get("equity",     balance_usd))
+                open_profit = float(info.get("profit",     0.0))
+                currency    = info.get("currency", "USD")
+                margin      = float(info.get("margin",     0.0))
+                free_margin = float(info.get("freeMargin", equity_usd))
 
-    secs_ago = int((now - last_seen).total_seconds()) if last_seen else None
+                # Cache to DB so we always have a last-known value
+                cfg.mt5_account_balance  = balance_usd
+                cfg.mt5_account_equity   = equity_usd
+                cfg.mt5_account_currency = currency
+                cfg.mt5_open_profit      = open_profit
+                cfg.bridge_last_seen     = datetime.utcnow()
+                db.commit()
+
+                return {
+                    "connected"         : True,
+                    "status"            : "LIVE",
+                    "connection_type"   : "metaapi_cloud",
+                    "message"           : "Connected via MetaApi cloud — live data",
+                    "mt5_account"       : cfg.mt5_account_number,
+                    "mt5_server"        : cfg.mt5_server,
+                    "mt5_broker"        : cfg.mt5_broker,
+                    "currency"          : currency,
+                    "balance_usd"       : round(balance_usd, 2),
+                    "balance_ngn"       : round(balance_usd * ngn_rate, 2),
+                    "equity_usd"        : round(equity_usd, 2),
+                    "equity_ngn"        : round(equity_usd * ngn_rate, 2),
+                    "open_profit_usd"   : round(open_profit, 2),
+                    "margin_usd"        : round(margin, 2),
+                    "free_margin_usd"   : round(free_margin, 2),
+                    "usd_ngn_rate"      : ngn_rate,
+                    "last_sync"         : datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "bot_active"        : cfg.is_active or False,
+                    "metaapi_state"     : state,
+                }
+
+            elif state == "DEPLOYING":
+                db.commit()
+                return {
+                    "connected"       : False,
+                    "status"          : "CONNECTING",
+                    "connection_type" : "metaapi_cloud",
+                    "message"         : "Your MT5 account is being connected in the cloud. This takes 60–120 seconds. Please wait…",
+                    "metaapi_state"   : state,
+                    "mt5_account"     : cfg.mt5_account_number,
+                    "balance_usd"     : None,
+                    "balance_ngn"     : None,
+                }
+
+            elif state == "DEPLOY_FAILED":
+                db.commit()
+                return {
+                    "connected"       : False,
+                    "status"          : "FAILED",
+                    "connection_type" : "metaapi_cloud",
+                    "message"         : "MetaApi failed to connect to your broker. Check your login credentials and broker server name, then try reconnecting.",
+                    "metaapi_state"   : state,
+                    "mt5_account"     : cfg.mt5_account_number,
+                    "balance_usd"     : None,
+                    "balance_ngn"     : None,
+                }
+
+            else:
+                # DISCONNECTED or unknown — return cached balance if available
+                db.commit()
+
+        except Exception as e:
+            print(f"[MetaApi] status fetch error for {username}: {e}")
+
+    # ── Fallback: return last-known cached balance ─────────────────
+    balance_usd = cfg.mt5_account_balance or 0.0
+    equity_usd  = cfg.mt5_account_equity  or balance_usd
+    currency    = cfg.mt5_account_currency or "USD"
+    open_profit = cfg.mt5_open_profit or 0.0
+    last_seen   = cfg.bridge_last_seen
+    now         = datetime.utcnow()
+
+    is_recent   = last_seen and (now - last_seen).total_seconds() < 300
 
     return {
-        "connected"         : is_live,
-        "status"            : "LIVE" if is_live else ("DISCONNECTED" if last_seen else "PENDING"),
-        "message"           : (
-            f"Bridge active — last sync {secs_ago}s ago"
-            if is_live else
-            "Bridge is offline — run mt5_bridge.py on your Windows machine"
-            if last_seen else
-            "Bridge has never connected — follow the setup steps"
+        "connected"       : False,
+        "status"          : "DISCONNECTED" if last_seen else "PENDING",
+        "connection_type" : "metaapi_cloud" if ma_id else "not_configured",
+        "message"         : (
+            "MetaApi is temporarily unreachable — showing last known balance"
+            if is_recent else
+            "Connecting to your MT5 account…"
+            if ma_id else
+            "No MT5 account linked yet"
         ),
-        "mt5_account"       : cfg.mt5_account_number,
-        "mt5_server"        : cfg.mt5_server,
-        "mt5_broker"        : cfg.mt5_broker,
-        "currency"          : currency,
-        "balance_usd"       : round(balance_usd, 2),
-        "balance_ngn"       : balance_ngn,
-        "equity_usd"        : round(equity_usd, 2),
-        "equity_ngn"        : equity_ngn,
-        "open_profit_usd"   : round(open_profit, 2),
-        "usd_ngn_rate"      : ngn_rate,
-        "last_sync"         : last_sync_str,
-        "bot_active"        : cfg.is_active or False,
-        "bridge_key"        : cfg.bridge_api_key,
+        "mt5_account"     : cfg.mt5_account_number,
+        "mt5_server"      : cfg.mt5_server,
+        "mt5_broker"      : cfg.mt5_broker,
+        "currency"        : currency,
+        "balance_usd"     : round(balance_usd, 2) if balance_usd else None,
+        "balance_ngn"     : round(balance_usd * ngn_rate, 2) if balance_usd else None,
+        "equity_usd"      : round(equity_usd, 2) if equity_usd else None,
+        "open_profit_usd" : round(open_profit, 2),
+        "usd_ngn_rate"    : ngn_rate,
+        "last_sync"       : last_seen.strftime("%Y-%m-%d %H:%M:%S UTC") if last_seen else "Never",
+        "bot_active"      : cfg.is_active or False,
+        "metaapi_state"   : cfg.metaapi_status,
     }
 
 
@@ -4282,12 +4399,83 @@ POLL_INTERVAL=5
     )
 
 
+@app.delete("/mt5/disconnect/{username}")
+def mt5_disconnect(username: str, db: Session = Depends(get_db)):
+    """
+    Disconnect and remove the user's MetaApi cloud account.
+    Clears all stored MT5 credentials and MetaApi account from our DB.
+    """
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    if not cfg:
+        return {"success": True, "message": "No account to disconnect."}
+
+    ma_id = cfg.metaapi_account_id
+    deleted_from_metaapi = False
+
+    if ma_id and _ma.METAAPI_TOKEN:
+        try:
+            deleted_from_metaapi = _ma.delete_account(ma_id)
+        except Exception as e:
+            print(f"[MetaApi] delete_account error: {e}")
+
+    cfg.metaapi_account_id   = None
+    cfg.metaapi_status       = None
+    cfg.metaapi_connected_at = None
+    cfg.mt5_account_number   = None
+    cfg.mt5_server           = None
+    cfg.mt5_broker           = None
+    cfg.mt5_account_balance  = None
+    cfg.mt5_account_equity   = None
+    cfg.mt5_open_profit      = None
+    cfg.mt5_connected_at     = None
+    cfg.bridge_last_seen     = None
+    cfg.is_active            = False
+    cfg.updated_at           = datetime.utcnow()
+    db.commit()
+
+    return {
+        "success"              : True,
+        "message"              : "MT5 account disconnected and removed.",
+        "deleted_from_metaapi" : deleted_from_metaapi,
+    }
+
+
+@app.get("/mt5/positions/{username}")
+def mt5_get_positions(username: str, db: Session = Depends(get_db)):
+    """
+    Returns all currently open positions from the live MT5 account via MetaApi.
+    """
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    cfg = db.query(BotConfig).filter(BotConfig.user_id == user.id).first()
+    ma_id = cfg.metaapi_account_id if cfg else None
+
+    if not ma_id or not _ma.METAAPI_TOKEN:
+        return {"positions": [], "count": 0, "message": "No MetaApi account connected."}
+
+    try:
+        positions = _ma.get_positions(ma_id)
+        ngn_rate  = get_ngn_rate()
+        for p in positions:
+            p["profit_ngn"] = round(float(p.get("profit", 0)) * ngn_rate, 2)
+        return {"positions": positions, "count": len(positions)}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not fetch positions: {e}")
+
+
 # ════════════════════════════════════════════════════════════════
 #  CLEO AUTO-TRADER  —  Bot Config · Risk Engine · Market Filter
 #                        Trade Manager · MT5 Bridge endpoints
 # ════════════════════════════════════════════════════════════════
 
 import secrets as _secrets
+import metaapi_client as _ma
 
 
 # ── Pydantic models ──────────────────────────────────────────────

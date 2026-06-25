@@ -274,11 +274,18 @@ class BotConfig(Base):
     mt5_server = Column(String, nullable=True)
     mt5_broker = Column(String, nullable=True)
 
-    # Live account state (updated each time the MT5 bridge connects)
+    # Live account state (updated each time the MT5 bridge connects OR MetaApi syncs)
     mt5_account_balance  = Column(Float,  nullable=True)   # last known balance in USD
     mt5_account_equity   = Column(Float,  nullable=True)   # last known equity in USD
     mt5_account_currency = Column(String, nullable=True)   # account currency (USD/NGN/GBP…)
     bridge_last_seen     = Column(DateTime, nullable=True) # when bridge last pinged
+    mt5_open_profit      = Column(Float,  nullable=True)   # current floating P&L
+
+    # MetaApi cloud connection (no Windows bridge needed)
+    metaapi_account_id   = Column(String, nullable=True)   # MetaApi provisioned account ID
+    metaapi_status       = Column(String, nullable=True)   # DEPLOYING / DEPLOYED / DISCONNECTED
+    metaapi_connected_at = Column(DateTime, nullable=True) # when MetaApi first connected
+    mt5_connected_at     = Column(DateTime, nullable=True) # when user submitted credentials
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
@@ -368,6 +375,9 @@ def init_db():
         "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_broker VARCHAR",
         "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_connected_at TIMESTAMP",
         "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS mt5_open_profit FLOAT",
+        "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS metaapi_account_id VARCHAR",
+        "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS metaapi_status VARCHAR",
+        "ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS metaapi_connected_at TIMESTAMP",
     ]
     with engine.connect() as conn:
         for sql in migrations:
